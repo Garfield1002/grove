@@ -50,6 +50,13 @@ const KIND_TOGGLE: &str = "toggle";
 /// purpose: the notification is best-effort and must not stall an agent.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long the GUI waits for a client to finish its line. The mirror image of
+/// [`WRITE_TIMEOUT`], and load-bearing for the same reason in the other
+/// direction: the listener handles one connection at a time, so a client that
+/// connects and then stalls would otherwise hold it for ever and every later
+/// `grove notify` and `grove toggle` would be lost in silence.
+const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// The maximum length of a notification message, in characters. Long enough for a
 /// summary line, short enough that a hostile writer cannot make the GUI
 /// allocate without bound.
@@ -378,17 +385,32 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
 
 /// Read one command from an accepted connection.
 ///
-/// Only the first line is read, and only [`MAX_LINE_LEN`] bytes of it: each
-/// `grove notify` or `grove toggle` process sends one short line and closes,
-/// so reading further would only let a stuck or hostile writer hold the
-/// listener and grow its buffer.
+/// Bounded in both directions, because the listener is serial and a client
+/// controls both how much it sends and how long it takes:
+///
+/// - only the first line is read, and at most [`MAX_LINE_LEN`] bytes of it, so
+///   a writer that never sends a newline cannot make the GUI buffer for ever;
+/// - the socket carries a [`READ_TIMEOUT`], so a client that connects and then
+///   stalls costs one short pause rather than every later notification.
+///
+/// Every way of failing collapses to [`ProtocolError::Malformed`]: nothing
+/// usable arrived, and the listener logs it and takes the next connection.
 pub fn read_command(stream: UnixStream) -> std::result::Result<Command, ProtocolError> {
+    // Refuse to read at all rather than read unbounded: an unarmed timeout is
+    // exactly the state this function exists to avoid.
+    if stream.set_read_timeout(Some(READ_TIMEOUT)).is_err() {
+        return Err(ProtocolError::Malformed);
+    }
     let mut line = String::new();
     let mut reader = BufReader::new(stream.take(MAX_LINE_LEN));
-    // A read error and an empty line are the same thing here: nothing usable
-    // arrived. The listener logs and moves on either way.
     match reader.read_line(&mut line) {
+        // A timed-out read, a non-UTF-8 byte and a closed connection are all
+        // the same answer here.
         Ok(0) | Err(_) => Err(ProtocolError::Malformed),
+        // A full read with no newline in it is a line that never ended; the cap
+        // truncated it, so decoding what arrived would risk acting on half a
+        // message.
+        Ok(_) if !line.ends_with('\n') => Err(ProtocolError::Malformed),
         Ok(_) => Command::decode(&line),
     }
 }
@@ -710,6 +732,56 @@ mod tests {
             Command::Notify(expected)
         );
         assert!(writer.join().expect("writer thread"));
+    }
+
+    /// The listener is serial, so this is what keeps one stalled client from
+    /// costing every later `grove notify` and `grove toggle`.
+    #[test]
+    fn a_client_that_stalls_is_given_up_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_path(dir.path());
+        let listener = bind(&socket).expect("bind");
+
+        // Connect and then hold the connection open, saying nothing.
+        let held = UnixStream::connect(&socket).expect("connect");
+        let (stream, _) = listener.accept().expect("accept");
+
+        let started = std::time::Instant::now();
+        assert_eq!(read_command(stream), Err(ProtocolError::Malformed));
+        let waited = started.elapsed();
+        assert!(
+            waited < READ_TIMEOUT * 4,
+            "gave up after {waited:?}, which is not a bounded wait"
+        );
+        drop(held);
+
+        // And the listener is still there for the next client, which is the
+        // whole point.
+        let sent = Command::Toggle { slot: Some(2) };
+        let expected = sent.clone();
+        let writer = std::thread::spawn(move || send_command(&socket, &sent).expect("send"));
+        let (stream, _) = listener.accept().expect("accept");
+        assert_eq!(read_command(stream).expect("decoded"), expected);
+        assert!(writer.join().expect("writer thread"));
+    }
+
+    #[test]
+    fn a_line_that_never_ends_is_refused_rather_than_buffered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_path(dir.path());
+        let listener = bind(&socket).expect("bind");
+
+        let flood = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&socket).expect("connect");
+            // Well past the cap, and not a newline in it.
+            let _ = stream.write_all(&vec![b'x'; MAX_LINE_LEN as usize * 2]);
+            // Hold the connection so the reader cannot mistake this for EOF.
+            std::thread::sleep(READ_TIMEOUT * 3);
+        });
+
+        let (stream, _) = listener.accept().expect("accept");
+        assert_eq!(read_command(stream), Err(ProtocolError::Malformed));
+        flood.join().expect("writer thread");
     }
 
     #[test]
