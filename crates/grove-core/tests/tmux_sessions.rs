@@ -615,6 +615,70 @@ fn a_hand_set_attention_option_is_read_as_attention() {
 }
 
 #[test]
+fn polling_reports_signals_for_grove_sessions_only() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let test = TestServer::new();
+    let spec = spec_for(&worktree, "acme-web");
+    let (name, _) = tmux::ensure_session(&test.server, &spec).expect("creates");
+
+    // A session Grove did not create must not appear in the poll.
+    test.server
+        .run([
+            "new-session",
+            "-d",
+            "-s",
+            "someone-elses-session",
+            "-c",
+            "/tmp",
+        ])
+        .expect("creates a foreign session");
+
+    let now = workflow::now_epoch();
+    let signals = workflow::poll_session_signals(&test.server, now).expect("polls");
+    assert_eq!(
+        signals.keys().collect::<Vec<_>>(),
+        vec![&spec.worktree_id],
+        "only Grove's own sessions are polled"
+    );
+
+    let mine = &signals[&spec.worktree_id];
+    assert!(!mine.attention_flag);
+    assert!(
+        mine.activity_age.is_some(),
+        "a real session always has an activity stamp"
+    );
+    assert_eq!(
+        mine.pane_commands.len(),
+        1,
+        "the shell window's pane is reported: {:?}",
+        mine.pane_commands
+    );
+
+    // Raising attention shows up in the very next poll.
+    tmux::session::set_attention(&test.server, &name).expect("sets");
+    let signals = workflow::poll_session_signals(&test.server, now).expect("polls");
+    assert!(signals[&spec.worktree_id].attention_flag);
+    assert_eq!(
+        grove_core::status::classify(
+            &signals[&spec.worktree_id],
+            &grove_core::StatusPolicy::default()
+        ),
+        grove_core::SessionStatus::Attention
+    );
+}
+
+#[test]
+fn polling_an_empty_server_is_an_empty_map_not_an_error() {
+    require!("tmux");
+    let test = TestServer::new();
+    let signals = workflow::poll_session_signals(&test.server, workflow::now_epoch())
+        .expect("no server is a normal state");
+    assert!(signals.is_empty());
+}
+
+#[test]
 fn a_session_grove_did_not_create_carries_no_metadata() {
     require!("tmux");
     let dir = tempfile::tempdir().expect("tempdir");

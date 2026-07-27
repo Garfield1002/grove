@@ -395,6 +395,22 @@ pub fn list_panes(server: &TmuxServer, session: &str) -> Result<Vec<PaneInfo>> {
     Ok(parse_panes(&out.stdout)?)
 }
 
+/// Every pane on the server, across all sessions.
+///
+/// One invocation for the whole poll: the alternative is a `list-panes` per
+/// session, which is what makes a 2 s cadence expensive once a user has a
+/// dozen worktrees open.
+pub fn list_all_panes(server: &TmuxServer) -> Result<Vec<PaneInfo>> {
+    let out = server.run_allow_failure(["list-panes", "-a", "-F", PANE_FORMAT])?;
+    if !out.success {
+        if TmuxServer::is_missing_target(&out.stderr) {
+            return Ok(Vec::new());
+        }
+        return Err(out.failure.into());
+    }
+    Ok(parse_panes(&out.stdout)?)
+}
+
 /// Kill one session. Never called implicitly: closing a session is its own
 /// confirmed operation (ARCHITECTURE.md §8.2).
 pub fn kill_session(server: &TmuxServer, name: &str) -> Result<()> {

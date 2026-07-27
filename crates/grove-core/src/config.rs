@@ -8,10 +8,12 @@
 //! the user has touched (ARCHITECTURE.md §4).
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::status::StatusPolicy;
 use crate::terminal;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +21,54 @@ use crate::terminal;
 pub struct Config {
     pub terminal: TerminalConfig,
     pub worktrees: WorktreeConfig,
+    pub status: StatusConfig,
+}
+
+/// The `[status]` section: how sessions are judged working, idle or needing
+/// attention (DESIGN.md §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Seconds of quiet after which a session stops counting as working.
+    pub working_window_secs: u64,
+    /// Process names that mean an agent is running in a session.
+    pub agent_commands: Vec<String>,
+    /// Whether a tmux bell raises attention. Off by default: bells are noisy,
+    /// and `grove notify` is the reliable signal.
+    pub bell_is_attention: bool,
+    /// Whether raised attention also posts a desktop notification.
+    pub desktop_notifications: bool,
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        let policy = StatusPolicy::default();
+        Self {
+            working_window_secs: policy.working_window.as_secs(),
+            agent_commands: policy.agent_commands,
+            bell_is_attention: policy.bell_is_attention,
+            desktop_notifications: true,
+        }
+    }
+}
+
+impl StatusConfig {
+    /// The policy the status engine runs with.
+    ///
+    /// A zero or absurd window would make every session look permanently
+    /// working or permanently idle, so it is clamped rather than trusted.
+    pub fn policy(&self) -> StatusPolicy {
+        StatusPolicy {
+            working_window: Duration::from_secs(self.working_window_secs.clamp(1, 3600)),
+            agent_commands: self
+                .agent_commands
+                .iter()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+            bell_is_attention: self.bell_is_attention,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +125,16 @@ pub fn first_run_document(terminal_command: &str) -> String {
          # Parent directory for worktrees created from the GUI. Unset means\n\
          # \"beside the repository\". The create dialog always lets you edit\n\
          # the path before anything is created.\n\
-         # default_parent = \"/home/you/worktrees\"\n",
+         # default_parent = \"/home/you/worktrees\"\n\
+         \n\
+         # [status]\n\
+         # How sessions are judged working, idle or needing attention.\n\
+         # Attention comes from `grove notify --state attention` (run it from\n\
+         # your agent's hooks) and stays until you open the session.\n\
+         # working_window_secs = 10\n\
+         # agent_commands = [\"claude\", \"aider\", \"codex\", \"goose\"]\n\
+         # bell_is_attention = false\n\
+         # desktop_notifications = true\n",
         toml_string(terminal_command)
     )
 }
@@ -186,6 +245,66 @@ mod tests {
     use super::*;
 
     const DETECTED: &str = "foot tmux -S {socket} attach-session -t {session}";
+
+    #[test]
+    fn an_absent_status_section_is_the_default_policy() {
+        let config = Config::from_toml("[terminal]\ncommand = \"foot\"\n", Path::new("c.toml"))
+            .expect("valid");
+        assert_eq!(config.status.policy(), StatusPolicy::default());
+        assert!(config.status.desktop_notifications);
+    }
+
+    #[test]
+    fn the_status_section_is_read_into_the_policy() {
+        let text = "[status]\n\
+                    working_window_secs = 45\n\
+                    agent_commands = [\"myagent\", \" spaced \", \"\"]\n\
+                    bell_is_attention = true\n\
+                    desktop_notifications = false\n";
+        let config = Config::from_toml(text, Path::new("c.toml")).expect("valid");
+        let policy = config.status.policy();
+        assert_eq!(policy.working_window, Duration::from_secs(45));
+        assert_eq!(policy.agent_commands, vec!["myagent", "spaced"]);
+        assert!(policy.bell_is_attention);
+        assert!(!config.status.desktop_notifications);
+    }
+
+    #[test]
+    fn an_absurd_working_window_is_clamped_not_trusted() {
+        // 0 would make every session permanently idle; a huge value would make
+        // every session permanently working.
+        let zero = Config::from_toml("[status]\nworking_window_secs = 0\n", Path::new("c.toml"))
+            .expect("valid");
+        assert_eq!(zero.status.policy().working_window, Duration::from_secs(1));
+
+        let huge = Config::from_toml(
+            "[status]\nworking_window_secs = 99999999\n",
+            Path::new("c.toml"),
+        )
+        .expect("valid");
+        assert_eq!(
+            huge.status.policy().working_window,
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn an_empty_agent_list_is_honoured() {
+        // Not "fall back to the defaults": a user who empties the list means it.
+        let config = Config::from_toml("[status]\nagent_commands = []\n", Path::new("c.toml"))
+            .expect("valid");
+        assert!(config.status.policy().agent_commands.is_empty());
+    }
+
+    #[test]
+    fn the_first_run_document_documents_the_status_section() {
+        let text = first_run_document(DETECTED);
+        // Commented out, so the defaults stay live, but discoverable.
+        assert!(text.contains("# [status]"));
+        assert!(text.contains("grove notify --state attention"));
+        let parsed = Config::from_toml(&text, Path::new("c.toml")).expect("valid toml");
+        assert_eq!(parsed.status, StatusConfig::default());
+    }
 
     #[test]
     fn first_run_writes_the_detected_template_once() {

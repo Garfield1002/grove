@@ -15,6 +15,7 @@ use crate::model::{
     Project, SessionPresence, Worktree, default_worktree_parent, worktrees_from_entries,
 };
 use crate::removal::{RemovalInputs, Unpushed};
+use crate::status::SessionSignals;
 use crate::terminal::{self, TemplateVars};
 use crate::tmux::{self, SessionSpec, TmuxServer};
 
@@ -163,6 +164,45 @@ pub fn apply_session_presence(
             .copied()
             .unwrap_or(SessionPresence::None);
     }
+}
+
+/// Seconds since the Unix epoch, for comparing against tmux's timestamps.
+///
+/// A clock before the epoch is not a case worth an error: it yields 0, which
+/// makes every session look stale rather than making the poll fail.
+pub fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Gather one poll's status signals for every Grove session, keyed by
+/// worktree id (DESIGN.md §6).
+///
+/// Two subprocesses for the whole server — one `list-sessions`, one
+/// `list-panes -a` — because this runs every couple of seconds. Sessions
+/// Grove did not create are ignored: their status is not Grove's business.
+///
+/// Runs subprocesses: worker thread only.
+pub fn poll_session_signals(
+    server: &TmuxServer,
+    now_epoch: u64,
+) -> Result<HashMap<String, SessionSignals>> {
+    let sessions = tmux::list_sessions(server)?;
+    let mut commands: HashMap<String, Vec<String>> = HashMap::new();
+    for pane in tmux::session::list_all_panes(server)? {
+        commands.entry(pane.session).or_default().push(pane.command);
+    }
+    let mut signals = HashMap::new();
+    for session in sessions {
+        let Some(worktree_id) = session.worktree_id().map(str::to_string) else {
+            continue;
+        };
+        let panes = commands.remove(&session.name).unwrap_or_default();
+        signals.insert(worktree_id, session.signals(now_epoch, panes));
+    }
+    Ok(signals)
 }
 
 /// What activating a worktree actually did, so the UI can say so.
