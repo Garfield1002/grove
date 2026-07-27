@@ -65,3 +65,23 @@ print-claude-hook:
 # Install the grove binary into ~/.cargo/bin.
 install:
     cargo install --path crates/grove --locked
+
+# The icon is the scalable SVG only. Modern desktops render it at whatever
+# size they need, and the fine line art turns to mush below about 48px
+# anyway, so shipping small PNGs would buy nothing.
+
+# Install the desktop entry and icon, so Grove has a launcher entry and a real window icon.
+install-desktop:
+    install -Dm644 packaging/grove.desktop \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/applications/grove.desktop"
+    install -Dm644 packaging/grove.svg \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/grove.svg"
+    -update-desktop-database "${XDG_DATA_HOME:-$HOME/.local/share}/applications" 2>/dev/null
+    -gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null
+    @echo "Installed. Grove's window pairs with this entry through its app_id."
+
+# Remove both again.
+uninstall-desktop:
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/grove.desktop"
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/grove.svg"
+    -update-desktop-database "${XDG_DATA_HOME:-$HOME/.local/share}/applications" 2>/dev/null

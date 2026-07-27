@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Grove
+GenericName=Git Worktree Manager
+Comment=Navigate Git projects, worktrees and persistent tmux sessions
+Exec=grove
+Icon=grove
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;worktree;tmux;session;branch;agent;
+StartupNotify=true
+# The file's basename must match the window's app_id ("grove", set in
+# main.rs) or a Wayland compositor cannot pair the window with this entry,
+# and the window falls back to a generic icon. StartupWMClass is the same
+# pairing for X11, where it is WM_CLASS that is matched instead.
+StartupWMClass=grove

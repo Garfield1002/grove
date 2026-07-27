@@ -41,6 +41,7 @@ you.
 
 ```bash
 cargo install --path crates/grove --locked
+just install-desktop     # launcher entry and icon; optional
 ```
 
 Then just run it:
