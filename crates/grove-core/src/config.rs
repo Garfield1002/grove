@@ -26,9 +26,18 @@ pub struct Config {
     pub agents: AgentConfig,
 }
 
+/// How Claude Code resumes a conversation, and the default `resume_command`.
+///
+/// Claude Code is the one agent Grove knows by name: the conversation ids this
+/// template substitutes are the ones Claude Code itself reported through
+/// `grove notify --hook`, so its spelling of "resume" is the one Grove can
+/// know without guessing. Any other agent overrides it; blanking it turns the
+/// action off.
+pub const DEFAULT_RESUME_COMMAND: &str = "claude --resume {agent_session}";
+
 /// The `[agents]` section: the command Grove starts in a session's agent
 /// window, and whether to account for its resources (DESIGN.md §15).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     /// Shell-style command template, expanded like the terminal one. Empty
@@ -36,9 +45,9 @@ pub struct AgentConfig {
     pub command: String,
     /// Template that reopens the agent's last conversation in a worktree,
     /// with `{agent_session}` standing for the id the agent reported through
-    /// `grove notify`. Empty means Grove offers no "resume" action — it has no
-    /// idea how any given agent spells that, and guessing would produce a
-    /// command the user never asked for.
+    /// `grove notify`. Defaults to [`DEFAULT_RESUME_COMMAND`], the spelling
+    /// used by the agent that reports those ids; empty means Grove offers no
+    /// "resume" action at all.
     pub resume_command: String,
     /// Per-project overrides, keyed by project name.
     pub per_project: std::collections::BTreeMap<String, String>,
@@ -46,6 +55,17 @@ pub struct AgentConfig {
     /// `never`. An unrecognised value falls back to `auto` rather than
     /// refusing to load the file.
     pub resource_accounting: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            resume_command: DEFAULT_RESUME_COMMAND.to_string(),
+            per_project: std::collections::BTreeMap::new(),
+            resource_accounting: String::new(),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -59,9 +79,11 @@ impl AgentConfig {
             .filter(|c| !c.is_empty())
     }
 
-    /// The template that resumes an agent's last conversation, if the user
-    /// configured one. There is no default: only the user knows what their
-    /// agent's resume flag is.
+    /// The template that resumes an agent's last conversation.
+    ///
+    /// [`DEFAULT_RESUME_COMMAND`] unless the file says otherwise; `None` only
+    /// when the user blanked the key, which is how the action is turned off
+    /// for an agent that spells resuming differently or not at all.
     pub fn resume_command(&self) -> Option<&str> {
         Some(self.resume_command.trim()).filter(|c| !c.is_empty())
     }
@@ -191,8 +213,9 @@ pub fn first_run_document(terminal_command: &str) -> String {
          # resource_accounting = \"auto\"   # auto | always | never\n\
          #\n\
          # Reopens the last conversation `grove notify --agent-session` saw in\n\
-         # a worktree. Grove ships no default: only you know how your agent\n\
-         # spells it. {{agent_session}} is the id the agent reported.\n\
+         # a worktree. {{agent_session}} is the id the agent reported. The\n\
+         # default below is Claude Code's spelling, since Claude Code is what\n\
+         # reports those ids; set it to \"\" to offer no resume at all.\n\
          # resume_command = \"claude --resume {{agent_session}}\"\n\
          #\n\
          # [agents.per_project]\n\
@@ -341,6 +364,45 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.agents.command_for("acme-web"), None);
         assert_eq!(config.agents.accounting(), Accounting::Auto);
+    }
+
+    /// Resuming is the one agent command Grove can spell for the user: the ids
+    /// it substitutes came from Claude Code's own hooks. A user whose agent
+    /// spells it differently — or who wants no resume offered — says so by
+    /// blanking the key, exactly as with every other command here.
+    #[test]
+    fn resuming_defaults_to_the_agent_that_reports_the_ids() {
+        let config = Config::default();
+        assert_eq!(
+            config.agents.resume_command(),
+            Some("claude --resume {agent_session}")
+        );
+
+        let untouched = Config::from_toml("[agents]\ncommand = \"claude\"\n", Path::new("c.toml"))
+            .expect("valid");
+        assert_eq!(
+            untouched.agents.resume_command(),
+            Some("claude --resume {agent_session}"),
+            "an [agents] section that says nothing about resuming keeps the default"
+        );
+
+        let opted_out = Config::from_toml("[agents]\nresume_command = \"\"\n", Path::new("c.toml"))
+            .expect("valid");
+        assert_eq!(
+            opted_out.agents.resume_command(),
+            None,
+            "blanking the key is how the resume action is turned off"
+        );
+
+        let overridden = Config::from_toml(
+            "[agents]\nresume_command = \"aider --restore-chat-history\"\n",
+            Path::new("c.toml"),
+        )
+        .expect("valid");
+        assert_eq!(
+            overridden.agents.resume_command(),
+            Some("aider --restore-chat-history")
+        );
     }
 
     #[test]

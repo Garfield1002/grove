@@ -445,9 +445,9 @@ pub fn body(
                     egui::Label::new(theme::label(
                         "Reopens the conversation an agent last reported here, offered \
                          on a worktree's menu. {agent_session} is the id it reported \
-                         through `grove notify --agent-session`. Empty offers no \
-                         resume: Grove ships no default because only you know how your \
-                         agent spells it.",
+                         through `grove notify --agent-session`. Defaults to Claude \
+                         Code's spelling, since Claude Code is what reports those ids; \
+                         empty offers no resume at all.",
                         theme::FONT_SMALL,
                         theme::TEXT_FAINT,
                     ))
@@ -875,13 +875,23 @@ mod tests {
         );
 
         let mut form = Form::new(Some(&config(TEMPLATE, "")));
-        form.resume_command = "claude --resume {agent_session}".into();
+        form.resume_command = "aider --restore-chat-history".into();
         assert_eq!(
             form.edits(),
             vec![Edit::string(
                 config_write::AGENTS_RESUME_COMMAND,
-                "claude --resume {agent_session}"
+                "aider --restore-chat-history"
             )]
+        );
+
+        // Clearing the field is an edit too: it is how the user turns the
+        // resume action off, and silently restoring the default would leave
+        // them staring at an entry they just removed.
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        form.resume_command.clear();
+        assert_eq!(
+            form.edits(),
+            vec![Edit::string(config_write::AGENTS_RESUME_COMMAND, "")]
         );
 
         let mut form = Form::new(Some(&config(TEMPLATE, "")));

@@ -652,6 +652,7 @@ pub struct NewWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_RESUME_COMMAND;
     use crate::git::WorktreeEntry;
     use crate::status::SessionStatus;
     use std::path::PathBuf;
@@ -730,12 +731,15 @@ mod tests {
         let mut config = Config::default();
         config.agents.command = "claude".into();
 
+        // Blanked by a user whose agent cannot resume, or who does not want
+        // the action offered.
+        config.agents.resume_command = String::new();
         assert!(matches!(
             AgentStart::Resume("0f3a").template(&config, "acme-web"),
             Err(Error::NoResumeCommand)
         ));
 
-        config.agents.resume_command = "claude --resume {agent_session}".into();
+        config.agents.resume_command = DEFAULT_RESUME_COMMAND.into();
         assert!(matches!(
             AgentStart::Resume("").template(&config, "acme-web"),
             Err(Error::NoAgentSession)
@@ -751,8 +755,8 @@ mod tests {
     /// The two commands are independent: one configured is not the other.
     #[test]
     fn a_fresh_start_never_uses_the_resume_command() {
+        // The default config already carries a resume command and no other.
         let mut config = Config::default();
-        config.agents.resume_command = "claude --resume {agent_session}".into();
         assert!(matches!(
             AgentStart::Fresh.template(&config, "acme-web"),
             Err(Error::NoAgentCommand)
