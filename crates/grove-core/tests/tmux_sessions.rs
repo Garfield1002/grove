@@ -710,15 +710,37 @@ fn starting_an_agent_opens_its_own_window_beside_the_shell() {
         "the agent gets its own window beside the shell: {names:?}"
     );
 
-    // And the running agent makes the session read as working.
-    let signals =
-        workflow::poll_session_signals(&test.server, workflow::now_epoch()).expect("polls");
-    let mine = &signals[&worktree.id];
+    // And the running agent becomes visible to the poller.
+    //
+    // Not immediately: tmux reports `pane_current_command` as `tmux` itself
+    // for a moment after new-window, until the pane has exec'd the command.
+    // That is a real property of tmux, not of Grove, so this waits for it
+    // rather than asserting on the first reading.
+    let commands = wait_for(|| {
+        let signals =
+            workflow::poll_session_signals(&test.server, workflow::now_epoch()).expect("polls");
+        let commands = signals[&worktree.id].pane_commands.clone();
+        commands.iter().any(|c| c == "sleep").then_some(commands)
+    });
     assert!(
-        mine.pane_commands.iter().any(|c| c == "sleep"),
-        "the agent's process is visible to the poller: {:?}",
-        mine.pane_commands
+        commands.is_some_and(|c| c.iter().any(|c| c == "sleep")),
+        "the agent's process never became visible to the poller"
     );
+}
+
+/// Retry a check for up to two seconds, for the tmux states that are not
+/// observable the instant the command returns.
+fn wait_for<T>(mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(value) = check() {
+            return Some(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 #[test]

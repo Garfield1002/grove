@@ -113,6 +113,8 @@ impl SessionInfo {
             pane_commands,
             attention_flag: self.attention,
             bell: self.bell,
+            // Filled in by the poller, which has the pane pids to resolve.
+            usage: None,
         }
     }
 }

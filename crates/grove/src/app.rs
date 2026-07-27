@@ -9,7 +9,7 @@ use grove_core::config::Config;
 use grove_core::git::StatusSummary;
 use grove_core::model::{Project, SessionPresence};
 use grove_core::state::{ProjectRecord, State};
-use grove_core::status::SessionStatus;
+use grove_core::status::{SessionReport, SessionStatus};
 use grove_core::workflow::Activation;
 use grove_core::{Paths, state};
 
@@ -29,7 +29,7 @@ pub struct GroveApp {
     messages: Receiver<Message>,
     /// Last polled status per worktree id, kept so a refreshed worktree list
     /// shows its status immediately instead of blank until the next poll.
-    statuses: HashMap<String, SessionStatus>,
+    statuses: HashMap<String, SessionReport>,
 
     config: Option<Config>,
     state: State,
@@ -369,8 +369,10 @@ impl GroveApp {
         message: Option<String>,
     ) {
         if state == SessionStatus::Attention {
-            self.statuses
-                .insert(worktree_id.to_string(), SessionStatus::Attention);
+            // Keep any resource figures the last poll produced; only the
+            // status is being overridden here.
+            let report = self.statuses.entry(worktree_id.to_string()).or_default();
+            report.status = SessionStatus::Attention;
         }
         for project in &mut self.projects {
             if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {

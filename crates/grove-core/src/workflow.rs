@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::agent;
+use crate::cgroup;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git::{self, StatusSummary, WorktreeAdd};
@@ -16,7 +17,7 @@ use crate::model::{
     Project, SessionPresence, Worktree, default_worktree_parent, worktrees_from_entries,
 };
 use crate::removal::{RemovalInputs, Unpushed};
-use crate::status::{SessionSignals, SessionStatus};
+use crate::status::{SessionReport, SessionSignals};
 use crate::terminal::{self, TemplateVars};
 use crate::tmux::{self, SessionSpec, TmuxServer};
 
@@ -217,13 +218,15 @@ pub fn start_agent(
 /// A worktree with no session gets no status at all, whatever the map says:
 /// a status left over from a session that has since been closed would show a
 /// row as working with nothing running in it.
-pub fn apply_session_status(worktrees: &mut [Worktree], statuses: &HashMap<String, SessionStatus>) {
+pub fn apply_session_status(worktrees: &mut [Worktree], reports: &HashMap<String, SessionReport>) {
     for worktree in worktrees {
-        worktree.status = worktree
+        let report = worktree
             .session
             .exists()
-            .then(|| statuses.get(&worktree.id).copied())
+            .then(|| reports.get(&worktree.id))
             .flatten();
+        worktree.status = report.map(|r| r.status);
+        worktree.resources = report.and_then(SessionReport::resource_label);
         if worktree.status.is_none() {
             worktree.status_message = None;
         }
@@ -254,19 +257,59 @@ pub fn poll_session_signals(
     now_epoch: u64,
 ) -> Result<HashMap<String, SessionSignals>> {
     let sessions = tmux::list_sessions(server)?;
-    let mut commands: HashMap<String, Vec<String>> = HashMap::new();
+    let mut panes: HashMap<String, Vec<tmux::session::PaneInfo>> = HashMap::new();
     for pane in tmux::session::list_all_panes(server)? {
-        commands.entry(pane.session).or_default().push(pane.command);
+        panes.entry(pane.session.clone()).or_default().push(pane);
     }
     let mut signals = HashMap::new();
     for session in sessions {
         let Some(worktree_id) = session.worktree_id().map(str::to_string) else {
             continue;
         };
-        let panes = commands.remove(&session.name).unwrap_or_default();
-        signals.insert(worktree_id, session.signals(now_epoch, panes));
+        let session_panes = panes.remove(&session.name).unwrap_or_default();
+        let usage = scope_usage(
+            Path::new("/proc"),
+            Path::new(cgroup::CGROUP_ROOT),
+            &session_panes,
+        );
+        let commands = session_panes.into_iter().map(|p| p.command).collect();
+        let mut signal = session.signals(now_epoch, commands);
+        signal.usage = usage;
+        signals.insert(worktree_id, signal);
     }
     Ok(signals)
+}
+
+/// Sum the resource usage of a session's Grove agent scopes.
+///
+/// Only Grove's own scopes are counted. The shell's cgroup is the terminal's,
+/// shared with much of the desktop, and reporting its memory beside a
+/// worktree's name would be actively misleading. A session with no scoped
+/// agent therefore reports `None`, not zero.
+///
+/// Reads `/proc` and `/sys`: cheap file reads, but still worker-thread work.
+pub fn scope_usage(
+    proc_root: &Path,
+    cgroup_root: &Path,
+    panes: &[tmux::session::PaneInfo],
+) -> Option<cgroup::Usage> {
+    let mut seen = std::collections::BTreeSet::new();
+    for pane in panes {
+        if let Some(path) = cgroup::cgroup_of_pid(proc_root, pane.pid)
+            && cgroup::is_grove_scope(&path)
+        {
+            // Panes can share a cgroup; counting it twice would double the
+            // memory figure.
+            seen.insert(path);
+        }
+    }
+    let mut total: Option<cgroup::Usage> = None;
+    for path in seen {
+        if let Some(usage) = cgroup::read_usage(cgroup_root, &path) {
+            total = Some(total.unwrap_or_default().plus(usage));
+        }
+    }
+    total
 }
 
 /// What activating a worktree actually did, so the UI can say so.
@@ -376,6 +419,7 @@ pub fn open_in_new_terminal(
 mod tests {
     use super::*;
     use crate::git::WorktreeEntry;
+    use crate::status::SessionStatus;
     use std::path::PathBuf;
 
     fn worktree(path: &str) -> Worktree {
@@ -497,18 +541,44 @@ mod tests {
         let mut worktrees = vec![worktree("/home/u/proj"), worktree("/home/u/wt/feature")];
         worktrees[0].session = SessionPresence::Detached;
         worktrees[1].session = SessionPresence::None;
-        let statuses = HashMap::from([
-            (worktrees[0].id.clone(), SessionStatus::Working),
+        let reports = HashMap::from([
+            (
+                worktrees[0].id.clone(),
+                SessionReport::new(SessionStatus::Working),
+            ),
             // A status left over for a session that has since been closed.
-            (worktrees[1].id.clone(), SessionStatus::Attention),
+            (
+                worktrees[1].id.clone(),
+                SessionReport::new(SessionStatus::Attention),
+            ),
         ]);
 
-        apply_session_status(&mut worktrees, &statuses);
+        apply_session_status(&mut worktrees, &reports);
         assert_eq!(worktrees[0].status, Some(SessionStatus::Working));
         assert_eq!(
             worktrees[1].status, None,
             "a closed session must not keep showing a status"
         );
+    }
+
+    #[test]
+    fn resource_figures_follow_the_status_onto_the_row() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        worktrees[0].session = SessionPresence::Detached;
+        let mut report = SessionReport::new(SessionStatus::Working);
+        report.usage = Some(crate::cgroup::Usage {
+            memory_bytes: 2 * 1024 * 1024,
+            cpu_usec: 0,
+        });
+        let reports = HashMap::from([(worktrees[0].id.clone(), report)]);
+
+        apply_session_status(&mut worktrees, &reports);
+        assert_eq!(worktrees[0].resources.as_deref(), Some("2 MB"));
+
+        // And they go when the session does, rather than lingering.
+        worktrees[0].session = SessionPresence::None;
+        apply_session_status(&mut worktrees, &reports);
+        assert_eq!(worktrees[0].resources, None);
     }
 
     #[test]

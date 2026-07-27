@@ -121,6 +121,10 @@ pub struct SessionSignals {
     pub attention_flag: bool,
     /// tmux is flagging a bell for this session.
     pub bell: bool,
+    /// RAM and CPU of the session's scoped agents, when resource accounting
+    /// is on and the scope could be read. `None` means "no figure", which the
+    /// UI shows as nothing rather than as zero.
+    pub usage: Option<crate::cgroup::Usage>,
 }
 
 /// Age of an activity timestamp, in whole seconds since the epoch.
@@ -148,6 +152,40 @@ pub fn classify(signals: &SessionSignals, policy: &StatusPolicy) -> SessionStatu
         return SessionStatus::Working;
     }
     SessionStatus::Idle
+}
+
+/// What one poll concluded about a session: its status, and the resource
+/// figures for its scoped agents when there are any.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SessionReport {
+    pub status: SessionStatus,
+    /// RAM and CPU time of the session's Grove scopes.
+    pub usage: Option<crate::cgroup::Usage>,
+    /// CPU percentage since the previous poll. Absent on the first poll of a
+    /// session, and whenever the counter could not be compared.
+    pub cpu_percent: Option<f32>,
+}
+
+impl SessionReport {
+    pub fn new(status: SessionStatus) -> Self {
+        Self {
+            status,
+            usage: None,
+            cpu_percent: None,
+        }
+    }
+
+    /// The resource line for a row: memory always, CPU when a rate is known.
+    ///
+    /// `None` when there is no scoped agent — which is not the same as zero,
+    /// and must not be rendered as "0 MB".
+    pub fn resource_label(&self) -> Option<String> {
+        let usage = self.usage?;
+        Some(match self.cpu_percent {
+            Some(cpu) => format!("{} · {cpu:.0}% CPU", usage.memory_label()),
+            None => usage.memory_label(),
+        })
+    }
 }
 
 /// Tracks the attention latch across polls, keyed by worktree id.
@@ -347,6 +385,7 @@ mod tests {
             pane_commands: vec!["claude".into()],
             attention_flag: true,
             bell: false,
+            usage: None,
         };
         assert_eq!(
             classify(&signals, &StatusPolicy::default()),
@@ -460,6 +499,27 @@ mod tests {
         assert!(!engine.is_latched("aaaaaa"));
         engine.retain_ids(|_| false);
         assert!(!engine.is_latched("bbbbbb"));
+    }
+
+    #[test]
+    fn a_report_without_a_scope_shows_no_resource_line() {
+        // No scoped agent is not the same as an agent using nothing.
+        let report = SessionReport::new(SessionStatus::Working);
+        assert_eq!(report.resource_label(), None);
+    }
+
+    #[test]
+    fn a_report_shows_memory_alone_until_a_rate_is_known() {
+        let mut report = SessionReport::new(SessionStatus::Working);
+        report.usage = Some(crate::cgroup::Usage {
+            memory_bytes: 566_853_632,
+            cpu_usec: 0,
+        });
+        // The first poll of a session has nothing to compare against.
+        assert_eq!(report.resource_label().as_deref(), Some("540 MB"));
+
+        report.cpu_percent = Some(12.4);
+        assert_eq!(report.resource_label().as_deref(), Some("540 MB · 12% CPU"));
     }
 
     #[test]

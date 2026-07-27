@@ -20,7 +20,7 @@ use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::process::Invocation;
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
-use grove_core::status::SessionStatus;
+use grove_core::status::{SessionReport, SessionStatus};
 use grove_core::workflow::{self, Activation};
 use grove_core::{Error, Paths, TmuxServer, config, git, state, terminal, tmux};
 
@@ -196,7 +196,7 @@ pub enum Message {
     },
     /// One poll of the status engine, keyed by worktree id. Sent by the
     /// poller thread, not by the worker.
-    StatusPolled(HashMap<String, SessionStatus>),
+    StatusPolled(HashMap<String, SessionReport>),
     /// An explicit `grove notify` report arrived over the socket.
     Notified {
         worktree_id: String,

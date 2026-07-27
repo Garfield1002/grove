@@ -17,12 +17,13 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use grove_core::cgroup::Usage;
 use grove_core::config::StatusConfig;
 use grove_core::desktop::{self, Attention};
 use grove_core::ipc::{self, Notification};
-use grove_core::status::{SessionStatus, StatusEngine};
+use grove_core::status::{SessionReport, SessionStatus, StatusEngine};
 use grove_core::{Error, Paths, TmuxServer, workflow};
 
 use crate::workers::{ErrorReport, Message};
@@ -85,6 +86,7 @@ impl StatusWatch {
             labels: HashMap::new(),
             notify_desktop: StatusConfig::default().desktop_notifications,
             known: HashMap::new(),
+            previous_usage: HashMap::new(),
         };
         spawn("grove-poller", move || poller.run(control_rx));
 
@@ -142,6 +144,9 @@ struct Poller {
     /// on the transition into attention rather than on every poll that still
     /// sees it.
     known: HashMap<String, SessionStatus>,
+    /// The previous usage reading per worktree and when it was taken. CPU is a
+    /// cumulative counter, so a percentage needs two readings.
+    previous_usage: HashMap<String, (Usage, Instant)>,
 }
 
 impl Poller {
@@ -185,7 +190,14 @@ impl Poller {
             }
         };
 
-        let mut statuses = HashMap::with_capacity(signals.len());
+        let now = Instant::now();
+        // CPU rates first: they mutate the previous-reading map, and the
+        // engine lock below must not be held across anything else.
+        let cpu: HashMap<String, Option<f32>> = signals
+            .iter()
+            .map(|(id, signal)| (id.clone(), self.cpu_percent(id, signal.usage, now)))
+            .collect();
+        let mut reports = HashMap::with_capacity(signals.len());
         let mut raised = Vec::new();
         {
             let mut engine = lock(&self.engine);
@@ -199,15 +211,48 @@ impl Poller {
                 {
                     raised.push(worktree_id.clone());
                 }
-                statuses.insert(worktree_id.clone(), status);
+                reports.insert(
+                    worktree_id.clone(),
+                    SessionReport {
+                        status,
+                        usage: signal.usage,
+                        cpu_percent: cpu.get(worktree_id).copied().flatten(),
+                    },
+                );
             }
         }
-        self.known.clone_from(&statuses);
+        self.known = reports
+            .iter()
+            .map(|(id, r)| (id.clone(), r.status))
+            .collect();
+        // Drop readings for sessions that are gone, so the map cannot grow
+        // without bound over a long-running process.
+        self.previous_usage.retain(|id, _| signals.contains_key(id));
 
         for worktree_id in raised {
             self.announce(&worktree_id, None);
         }
-        self.emit(Message::StatusPolled(statuses));
+        self.emit(Message::StatusPolled(reports));
+    }
+
+    /// CPU percentage since this worktree's previous reading, recording the
+    /// current one for the next poll.
+    fn cpu_percent(
+        &mut self,
+        worktree_id: &str,
+        usage: Option<Usage>,
+        now: Instant,
+    ) -> Option<f32> {
+        let usage = usage?;
+        let percent = self
+            .previous_usage
+            .get(worktree_id)
+            .and_then(|(previous, taken)| {
+                usage.cpu_percent(*previous, now.saturating_duration_since(*taken))
+            });
+        self.previous_usage
+            .insert(worktree_id.to_string(), (usage, now));
+        percent
     }
 
     /// Post a desktop notification for a worktree that just raised attention.

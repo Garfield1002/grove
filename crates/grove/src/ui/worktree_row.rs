@@ -266,6 +266,10 @@ fn hover_lines(worktree: &Worktree) -> Vec<String> {
     {
         lines.push(message.to_string());
     }
+    // What the agent's own cgroup reports, when it has one.
+    if let Some(resources) = worktree.resources.as_deref() {
+        lines.push(resources.to_string());
+    }
     if let Some(status) = &worktree.git_status {
         lines.push(status.summary());
     }

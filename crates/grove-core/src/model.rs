@@ -127,6 +127,10 @@ pub struct Worktree {
     /// The message from the last `grove notify` for this worktree, shown while
     /// its status is still the one that message reported.
     pub status_message: Option<String>,
+    /// RAM and CPU of the worktree's scoped agents, pre-rendered by the
+    /// poller. `None` means there is no scoped agent — not that it uses
+    /// nothing.
+    pub resources: Option<String>,
 }
 
 impl Worktree {
@@ -154,6 +158,7 @@ impl Worktree {
             git_status: None,
             status: None,
             status_message: None,
+            resources: None,
         }
     }
 
