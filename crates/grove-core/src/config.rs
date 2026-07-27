@@ -1,8 +1,11 @@
 //! `config.toml` — user-owned configuration.
 //!
-//! Grove reads this file. It writes it exactly once: on first run, when no
-//! file exists and a terminal has been auto-detected. It never rewrites or
-//! reformats a file the user has touched (ARCHITECTURE.md §4).
+//! Grove reads this file. It creates it once, on first run, when no file
+//! exists and a terminal has been auto-detected. After that the only writes
+//! are the *surgical* per-key edits in [`crate::config_write`], made when the
+//! user changes something in the Settings UI: comments, ordering and unknown
+//! keys survive, and the whole `Config` struct is never serialized over a file
+//! the user has touched (ARCHITECTURE.md §4).
 
 use std::path::Path;
 

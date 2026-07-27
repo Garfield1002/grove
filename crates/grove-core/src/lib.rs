@@ -6,7 +6,9 @@
 //! subprocess says so in its documentation — the UI must call those from a
 //! worker thread only.
 
+pub mod atomic;
 pub mod config;
+pub mod config_write;
 pub mod error;
 pub mod git;
 pub mod ids;

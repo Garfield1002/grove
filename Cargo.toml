@@ -14,6 +14,12 @@ eframe = { version = "0.32", default-features = false, features = ["glow", "wayl
 egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+toml_edit = "0.25"
+# Native file picker. On Wayland this is the xdg-desktop-portal dialog, i.e.
+# the compositor's own picker — no window tricks of our own. The portal client
+# (`ashpd`) needs an async executor internally; Grove's own concurrency stays
+# threads + mpsc, and the picker is called blocking from the worker thread.
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland", "async-std"] }
 thiserror = "2"
 shell-words = "1"
 tempfile = "3"

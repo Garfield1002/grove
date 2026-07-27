@@ -117,48 +117,7 @@ pub fn load(path: &Path) -> Result<State> {
 /// directory, fsync it, then `rename(2)` over the target. A crash mid-write
 /// leaves the previous file intact.
 pub fn save(path: &Path, state: &State) -> Result<()> {
-    use std::io::Write;
-
-    let text = state.to_toml()?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)
-        .map_err(|e| Error::io(format!("could not create {}", dir.display()), e))?;
-
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "state.toml".to_string());
-    let temp = dir.join(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        temp_counter()
-    ));
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::io(format!("could not write {}", temp.display()), e));
-    }
-
-    if let Err(e) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::io(
-            format!("could not replace {}", path.display()),
-            e,
-        ));
-    }
-    Ok(())
-}
-
-fn temp_counter() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    crate::atomic::write(path, &state.to_toml()?)
 }
 
 #[cfg(test)]

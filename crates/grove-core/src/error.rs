@@ -150,6 +150,18 @@ pub enum Error {
         source: toml::de::Error,
     },
 
+    /// `config.toml` could not be parsed for a surgical edit. Boxed because
+    /// `toml_edit::TomlError` is large and this variant is rare.
+    #[error("could not parse {path}: {source}")]
+    ConfigEdit {
+        path: PathBuf,
+        #[source]
+        source: Box<toml_edit::TomlError>,
+    },
+
+    #[error("cannot set {key}: {reason}")]
+    ConfigEditKey { key: String, reason: String },
+
     #[error("could not read {path}: {source}")]
     StateRead {
         path: PathBuf,
