@@ -151,7 +151,15 @@ Three states, evaluated by `grove-core::status` from poller + IPC inputs:
   a `grove notify` message, or a manual user override.
 
 Precedence: attention > working > idle. Attention latches until the user
-opens the session. Process-name sniffing alone is explicitly *not* trusted
+opens the session.
+
+There is **no Grove daemon**: the only long-lived processes are the tmux
+server and (when open) the GUI. `grove notify` delivers over the IPC socket
+when the GUI is running, and *always* also stamps the session with a
+`@grove_attention` tmux user option — so attention raised while the GUI is
+closed is held durably by tmux and picked up by the first poll after the
+next launch. The socket is a latency optimization, not the source of truth.
+Clearing attention (on session open) clears the user option too. Process-name sniffing alone is explicitly *not* trusted
 to infer attention; terminal-output parsing is out of scope.
 
 ## 7. Reconciliation & restore
