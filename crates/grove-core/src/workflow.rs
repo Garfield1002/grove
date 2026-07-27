@@ -37,6 +37,7 @@ pub fn open_project(server: &TmuxServer, config: &Config, path: &Path) -> Result
         default_worktree_path,
         is_expanded: true,
         worktrees,
+        unavailable: None,
     };
     apply_session_presence(&mut project.worktrees, &session_presence(server)?);
     Ok(project)
@@ -136,6 +137,12 @@ pub fn refresh_project(
 ) -> Result<Vec<Worktree>> {
     let entries = git::worktree_list(repository_path)?;
     let mut worktrees = worktrees_from_entries(&entries, project_id, git_common_dir);
+    for worktree in &mut worktrees {
+        // A worktree git still lists whose directory has gone is *unavailable*
+        // — the same mark reconciliation makes, so a refresh after a git
+        // operation cannot quietly drop it (DESIGN.md §11).
+        worktree.is_missing = !worktree.is_bare && !worktree.path.is_dir();
+    }
     apply_session_presence(&mut worktrees, &session_presence(server)?);
     Ok(worktrees)
 }
@@ -380,6 +387,62 @@ pub fn activate_worktree(
         command: terminal::preview(&invocation),
         session,
     })
+}
+
+/// Open a session by name, without creating anything (DESIGN.md §11).
+///
+/// This is how an *orphaned* session is opened: it exists, it may hold work
+/// the user wants to see, and Grove must be able to show it before the user
+/// decides whether to associate or close it. `cwd` is only used to fill the
+/// `{path}` template variable — the session already has its own directory.
+///
+/// Runs subprocesses: worker thread only.
+pub fn open_session(
+    server: &TmuxServer,
+    config: &Config,
+    session: &str,
+    cwd: &Path,
+) -> Result<Activation> {
+    let clients = tmux::list_clients(server)?;
+    if let Some(client) = tmux::primary_client(&clients) {
+        tmux::switch_client(server, client, session)?;
+        return Ok(Activation::SwitchedClient {
+            session: session.to_string(),
+            client_tty: client.tty.to_string_lossy().into_owned(),
+        });
+    }
+    if !config.has_terminal() {
+        return Err(Error::EmptyTerminalTemplate);
+    }
+    let vars = TemplateVars::new(server.socket(), session, cwd, "", "");
+    let invocation = terminal::launch(&config.terminal.command, &vars)?;
+    Ok(Activation::LaunchedTerminal {
+        command: terminal::preview(&invocation),
+        session: session.to_string(),
+    })
+}
+
+/// Adopt an orphaned session as a worktree's session (DESIGN.md §11).
+///
+/// The session is renamed to `wt-<id>` and stamped with the `@grove_*`
+/// options, so both reconciliation keys agree afterwards. Nothing is created
+/// or killed: this is the same session, with the same panes and history,
+/// under a name Grove can find again.
+///
+/// The worktree must already have no session of its own — associating over a
+/// live one would leave two sessions fighting for the same name, which tmux
+/// would refuse anyway.
+///
+/// Runs subprocesses: worker thread only.
+pub fn associate_session(
+    server: &TmuxServer,
+    project_name: &str,
+    git_common_dir: &Path,
+    worktree: &Worktree,
+    orphan: &str,
+) -> Result<String> {
+    let spec = session_spec(project_name, git_common_dir, worktree);
+    tmux::associate_session(server, orphan, &spec)
 }
 
 /// Attach an *additional* terminal client to a worktree's session without

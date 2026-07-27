@@ -292,6 +292,38 @@ pub fn set_session_metadata(server: &TmuxServer, session: &str, spec: &SessionSp
     Ok(())
 }
 
+/// Build one `rename-session -t <old> <new>` invocation.
+pub fn rename_session_args(old: &str, new: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("rename-session"),
+        OsString::from("-t"),
+        OsString::from(old),
+        OsString::from(new),
+    ]
+}
+
+/// Adopt an orphaned session as a worktree's session (DESIGN.md §11).
+///
+/// Renaming is what makes the session findable again by name after a
+/// `state.toml` loss, and the `@grove_*` options are what make it findable
+/// even if it is renamed by hand later. Nothing is created or destroyed here:
+/// the panes, their processes and their history are the same session
+/// throughout.
+///
+/// Runs subprocesses: worker thread only.
+pub fn associate_session(
+    server: &TmuxServer,
+    current_name: &str,
+    spec: &SessionSpec,
+) -> Result<String> {
+    let name = spec.session_name();
+    if current_name != name {
+        server.run(rename_session_args(current_name, &name))?;
+    }
+    set_session_metadata(server, &name, spec)?;
+    Ok(name)
+}
+
 /// Read the `@grove_*` user options back from a session.
 pub fn session_metadata(server: &TmuxServer, session: &str) -> Result<SessionMetadata> {
     Ok(list_sessions(server)?
@@ -668,6 +700,14 @@ mod tests {
                 "@grove_worktree",
                 "/home/u/my wt",
             ]
+        );
+    }
+
+    #[test]
+    fn rename_keeps_names_with_odd_characters_in_one_argument() {
+        assert_eq!(
+            rename_session_args("my session", "wt-a1b2c3"),
+            ["rename-session", "-t", "my session", "wt-a1b2c3"]
         );
     }
 

@@ -19,6 +19,7 @@ pub mod ipc;
 pub mod model;
 pub mod paths;
 pub mod process;
+pub mod reconcile;
 pub mod removal;
 pub mod state;
 pub mod status;

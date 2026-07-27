@@ -1,12 +1,17 @@
 //! `state.toml` — app-owned state.
 //!
-//! Milestone 1 persists only the registered project list. The file is an
-//! *index*, never a source of truth: git and tmux decide what exists, and
-//! nothing is ever deleted because it is absent here (ARCHITECTURE.md §8.1).
-//! Full startup reconciliation arrives in Milestone 3; the shapes below are
-//! deliberately additive (`#[serde(default)]` everywhere) so a newer field or
-//! table can be introduced without invalidating an older file, and an older
-//! Grove tolerates a file written by a newer one.
+//! It holds the registered project list, the worktree ↔ session mappings Grove
+//! has seen, and the orphaned sessions the user asked it to stop mentioning.
+//! The file is an *index*, never a source of truth: git and tmux decide what
+//! exists, and nothing is ever deleted because it is absent here
+//! (ARCHITECTURE.md §8.1). Conversely nothing here can resurrect a session:
+//! a mapping whose session tmux no longer reports is shown as *stopped*
+//! (DESIGN.md §11), never recreated behind the user's back.
+//!
+//! The shapes below are deliberately additive (`#[serde(default)]`
+//! everywhere) so a newer field or table can be introduced without
+//! invalidating an older file, and an older Grove tolerates a file written by
+//! a newer one.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +28,14 @@ pub struct State {
     pub version: u32,
     #[serde(rename = "project")]
     pub projects: Vec<ProjectRecord>,
+    /// Worktree ↔ session mappings Grove has seen. Purely an index: a record
+    /// whose session is gone makes the row say *stopped*, and never recreates
+    /// anything.
+    #[serde(rename = "session")]
+    pub sessions: Vec<SessionRecord>,
+    /// Orphaned tmux sessions the user chose to ignore, by session name.
+    /// Ignoring hides a session from the restore report; it never closes it.
+    pub ignored_sessions: Vec<String>,
 }
 
 impl Default for State {
@@ -30,6 +43,8 @@ impl Default for State {
         Self {
             version: STATE_VERSION,
             projects: Vec::new(),
+            sessions: Vec::new(),
+            ignored_sessions: Vec::new(),
         }
     }
 }
@@ -62,6 +77,25 @@ impl Default for ProjectRecord {
             is_expanded: true,
         }
     }
+}
+
+/// A tmux session Grove has seen for a worktree.
+///
+/// Written when reconciliation finds a live session and kept afterwards, so a
+/// session that disappears can be reported as *stopped* rather than as "there
+/// was never one" (DESIGN.md §11). It is dropped only when the user closes
+/// that session themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionRecord {
+    /// Deterministic worktree id; the session is named `wt-<id>`.
+    pub worktree_id: String,
+    pub project_id: String,
+    pub worktree_path: PathBuf,
+    pub session_name: String,
+    /// Seconds since the Unix epoch of the last activity tmux reported, or 0
+    /// when it never reported one.
+    pub last_activity_at: u64,
 }
 
 impl State {
@@ -97,10 +131,67 @@ impl State {
 
     /// Remove a project from Grove's index. This must never be accompanied by
     /// any filesystem or git operation.
+    ///
+    /// Its session records go with it — they are an index of that project's
+    /// sessions and would otherwise describe rows that are no longer shown.
+    /// The tmux sessions themselves keep running; closing one is a separate,
+    /// separately confirmed operation (ARCHITECTURE.md §8.2).
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.projects.len();
         self.projects.retain(|p| p.id != id);
+        self.sessions.retain(|s| s.project_id != id);
         self.projects.len() != before
+    }
+
+    pub fn session(&self, worktree_id: &str) -> Option<&SessionRecord> {
+        self.sessions.iter().find(|s| s.worktree_id == worktree_id)
+    }
+
+    /// Record (or refresh) the session mapping for a worktree.
+    pub fn record_session(&mut self, record: SessionRecord) {
+        match self
+            .sessions
+            .iter_mut()
+            .find(|s| s.worktree_id == record.worktree_id)
+        {
+            Some(existing) => *existing = record,
+            None => self.sessions.push(record),
+        }
+    }
+
+    /// Forget a worktree's session mapping. Called when the user closes that
+    /// session: a session that vanished on its own keeps its record, which is
+    /// what makes it show as *stopped* instead of silently disappearing.
+    pub fn forget_session(&mut self, worktree_id: &str) -> bool {
+        let before = self.sessions.len();
+        self.sessions.retain(|s| s.worktree_id != worktree_id);
+        self.sessions.len() != before
+    }
+
+    /// Every worktree id Grove has a session record for.
+    pub fn recorded_session_ids(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .map(|s| s.worktree_id.clone())
+            .collect()
+    }
+
+    pub fn is_ignored(&self, session_name: &str) -> bool {
+        self.ignored_sessions.iter().any(|n| n == session_name)
+    }
+
+    /// Stop reporting an orphaned session. Nothing is closed or deleted.
+    pub fn ignore_session(&mut self, session_name: &str) {
+        if !self.is_ignored(session_name) {
+            self.ignored_sessions.push(session_name.to_string());
+        }
+    }
+
+    /// Report ignored sessions again.
+    pub fn clear_ignored_sessions(&mut self) -> bool {
+        let before = self.ignored_sessions.len();
+        self.ignored_sessions.clear();
+        before != 0
     }
 }
 
@@ -305,5 +396,112 @@ mod tests {
         assert!(!state.remove("a1b2c3"));
         assert_eq!(state.projects.len(), 1);
         assert!(state.find("ddeeff").is_some());
+    }
+
+    // -------------------------------------------------- session records (M3)
+
+    fn session(worktree_id: &str, project_id: &str) -> SessionRecord {
+        SessionRecord {
+            worktree_id: worktree_id.to_string(),
+            project_id: project_id.to_string(),
+            worktree_path: PathBuf::from(format!("/home/u/wt/{worktree_id}")),
+            session_name: format!("wt-{worktree_id}"),
+            last_activity_at: 1_753_600_000,
+        }
+    }
+
+    #[test]
+    fn session_records_round_trip_through_toml() {
+        let mut state = State::default();
+        state.upsert(record("a1b2c3", "acme-web"));
+        state.record_session(session("bceeb7", "a1b2c3"));
+        state.ignore_session("wt-999999");
+
+        let text = state.to_toml().expect("serializes");
+        let parsed = State::from_toml(&text, Path::new("state.toml")).expect("parses");
+        assert_eq!(parsed, state);
+        assert_eq!(
+            parsed.session("bceeb7").map(|s| s.session_name.as_str()),
+            Some("wt-bceeb7")
+        );
+        assert!(parsed.is_ignored("wt-999999"));
+    }
+
+    #[test]
+    fn recording_a_session_twice_updates_it_in_place() {
+        let mut state = State::default();
+        state.record_session(session("bceeb7", "a1b2c3"));
+        state.record_session(SessionRecord {
+            last_activity_at: 1_753_609_999,
+            ..session("bceeb7", "a1b2c3")
+        });
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(
+            state.session("bceeb7").map(|s| s.last_activity_at),
+            Some(1_753_609_999)
+        );
+    }
+
+    #[test]
+    fn forgetting_a_session_removes_only_that_mapping() {
+        let mut state = State::default();
+        state.record_session(session("bceeb7", "a1b2c3"));
+        state.record_session(session("69f1b5", "a1b2c3"));
+        assert!(state.forget_session("bceeb7"));
+        assert!(!state.forget_session("bceeb7"));
+        assert_eq!(state.recorded_session_ids(), vec!["69f1b5".to_string()]);
+    }
+
+    /// Removing a project takes its session index with it — but that is still
+    /// only an index: no tmux session is touched by this call.
+    #[test]
+    fn removing_a_project_drops_its_session_records_only() {
+        let mut state = State::default();
+        state.upsert(record("a1b2c3", "acme-web"));
+        state.upsert(record("ddeeff", "design-system"));
+        state.record_session(session("bceeb7", "a1b2c3"));
+        state.record_session(session("111111", "ddeeff"));
+
+        state.remove("a1b2c3");
+        assert_eq!(state.recorded_session_ids(), vec!["111111".to_string()]);
+    }
+
+    #[test]
+    fn ignoring_a_session_is_idempotent_and_reversible() {
+        let mut state = State::default();
+        state.ignore_session("wt-999999");
+        state.ignore_session("wt-999999");
+        assert_eq!(state.ignored_sessions.len(), 1);
+        assert!(state.is_ignored("wt-999999"));
+        assert!(!state.is_ignored("wt-000000"));
+        assert!(state.clear_ignored_sessions());
+        assert!(!state.clear_ignored_sessions());
+        assert!(!state.is_ignored("wt-999999"));
+    }
+
+    /// A file written by an older Grove has neither table; it must load as a
+    /// state with no session index rather than failing.
+    #[test]
+    fn a_file_without_the_session_tables_still_loads() {
+        let state = State::from_toml(
+            "version = 1\n\n[[project]]\nid = \"a1b2c3\"\nname = \"acme\"\n",
+            Path::new("state.toml"),
+        )
+        .expect("older file");
+        assert!(state.sessions.is_empty());
+        assert!(state.ignored_sessions.is_empty());
+    }
+
+    #[test]
+    fn a_partial_session_record_is_tolerated() {
+        let state = State::from_toml(
+            "[[session]]\nworktree_id = \"bceeb7\"\n",
+            Path::new("state.toml"),
+        )
+        .expect("partial record");
+        let record = state.session("bceeb7").expect("present");
+        assert_eq!(record.session_name, "");
+        assert_eq!(record.last_activity_at, 0);
+        assert_eq!(record.worktree_path, PathBuf::new());
     }
 }
