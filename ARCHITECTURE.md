@@ -74,7 +74,7 @@ grove/
 │   │       ├── git/
 │   │       │   ├── commands.rs # process invocation (arg arrays)
 │   │       │   ├── parser.rs   # `worktree list --porcelain` etc. — TESTED
-│   │       │   └── status.rs   # dirty/ahead-behind summary
+│   │       │   └── status.rs   # `status --porcelain=v2` summary — TESTED
 │   │       ├── tmux/
 │   │       │   ├── server.rs   # socket path, server lifecycle
 │   │       │   ├── session.rs  # create/kill/list, activity timestamps
@@ -82,6 +82,7 @@ grove/
 │   │       ├── terminal.rs     # template expansion, auto-detect, launch
 │   │       ├── config.rs       # config.toml (read-only for the app)
 │   │       ├── state.rs        # state.toml (atomic temp+rename writes)
+│   │       ├── removal.rs      # safe-removal risk report (pure) — TESTED
 │   │       ├── reconcile.rs    # startup/restore reconciliation
 │   │       ├── status.rs       # working/idle/attention state machine
 │   │       └── ipc.rs          # notify socket protocol
@@ -93,7 +94,8 @@ grove/
 │           └── ui/
 │               ├── project_list.rs
 │               ├── worktree_row.rs
-│               ├── dialogs.rs      # create-worktree, safe-removal, errors
+│               ├── dialogs/        # open-project, create-worktree,
+│               │                   # safe-removal, error area
 │               └── settings.rs
 └── docs/DESIGN.md          # original full design document
 ```

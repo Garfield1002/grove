@@ -432,36 +432,14 @@ impl GroveApp {
 
     /// The rows the keyboard walks: every visible worktree, in list order.
     fn visible_rows(&self) -> Vec<(String, String)> {
-        let needle = self.filter.trim().to_ascii_lowercase();
-        let mut rows = Vec::new();
-        for project in &self.projects {
-            if !project.is_expanded {
-                continue;
-            }
-            for worktree in &project.worktrees {
-                if ui::project_list::matches_filter(project, worktree, &needle) {
-                    rows.push((project.id.clone(), worktree.id.clone()));
-                }
-            }
-        }
-        rows
+        visible_rows(&self.projects, &self.filter)
     }
 
     fn move_selection(&mut self, delta: isize) {
         let rows = self.visible_rows();
-        if rows.is_empty() {
-            return;
+        if let Some(next) = next_selection(&rows, self.selected.as_deref(), delta) {
+            self.selected = Some(next);
         }
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|id| rows.iter().position(|(_, w)| w == id));
-        let next = match current {
-            Some(index) => (index as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
-            None if delta < 0 => rows.len() - 1,
-            None => 0,
-        };
-        self.selected = Some(rows[next].1.clone());
     }
 
     fn selected_row(&self) -> Option<(String, String)> {
@@ -688,5 +666,169 @@ impl eframe::App for GroveApp {
             self.apply_action(action);
         }
         self.keyboard(ctx);
+    }
+}
+
+/// The worktree rows the user can see, as (project id, worktree id) pairs, in
+/// list order. Collapsed projects and filtered-out rows are not walkable.
+fn visible_rows(projects: &[Project], filter: &str) -> Vec<(String, String)> {
+    let needle = filter.trim().to_ascii_lowercase();
+    let mut rows = Vec::new();
+    for project in projects {
+        if !project.is_expanded {
+            continue;
+        }
+        for worktree in &project.worktrees {
+            if ui::project_list::matches_filter(project, worktree, &needle) {
+                rows.push((project.id.clone(), worktree.id.clone()));
+            }
+        }
+    }
+    rows
+}
+
+/// The worktree id Up/Down should move to. `None` when there is nothing to
+/// select. The ends do not wrap: a held arrow key stops at the list edge.
+fn next_selection(
+    rows: &[(String, String)],
+    selected: Option<&str>,
+    delta: isize,
+) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let current = selected.and_then(|id| rows.iter().position(|(_, w)| w == id));
+    let next = match current {
+        Some(index) => (index as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+        // Nothing selected yet: Down starts at the top, Up at the bottom.
+        None if delta < 0 => rows.len() - 1,
+        None => 0,
+    };
+    Some(rows[next].1.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grove_core::git::WorktreeEntry;
+    use grove_core::model::Worktree;
+
+    fn project(id: &str, name: &str, branches: &[&str]) -> Project {
+        let git_common_dir = PathBuf::from(format!("/home/u/{name}/.git"));
+        Project {
+            id: id.to_string(),
+            name: name.to_string(),
+            repository_path: PathBuf::from(format!("/home/u/{name}")),
+            git_common_dir: git_common_dir.clone(),
+            default_worktree_path: PathBuf::from("/home/u"),
+            is_expanded: true,
+            worktrees: branches
+                .iter()
+                .map(|branch| {
+                    Worktree::from_entry(
+                        &WorktreeEntry {
+                            path: PathBuf::from(format!("/home/u/wt/{name}-{branch}")),
+                            branch: Some((*branch).to_string()),
+                            ..WorktreeEntry::default()
+                        },
+                        id,
+                        &git_common_dir,
+                        false,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn ids(rows: &[(String, String)]) -> Vec<String> {
+        rows.iter().map(|(_, w)| w.clone()).collect()
+    }
+
+    #[test]
+    fn visible_rows_follow_the_list_order_across_projects() {
+        let projects = vec![
+            project("p1", "acme", &["main", "feature"]),
+            project("p2", "design", &["main"]),
+        ];
+        let rows = visible_rows(&projects, "");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "p1");
+        assert_eq!(rows[2].0, "p2");
+    }
+
+    #[test]
+    fn a_collapsed_project_is_not_walkable() {
+        let mut projects = vec![
+            project("p1", "acme", &["main", "feature"]),
+            project("p2", "design", &["main"]),
+        ];
+        projects[0].is_expanded = false;
+        let rows = visible_rows(&projects, "");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "p2");
+    }
+
+    #[test]
+    fn the_filter_narrows_what_the_keyboard_walks() {
+        let projects = vec![project("p1", "acme", &["main", "feature/auth"])];
+        let rows = visible_rows(&projects, "auth");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1, projects[0].worktrees[1].id,
+            "only the matching row is selectable"
+        );
+    }
+
+    #[test]
+    fn selection_moves_one_row_at_a_time_and_stops_at_the_ends() {
+        let projects = vec![project("p1", "acme", &["a", "b", "c"])];
+        let rows = visible_rows(&projects, "");
+        let all = ids(&rows);
+
+        assert_eq!(
+            next_selection(&rows, Some(&all[0]), 1).as_ref(),
+            Some(&all[1])
+        );
+        assert_eq!(
+            next_selection(&rows, Some(&all[1]), -1).as_ref(),
+            Some(&all[0])
+        );
+        assert_eq!(
+            next_selection(&rows, Some(&all[0]), -1).as_ref(),
+            Some(&all[0]),
+            "the top does not wrap to the bottom"
+        );
+        assert_eq!(
+            next_selection(&rows, Some(&all[2]), 1).as_ref(),
+            Some(&all[2]),
+            "the bottom does not wrap to the top"
+        );
+    }
+
+    #[test]
+    fn with_nothing_selected_down_starts_at_the_top_and_up_at_the_bottom() {
+        let projects = vec![project("p1", "acme", &["a", "b", "c"])];
+        let rows = visible_rows(&projects, "");
+        let all = ids(&rows);
+        assert_eq!(next_selection(&rows, None, 1).as_ref(), Some(&all[0]));
+        assert_eq!(next_selection(&rows, None, -1).as_ref(), Some(&all[2]));
+    }
+
+    #[test]
+    fn a_selection_that_is_no_longer_visible_restarts_from_the_edge() {
+        let projects = vec![project("p1", "acme", &["a", "b"])];
+        let rows = visible_rows(&projects, "");
+        let all = ids(&rows);
+        assert_eq!(
+            next_selection(&rows, Some("gone"), 1).as_ref(),
+            Some(&all[0])
+        );
+    }
+
+    #[test]
+    fn an_empty_list_selects_nothing() {
+        assert_eq!(next_selection(&[], None, 1), None);
+        assert_eq!(next_selection(&[], Some("a1b2c3"), -1), None);
+        assert!(visible_rows(&[], "").is_empty());
     }
 }
