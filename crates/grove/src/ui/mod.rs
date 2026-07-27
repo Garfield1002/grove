@@ -10,7 +10,6 @@ pub mod project_list;
 pub mod settings;
 pub mod theme;
 pub mod window_edge;
-pub mod window_row;
 pub mod worktree_row;
 
 /// Was the binary built with the native directory picker (`rfd`, which goes

@@ -1,10 +1,17 @@
-//! The project list: collapsible project headers with a worktree-count badge,
-//! each followed by its worktree rows.
+//! The project list: three levels, each of which disappears when it would
+//! have exactly one child.
+//!
+//! A project is a dropdown header with a worktree-count badge; a worktree with
+//! several tmux windows is the same dropdown, badged with its window count;
+//! and a window is a leaf row. A project with one worktree is drawn as that
+//! worktree under the project's name, and a worktree with one window is drawn
+//! as that window under the worktree's — so the common case, one repository
+//! with one shell, is still a single row.
 
 use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
 
-use super::{Action, icons, theme, window_row, worktree_row};
+use super::{Action, icons, theme, worktree_row};
 
 /// Draw every project, applying the filter. Returns the user's action.
 pub fn show(
@@ -32,23 +39,22 @@ pub fn show(
             continue;
         }
 
-        // A project with a single worktree is drawn as that one row, under the
+        // A project with a single worktree is drawn as that worktree, under the
         // project's name: a header with exactly one child says nothing the
         // child does not. An unavailable project keeps its header, which is
         // where its Retry and Locate live (DESIGN.md §11).
         if project.is_available() && project.worktrees.len() == 1 && matches.len() == 1 {
             let worktree = matches[0];
-            if let Some(row_action) = worktree_row::show(
+            if let Some(inner) = worktree_level(
                 ui,
+                project,
                 worktree,
-                selected == Some(worktree.id.as_str()),
+                worktree_row::Stands::Project(project),
+                selected,
+                selected_window,
                 home,
-                Some(project),
             ) {
-                action = Some(row_action.into_action(&project.id, &worktree.id));
-            }
-            if let Some(window_action) = windows(ui, project, worktree, selected_window) {
-                action = Some(window_action);
+                action = Some(inner);
             }
             ui.add_space(8.0);
             continue;
@@ -73,13 +79,16 @@ pub fn show(
         let body = state.show_body_unindented(ui, |ui| {
             let mut inner = None;
             for worktree in &matches {
-                let is_selected = selected == Some(worktree.id.as_str());
-                if let Some(row_action) = worktree_row::show(ui, worktree, is_selected, home, None)
-                {
-                    inner = Some(row_action.into_action(&project.id, &worktree.id));
-                }
-                if let Some(window_action) = windows(ui, project, worktree, selected_window) {
-                    inner = Some(window_action);
+                if let Some(worktree_action) = worktree_level(
+                    ui,
+                    project,
+                    worktree,
+                    worktree_row::Stands::Worktree,
+                    selected,
+                    selected_window,
+                    home,
+                ) {
+                    inner = Some(worktree_action);
                 }
             }
             if matches.is_empty() {
@@ -119,32 +128,83 @@ pub fn show(
     action
 }
 
-/// The worktree's tmux windows, as child rows.
+/// One worktree of a project: either a single leaf row, or a dropdown header
+/// with one leaf row per tmux window.
 ///
-/// A single window gets no row of its own: the worktree row already stands for
-/// it, exactly as a project with one worktree gets no header. Rows appear only
-/// once a poll has reported windows, so a worktree with no session has none.
-fn windows(
+/// A worktree with one window (or none reported yet) *is* the leaf row, named
+/// after `stands` — which is why a worktree with a single shell looks exactly
+/// as it did before windows entered the tree. Only a second window earns the
+/// header, and the badge on it counts them.
+fn worktree_level(
     ui: &mut Ui,
     project: &Project,
     worktree: &grove_core::model::Worktree,
+    stands: worktree_row::Stands,
+    selected: Option<&str>,
     selected_window: Option<(&str, u32)>,
+    home: Option<&std::path::Path>,
 ) -> Option<Action> {
-    if worktree.windows.len() < 2 {
-        return None;
+    let is_selected = selected == Some(worktree.id.as_str());
+    if !has_window_rows(worktree) {
+        let row_action = worktree_row::show(ui, worktree, is_selected, home, stands)?;
+        return row_action.into_action(&project.id, &worktree.id);
     }
+
+    // egui owns this fold, unlike a project's: it is a view detail of a live
+    // tmux session, not something `state.toml` should carry across restarts.
+    let id = ui.make_persistent_id(("grove-worktree", &worktree.id));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let openness = state.openness(ui.ctx());
+
     let mut action = None;
-    for window in &worktree.windows {
-        let selected = selected_window == Some((worktree.id.as_str(), window.index));
-        if window_row::show(ui, window, selected).is_some() {
-            action = Some(Action::ActivateWindow {
-                project_id: project.id.clone(),
-                worktree_id: worktree.id.clone(),
-                window_index: window.index,
-            });
+    if let Some(row_action) =
+        worktree_row::header(ui, worktree, stands, worktree.windows.len(), openness)
+    {
+        if row_action == worktree_row::RowAction::Fold {
+            state.toggle(ui);
         }
+        action = row_action.into_action(&project.id, &worktree.id);
     }
-    action
+
+    let body = state.show_body_unindented(ui, |ui| {
+        let mut inner = None;
+        for window in &worktree.windows {
+            let selected = selected_window == Some((worktree.id.as_str(), window.index));
+            let Some(row_action) = worktree_row::show(
+                ui,
+                worktree,
+                selected,
+                home,
+                worktree_row::Stands::Window(window),
+            ) else {
+                continue;
+            };
+            // Opening a window row opens *that* window; everything else on it
+            // is the worktree's, and means what it means anywhere else.
+            inner = if row_action == worktree_row::RowAction::Activate {
+                Some(Action::ActivateWindow {
+                    project_id: project.id.clone(),
+                    worktree_id: worktree.id.clone(),
+                    window_index: window.index,
+                })
+            } else {
+                row_action.into_action(&project.id, &worktree.id)
+            };
+        }
+        inner
+    });
+    state.store(ui.ctx());
+    body.and_then(|body| body.inner).or(action)
+}
+
+/// Does this worktree get a dropdown header with a row per window, or is it a
+/// single leaf row?
+///
+/// One window is no reason for two levels, and no window at all — a worktree
+/// with no session, or one Grove has not polled yet — is the same case.
+pub fn has_window_rows(worktree: &grove_core::model::Worktree) -> bool {
+    worktree.windows.len() > 1
 }
 
 pub fn matches_filter(
@@ -378,6 +438,28 @@ mod tests {
             Path::new("/home/u/acme-web/.git"),
             false,
         )
+    }
+
+    fn window(index: u32) -> grove_core::tmux::WindowInfo {
+        grove_core::tmux::WindowInfo {
+            session: "wt-a1b2c3".into(),
+            index,
+            name: "shell".into(),
+            active: index == 0,
+            bell: false,
+        }
+    }
+
+    /// The case that must not have changed when windows joined the tree: one
+    /// shell is still one row, drawn exactly as a worktree always was.
+    #[test]
+    fn a_worktree_with_one_window_stays_a_single_row() {
+        let mut worktree = worktree("main", "/home/u/acme-web");
+        assert!(!has_window_rows(&worktree), "no poll has landed yet");
+        worktree.windows = vec![window(0)];
+        assert!(!has_window_rows(&worktree), "one shell is not a level");
+        worktree.windows.push(window(1));
+        assert!(has_window_rows(&worktree), "a second window earns a header");
     }
 
     #[test]

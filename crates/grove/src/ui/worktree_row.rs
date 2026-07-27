@@ -1,12 +1,58 @@
-//! One worktree row, laid out as in direction 1c: a left accent edge, a
-//! session dot, the branch name over a muted sublabel, and quiet right-aligned
-//! markers for a locked or detached worktree and a dirty working tree.
+//! The tree's leaf row, laid out as in direction 1c: a left accent edge, a
+//! session dot, a name over a muted sublabel, and quiet right-aligned markers
+//! for a locked or detached worktree.
+//!
+//! A leaf is one tmux window. A worktree with a single window *is* that row —
+//! it takes the worktree's name, so nothing about the common case changed when
+//! windows became part of the tree. A worktree with more gets [`header`], the
+//! same dropdown a project has, with one leaf row per window under it.
 
 use egui::{Align, Layout, Sense, Stroke, StrokeKind, Ui, vec2};
 use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::status::SessionStatus;
+use grove_core::tmux::WindowInfo;
 
 use super::{icons, theme};
+
+/// What a row stands for: it decides the row's name, and which menu entries
+/// have nowhere else to live.
+#[derive(Debug, Clone, Copy)]
+pub enum Stands<'a> {
+    /// The worktree itself, named after its branch. Its single window, if it
+    /// has one, is this row.
+    Worktree,
+    /// The worktree standing in for its whole project, which has only this
+    /// one. The row takes the project's name and carries its menu.
+    Project(&'a Project),
+    /// One window of a worktree that has several, named after the window.
+    Window(&'a WindowInfo),
+}
+
+impl<'a> Stands<'a> {
+    /// The project this row also stands for, if any.
+    fn as_project(self) -> Option<&'a Project> {
+        match self {
+            Stands::Project(project) => Some(project),
+            _ => None,
+        }
+    }
+
+    fn as_window(self) -> Option<&'a WindowInfo> {
+        match self {
+            Stands::Window(window) => Some(window),
+            _ => None,
+        }
+    }
+
+    /// The row's name.
+    fn name(self, worktree: &Worktree) -> String {
+        match self {
+            Stands::Worktree => worktree.label(),
+            Stands::Project(project) => project.name.clone(),
+            Stands::Window(window) => format!("{}: {}", window.index, window.name),
+        }
+    }
+}
 
 /// What the user did on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,15 +68,20 @@ pub enum RowAction {
     /// place those two have no header of their own to hang off.
     CreateWorktree,
     RemoveProject,
+    /// Fold or unfold a worktree's window list. Handled in the list itself:
+    /// egui owns that state, and nothing outside the tree cares.
+    Fold,
 }
 
 impl RowAction {
     /// What this row action means for the project and worktree it came from.
-    pub fn into_action(self, project_id: &str, worktree_id: &str) -> super::Action {
+    ///
+    /// `None` for the actions the list handles without leaving the UI.
+    pub fn into_action(self, project_id: &str, worktree_id: &str) -> Option<super::Action> {
         use super::Action;
         let project_id = project_id.to_string();
         let worktree_id = worktree_id.to_string();
-        match self {
+        Some(match self {
             RowAction::Activate => Action::ActivateWorktree {
                 project_id,
                 worktree_id,
@@ -58,7 +109,8 @@ impl RowAction {
             },
             RowAction::CreateWorktree => Action::CreateWorktree(project_id),
             RowAction::RemoveProject => Action::RemoveProject(project_id),
-        }
+            RowAction::Fold => return None,
+        })
     }
 }
 
@@ -125,19 +177,15 @@ const MARKER_SIZE: f32 = 11.0;
 /// numbers rather than competing with them.
 const CPU_ICON: f32 = 9.0;
 
-/// Draw a worktree row.
-///
-/// `project` is `Some` when this row is standing in for its whole project —
-/// the project has this one worktree, so the tree draws one row instead of a
-/// header with a single child. That row takes the project's name and carries
-/// the project's menu entries as well as the worktree's.
+/// Draw a leaf row for a worktree, named after whatever it stands for.
 pub fn show(
     ui: &mut Ui,
     worktree: &Worktree,
     selected: bool,
     home: Option<&std::path::Path>,
-    project: Option<&Project>,
+    stands: Stands,
 ) -> Option<RowAction> {
+    let project = stands.as_project();
     let mut action = None;
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, theme::ROW_HEIGHT), Sense::click());
@@ -180,7 +228,7 @@ pub fn show(
         }
 
         let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
-        match (worktree.session, worktree.status) {
+        match (dot_presence(worktree, stands), worktree.status) {
             // Attention gets its own mark, not just a colour: it is the one
             // state the user has to act on, and colour alone is not enough.
             (session, Some(SessionStatus::Attention)) if session.exists() => icons::bang(
@@ -235,10 +283,7 @@ pub fn show(
         };
         content.add(
             egui::Label::new(theme::mono(
-                match project {
-                    Some(project) => project.name.clone(),
-                    None => worktree.label(),
-                },
+                stands.name(worktree),
                 theme::FONT_BRANCH,
                 name_color,
             ))
@@ -288,77 +333,7 @@ pub fn show(
         action = Some(RowAction::Activate);
     }
 
-    response.context_menu(|ui| {
-        if ui.button("Open or switch to session").clicked() {
-            action = Some(RowAction::Activate);
-            ui.close();
-        }
-        if ui.button("Open in a new terminal").clicked() {
-            action = Some(RowAction::OpenInNewTerminal);
-            ui.close();
-        }
-        if ui.button("New tmux window").clicked() {
-            action = Some(RowAction::OpenNewWindow);
-            ui.close();
-        }
-        if ui.button("Copy worktree path").clicked() {
-            ui.ctx().copy_text(worktree.path.display().to_string());
-            action = Some(RowAction::Select);
-            ui.close();
-        }
-        if ui.button("Start agent").clicked() {
-            action = Some(RowAction::StartAgent);
-            ui.close();
-        }
-        if ui.button("Refresh").clicked() {
-            action = Some(RowAction::Refresh);
-            ui.close();
-        }
-        // With no project header above it, this row is the only way to reach
-        // the project's own actions.
-        if let Some(project) = project {
-            ui.separator();
-            if ui.button("Create worktree…").clicked() {
-                action = Some(RowAction::CreateWorktree);
-                ui.close();
-            }
-            if ui.button("Copy repository path").clicked() {
-                ui.ctx()
-                    .copy_text(project.repository_path.display().to_string());
-                action = Some(RowAction::Select);
-                ui.close();
-            }
-            if ui
-                .button(theme::label(
-                    "Remove project from Grove",
-                    theme::FONT_BODY,
-                    theme::DANGER,
-                ))
-                .clicked()
-            {
-                action = Some(RowAction::RemoveProject);
-                ui.close();
-            }
-            ui.label(theme::label(
-                "Removing a project only removes it from Grove.",
-                theme::FONT_SUB,
-                theme::TEXT_FAINT,
-            ));
-        }
-        ui.separator();
-        if ui
-            .button(theme::label("Remove…", theme::FONT_BODY, theme::DANGER))
-            .clicked()
-        {
-            action = Some(RowAction::Remove);
-            ui.close();
-        }
-        ui.label(theme::label(
-            "Removal asks separately about the session, the worktree and the branch.",
-            theme::FONT_SUB,
-            theme::TEXT_FAINT,
-        ));
-    });
+    response.context_menu(|ui| menu(ui, worktree, stands, &mut action));
 
     // Built lazily: the tooltip allocates, and most rows are never hovered.
     response.on_hover_ui(|ui| {
@@ -375,6 +350,224 @@ pub fn show(
         }
     });
     action
+}
+
+/// A worktree's dropdown header: the same shape as a project's, for a worktree
+/// with more than one tmux window. The badge counts the windows under it.
+///
+/// It opens the worktree on click like a leaf row does — the disclosure
+/// triangle is the affordance for folding it away, and a user who clicks the
+/// name almost always means "give me this worktree".
+pub fn header(
+    ui: &mut Ui,
+    worktree: &Worktree,
+    stands: Stands,
+    count: usize,
+    openness: f32,
+) -> Option<RowAction> {
+    let mut action = None;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::PROJECT_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let hovered = response.hovered();
+
+    // The disclosure triangle is its own target inside the header, so folding
+    // and opening stay separate clicks.
+    let disclosure_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Vec2::splat(18.0),
+    );
+    let disclosure = ui.interact(
+        disclosure_rect,
+        ui.id().with(("grove-worktree-fold", &worktree.id)),
+        Sense::click(),
+    );
+    let more_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 11.0, rect.center().y),
+        egui::Vec2::splat(18.0),
+    );
+    let more = ui.interact(
+        more_rect,
+        ui.id().with(("grove-worktree-more", &worktree.id)),
+        Sense::click(),
+    );
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if hovered {
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(theme::ROW_RADIUS),
+                theme::BADGE.gamma_multiply(0.6),
+            );
+        }
+
+        icons::disclosure(
+            painter,
+            egui::Rect::from_center_size(disclosure_rect.center(), egui::Vec2::splat(9.0)),
+            openness,
+            theme::TEXT_MUTED,
+        );
+
+        // The status colour a leaf row would put on its edge is worth keeping
+        // here: a folded worktree must still be able to say it wants the user.
+        let name_color = match status_color(worktree) {
+            Some(color) => color,
+            None if worktree.session.exists() => theme::TEXT_DIM,
+            None => theme::TEXT_MUTED,
+        };
+        let name = painter.layout_no_wrap(
+            stands.name(worktree),
+            egui::FontId::monospace(theme::FONT_PROJECT),
+            name_color,
+        );
+        let name_left = rect.left() + 21.0;
+        painter.galley(
+            egui::pos2(name_left, rect.center().y - name.size().y / 2.0),
+            name.clone(),
+            name_color,
+        );
+
+        let badge = painter.layout_no_wrap(
+            count.to_string(),
+            egui::FontId::monospace(theme::FONT_SUB),
+            theme::TEXT_GHOST,
+        );
+        let badge_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                name_left + name.size().x + 8.0 + (badge.size().x + 12.0) / 2.0,
+                rect.center().y,
+            ),
+            vec2(badge.size().x + 12.0, 15.0),
+        );
+        painter.rect_filled(
+            badge_rect,
+            egui::CornerRadius::same(theme::BADGE_RADIUS),
+            theme::BADGE,
+        );
+        let badge_size = badge.size();
+        painter.galley(
+            badge_rect.center() - badge_size / 2.0,
+            badge,
+            theme::TEXT_GHOST,
+        );
+
+        if hovered || more.hovered() {
+            icons::ellipsis(
+                painter,
+                more_rect.shrink(4.0),
+                if more.hovered() {
+                    theme::TEXT_DIM
+                } else {
+                    theme::TEXT_FAINT
+                },
+            );
+        }
+    }
+
+    if disclosure.clicked() {
+        action = Some(RowAction::Fold);
+    } else if response.clicked() {
+        action = Some(RowAction::Activate);
+    }
+
+    response.context_menu(|ui| menu(ui, worktree, stands, &mut action));
+    let more = more.on_hover_cursor(egui::CursorIcon::PointingHand);
+    egui::Popup::menu(&more).show(|ui| menu(ui, worktree, stands, &mut action));
+
+    action
+}
+
+/// The menu a worktree row or header offers, wherever it was opened from.
+fn menu(ui: &mut Ui, worktree: &Worktree, stands: Stands, action: &mut Option<RowAction>) {
+    let open = match stands {
+        Stands::Window(_) => "Open or switch to this window",
+        _ => "Open or switch to session",
+    };
+    if ui.button(open).clicked() {
+        *action = Some(RowAction::Activate);
+        ui.close();
+    }
+    if ui.button("Open in a new terminal").clicked() {
+        *action = Some(RowAction::OpenInNewTerminal);
+        ui.close();
+    }
+    if ui.button("New tmux window").clicked() {
+        *action = Some(RowAction::OpenNewWindow);
+        ui.close();
+    }
+    if ui.button("Copy worktree path").clicked() {
+        ui.ctx().copy_text(worktree.path.display().to_string());
+        *action = Some(RowAction::Select);
+        ui.close();
+    }
+    if ui.button("Start agent").clicked() {
+        *action = Some(RowAction::StartAgent);
+        ui.close();
+    }
+    if ui.button("Refresh").clicked() {
+        *action = Some(RowAction::Refresh);
+        ui.close();
+    }
+    // With no project header above it, this row is the only way to reach the
+    // project's own actions.
+    if let Some(project) = stands.as_project() {
+        ui.separator();
+        if ui.button("Create worktree…").clicked() {
+            *action = Some(RowAction::CreateWorktree);
+            ui.close();
+        }
+        if ui.button("Copy repository path").clicked() {
+            ui.ctx()
+                .copy_text(project.repository_path.display().to_string());
+            *action = Some(RowAction::Select);
+            ui.close();
+        }
+        if ui
+            .button(theme::label(
+                "Remove project from Grove",
+                theme::FONT_BODY,
+                theme::DANGER,
+            ))
+            .clicked()
+        {
+            *action = Some(RowAction::RemoveProject);
+            ui.close();
+        }
+        ui.label(theme::label(
+            "Removing a project only removes it from Grove.",
+            theme::FONT_SUB,
+            theme::TEXT_FAINT,
+        ));
+    }
+    ui.separator();
+    if ui
+        .button(theme::label("Remove…", theme::FONT_BODY, theme::DANGER))
+        .clicked()
+    {
+        *action = Some(RowAction::Remove);
+        ui.close();
+    }
+    ui.label(theme::label(
+        "Removal asks separately about the session, the worktree and the branch.",
+        theme::FONT_SUB,
+        theme::TEXT_FAINT,
+    ));
+}
+
+/// What the dot on a row reports.
+///
+/// A window row's dot says whether that window is the session's current one —
+/// the one thing a per-window row can say that the worktree's own presence
+/// cannot. A live status still outranks it: attention and work are why the dot
+/// exists at all.
+fn dot_presence(worktree: &Worktree, stands: Stands) -> SessionPresence {
+    match stands.as_window() {
+        Some(window) if window.active => SessionPresence::Attached,
+        Some(_) => SessionPresence::Detached,
+        None => worktree.session,
+    }
 }
 
 /// Tooltip lines after the path: the git summary and what each marker means.
@@ -661,6 +854,70 @@ mod tests {
         worktree.is_detached = true;
         let list: Vec<Marker> = markers(&worktree).iter().collect();
         assert_eq!(list, vec![Marker::Locked, Marker::Detached]);
+    }
+
+    fn project() -> Project {
+        Project {
+            id: "p1".into(),
+            name: "acme-web".into(),
+            repository_path: PathBuf::from("/home/u/acme-web"),
+            git_common_dir: PathBuf::from("/home/u/acme-web/.git"),
+            default_worktree_path: PathBuf::from("/home/u"),
+            is_expanded: true,
+            worktrees: Vec::new(),
+            unavailable: None,
+        }
+    }
+
+    fn window(index: u32, name: &str, active: bool) -> WindowInfo {
+        WindowInfo {
+            session: "wt-a1b2c3".into(),
+            index,
+            name: name.into(),
+            active,
+            bell: false,
+        }
+    }
+
+    /// The three things a leaf row can stand for, each with its own name.
+    #[test]
+    fn a_row_is_named_after_what_it_stands_for() {
+        let worktree = worktree();
+        let project = project();
+        let window = window(2, "agent", true);
+        assert_eq!(Stands::Worktree.name(&worktree), "feature/auth");
+        assert_eq!(Stands::Project(&project).name(&worktree), "acme-web");
+        assert_eq!(Stands::Window(&window).name(&worktree), "2: agent");
+    }
+
+    /// A window row's dot reports that window, not the session as a whole:
+    /// several rows of one session would otherwise all claim to be attached.
+    #[test]
+    fn a_window_rows_dot_reports_the_current_window() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Attached;
+        let current = window(0, "shell", true);
+        let other = window(1, "shell", false);
+        assert_eq!(
+            dot_presence(&worktree, Stands::Window(&current)),
+            SessionPresence::Attached
+        );
+        assert_eq!(
+            dot_presence(&worktree, Stands::Window(&other)),
+            SessionPresence::Detached
+        );
+        assert_eq!(
+            dot_presence(&worktree, Stands::Worktree),
+            SessionPresence::Attached,
+            "a worktree row still reports its own session"
+        );
+    }
+
+    /// Folding is the list's own business; every other row action leaves it.
+    #[test]
+    fn folding_is_not_an_app_action() {
+        assert_eq!(RowAction::Fold.into_action("p1", "a1b2c3"), None);
+        assert!(RowAction::Activate.into_action("p1", "a1b2c3").is_some());
     }
 
     /// The dirty dot is gone: the sublabel counts the files instead.
