@@ -12,6 +12,7 @@ use grove_core::state::{ProjectRecord, State};
 use grove_core::workflow::Activation;
 use grove_core::{Paths, state};
 
+use crate::ui::chrome::Detached;
 use crate::ui::dialogs::create_worktree::CreateForm;
 use crate::ui::dialogs::removal::{RemovalForm, Request};
 use crate::ui::{self, Action, theme};
@@ -35,10 +36,18 @@ pub struct GroveApp {
     open_project_path: Option<String>,
     /// A worktree Grove just created, selected as soon as a refresh lists it.
     pending_selection: Option<(String, PathBuf)>,
-    create: Option<CreateForm>,
-    removal: Option<RemovalForm>,
-    settings: Option<ui::settings::Form>,
+    /// The three detached windows. The main window is a narrow sliver, so
+    /// these render as their own toplevels (`ui::chrome`), one of each.
+    create: Detached<CreateForm>,
+    removal: Detached<RemovalForm>,
+    settings: Detached<ui::settings::Form>,
 }
+
+/// Stable viewport ids for the detached windows: one per kind, which is what
+/// makes "at most one instance" a fact about the window system too.
+const SETTINGS_VIEWPORT: &str = "grove-settings-window";
+const CREATE_VIEWPORT: &str = "grove-create-worktree-window";
+const REMOVAL_VIEWPORT: &str = "grove-removal-window";
 
 impl GroveApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> Self {
@@ -91,9 +100,9 @@ impl GroveApp {
             errors,
             open_project_path: None,
             pending_selection: None,
-            create: None,
-            removal: None,
-            settings: None,
+            create: Detached::default(),
+            removal: Detached::default(),
+            settings: Detached::default(),
         }
     }
 
@@ -107,19 +116,19 @@ impl GroveApp {
                             self.paths.config_file().display()
                         ));
                     }
-                    if let Some(form) = &mut self.settings {
+                    if let Some(form) = self.settings.get_mut() {
                         form.reloaded(&loaded.config);
                     }
                     self.config = Some(loaded.config);
                 }
                 Message::ConfigSaved { path } => {
                     self.status = Some(format!("Saved {}", path.display()));
-                    if let Some(form) = &mut self.settings {
+                    if let Some(form) = self.settings.get_mut() {
                         form.note = Some("Saved. Your comments are untouched.".to_string());
                     }
                 }
                 Message::TerminalDetected { template } => {
-                    if let Some(form) = &mut self.settings {
+                    if let Some(form) = self.settings.get_mut() {
                         form.terminal_command = template.clone();
                         form.note = None;
                         self.workers.send(Task::ProbeTerminal(template));
@@ -130,7 +139,7 @@ impl GroveApp {
                     program,
                     found,
                 } => {
-                    if let Some(form) = &mut self.settings {
+                    if let Some(form) = self.settings.get_mut() {
                         form.probe = Some(ui::settings::Probe {
                             command,
                             program,
@@ -174,7 +183,7 @@ impl GroveApp {
                     refs,
                     current,
                 } => {
-                    if let Some(form) = &mut self.create
+                    if let Some(form) = self.create.get_mut()
                         && form.project_id == project_id
                     {
                         form.refs = refs;
@@ -196,7 +205,7 @@ impl GroveApp {
                     worktree_id,
                     report,
                 } => {
-                    if let Some(form) = &mut self.removal
+                    if let Some(form) = self.removal.get_mut()
                         && form.project_id == project_id
                         && form.worktree_id == worktree_id
                     {
@@ -209,7 +218,7 @@ impl GroveApp {
                     detail,
                 } => {
                     self.status = Some(detail.clone());
-                    if let Some(form) = &mut self.removal
+                    if let Some(form) = self.removal.get_mut()
                         && form.project_id == project_id
                     {
                         form.note_done(operation, detail);
@@ -226,7 +235,7 @@ impl GroveApp {
                         operation.label()
                     ));
                     self.errors.push(report);
-                    if let Some(form) = &mut self.removal
+                    if let Some(form) = self.removal.get_mut()
                         && form.project_id == project_id
                     {
                         form.note_refusal(operation, summary);
@@ -252,7 +261,7 @@ impl GroveApp {
                 Message::Failed(report) => {
                     // A failed save must release the Save button, or the pane
                     // would sit on "Saving…" for ever.
-                    if let Some(form) = &mut self.settings {
+                    if let Some(form) = self.settings.get_mut() {
                         form.saving = false;
                     }
                     self.errors.push(report);
@@ -387,22 +396,29 @@ impl GroveApp {
         self.projects.retain(|p| p.id != id);
         self.state.remove(id);
         self.save_state();
-        if self.removal.as_ref().is_some_and(|f| f.project_id == id) {
-            self.removal = None;
+        if self.removal.get().is_some_and(|f| f.project_id == id) {
+            self.removal.close();
         }
         self.status = Some("Removed from Grove. The repository is untouched.".to_string());
     }
 
+    /// Open the create-worktree window, or raise the one already open. Asking
+    /// again for the same project keeps whatever has been typed.
     fn open_create_dialog(&mut self, project_id: &str) {
         let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
             return;
         };
         let form = CreateForm::new(project);
-        self.workers.send(Task::LoadBaseRefs {
-            project_id: project.id.clone(),
-            repository_path: project.repository_path.clone(),
-        });
-        self.create = Some(form);
+        let (id, repository_path) = (project.id.clone(), project.repository_path.clone());
+        if self
+            .create
+            .open_or_focus(form, |open| open.project_id == id)
+        {
+            self.workers.send(Task::LoadBaseRefs {
+                project_id: id,
+                repository_path,
+            });
+        }
     }
 
     fn open_removal_dialog(&mut self, project_id: &str, worktree_id: &str) {
@@ -413,11 +429,11 @@ impl GroveApp {
             return;
         };
         self.selected = Some(worktree_id.to_string());
-        self.workers.send(Task::GatherRemoval {
+        let gather = Task::GatherRemoval {
             project_id: project.id.clone(),
             worktree: Box::new(worktree.clone()),
-        });
-        self.removal = Some(RemovalForm {
+        };
+        let form = RemovalForm {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
             repository_path: project.repository_path.clone(),
@@ -433,12 +449,23 @@ impl GroveApp {
             force_branch_offered: false,
             done: Vec::new(),
             refusals: Vec::new(),
-        });
+        };
+        // Re-opening the window on the same worktree must not throw away a
+        // half-finished confirmation, or the risk report already gathered.
+        let worktree_id = worktree_id.to_string();
+        if self
+            .removal
+            .open_or_focus(form, |open| open.worktree_id == worktree_id)
+        {
+            self.workers.send(gather);
+        }
     }
 
     /// Dispatch one confirmed removal operation. Exactly one, never a bundle.
     fn apply_removal(&mut self, request: Request) {
-        let Some(form) = &self.removal else { return };
+        let Some(form) = self.removal.get() else {
+            return;
+        };
         match request {
             Request::RemoveProject => {
                 let id = form.project_id.clone();
@@ -476,7 +503,9 @@ impl GroveApp {
     /// Settings never touch a file on the UI thread: writing `config.toml`,
     /// probing PATH and handing a path to the desktop all go to the worker.
     fn apply_settings_action(&mut self, action: ui::settings::Action) {
-        let Some(form) = &self.settings else { return };
+        let Some(form) = self.settings.get() else {
+            return;
+        };
         match action {
             ui::settings::Action::Save => {
                 let edits = form.edits();
@@ -498,6 +527,136 @@ impl GroveApp {
                     start,
                 });
             }
+        }
+    }
+
+    // -------------------------------------------------------- detached windows
+    //
+    // Each dialog is its own toplevel, driven with
+    // `Context::show_viewport_immediate` — see `ui::chrome` for why immediate
+    // and not deferred. The callback runs inline, on this thread, so a window
+    // keeps borrowing this struct's fields exactly as the in-window
+    // `egui::Window` bodies did, and the worker plumbing is untouched: errors
+    // still land in `self.errors` and are shown by the main window's strip.
+
+    fn create_window(&mut self, ctx: &egui::Context) {
+        use ui::dialogs::create_worktree::{self as create, Outcome};
+
+        let id = egui::ViewportId::from_hash_of(CREATE_VIEWPORT);
+        if self.create.take_focus_request() {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        let Some(form) = self.create.get_mut() else {
+            return;
+        };
+
+        let title = create::title(form);
+        let mut outcome = Outcome::Idle;
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            id,
+            ui::chrome::viewport(&title, create::SIZE, create::MIN_SIZE),
+            |ctx, class| {
+                let dialog =
+                    ui::chrome::show(ctx, class, &title, |ui| create::body(ui, &mut *form));
+                outcome = dialog.inner;
+                close |= dialog.close;
+            },
+        );
+
+        match outcome {
+            Outcome::Idle => {}
+            Outcome::Browse => {
+                let start = pick_start(&form.path, Some(&form.default_parent));
+                self.workers.send(Task::PickDirectory {
+                    target: PickTarget::WorktreePath,
+                    start,
+                });
+            }
+            Outcome::Cancelled => close = true,
+            Outcome::Create(add) => {
+                self.workers.send(Task::CreateWorktree {
+                    project_id: form.project_id.clone(),
+                    project_name: form.project_name.clone(),
+                    repository_path: form.repository_path.clone(),
+                    git_common_dir: form.git_common_dir.clone(),
+                    add,
+                    open_after: form.open_after,
+                });
+                self.status = Some("Creating the worktree…".to_string());
+                close = true;
+            }
+        }
+        if close {
+            self.create.close();
+        }
+    }
+
+    fn removal_window(&mut self, ctx: &egui::Context) {
+        use ui::dialogs::removal;
+
+        let id = egui::ViewportId::from_hash_of(REMOVAL_VIEWPORT);
+        if self.removal.take_focus_request() {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        let Some(form) = self.removal.get_mut() else {
+            return;
+        };
+
+        let title = removal::title(form);
+        let mut request = None;
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            id,
+            ui::chrome::viewport(&title, removal::SIZE, removal::MIN_SIZE),
+            |ctx, class| {
+                let dialog =
+                    ui::chrome::show(ctx, class, &title, |ui| removal::body(ui, &mut *form));
+                request = dialog.inner;
+                close |= dialog.close;
+            },
+        );
+
+        // Closing first would drop the form `apply_removal` reads. The dialog
+        // stays open after an operation either way: the four are separate
+        // decisions and the results have to stay readable.
+        if let Some(request) = request {
+            self.apply_removal(request);
+        }
+        if close {
+            self.removal.close();
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let id = egui::ViewportId::from_hash_of(SETTINGS_VIEWPORT);
+        if self.settings.take_focus_request() {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        let Some(form) = self.settings.get_mut() else {
+            return;
+        };
+        let (paths, home) = (&self.paths, self.home.as_deref());
+
+        let mut action = None;
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            id,
+            ui::chrome::viewport("Settings", ui::settings::SIZE, ui::settings::MIN_SIZE),
+            |ctx, class| {
+                let dialog = ui::chrome::show(ctx, class, "Settings", |ui| {
+                    ui::settings::body(ui, &mut *form, paths, home)
+                });
+                action = dialog.inner;
+                close |= dialog.close;
+            },
+        );
+
+        if let Some(action) = action {
+            self.apply_settings_action(action);
+        }
+        if close {
+            self.settings.close();
         }
     }
 
@@ -532,12 +691,20 @@ impl GroveApp {
         }
     }
 
-    /// Keyboard navigation (DESIGN.md §16). Ignored while a dialog is open so
-    /// Delete cannot fire behind a confirmation.
+    /// Keyboard navigation for the main window (DESIGN.md §16).
+    ///
+    /// Settings and create-worktree are their own toplevels now, so the list
+    /// behind them stays navigable: neither can act on a row, and having the
+    /// sliver go deaf because a window is open elsewhere on the desktop would
+    /// be baffling. The removal window still deafens it — it is a destructive
+    /// confirmation about the selected row, and Delete must not open a second
+    /// one behind it. The in-window open-project dialog keeps its guard for
+    /// the same reason it always had it: it owns the keyboard.
     fn keyboard(&mut self, ctx: &egui::Context) {
         // The window has no decorations and therefore no close button, so
-        // Grove has to offer the shortcut itself. This is the one behaviour
-        // addition of the visual pass, and it works with a dialog open.
+        // Grove has to offer the shortcut itself. Ctrl+Q quits from any of
+        // Grove's windows; Ctrl+W on the main window closes it, which for the
+        // only remaining window means quitting too.
         let close = ctx.input(|i| {
             i.modifiers.command && (i.key_pressed(egui::Key::Q) || i.key_pressed(egui::Key::W))
         });
@@ -546,7 +713,7 @@ impl GroveApp {
             return;
         }
 
-        if self.create.is_some() || self.removal.is_some() || self.open_project_path.is_some() {
+        if self.removal.is_open() || self.open_project_path.is_some() {
             return;
         }
         let (down, up, enter, remove, new, refresh) = ctx.input(|i| {
@@ -598,14 +765,7 @@ impl GroveApp {
             ui.cursor().min,
             egui::vec2(ui.available_width(), theme::ICON_BUTTON),
         );
-        let drag = ui.interact(
-            bar,
-            ui.id().with("grove-titlebar"),
-            egui::Sense::click_and_drag(),
-        );
-        if drag.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
+        ui::chrome::drag_region(ui, bar, "grove-titlebar");
 
         ui.horizontal(|ui| {
             ui.set_min_height(theme::ICON_BUTTON);
@@ -678,15 +838,18 @@ impl GroveApp {
                     .on_hover_text("Settings")
                     .clicked()
                 {
-                    self.settings = match self.settings {
-                        Some(_) => None,
-                        None => Some(ui::settings::Form::new(self.config.as_ref())),
-                    };
-                    // The valid/invalid indicator needs a PATH probe, which
-                    // is filesystem work and therefore the worker's.
-                    if let Some(form) = &self.settings {
+                    // Settings is its own window: the gear raises the one
+                    // already open rather than toggling it shut, so unsaved
+                    // edits survive a stray click.
+                    if self.settings.is_open() {
+                        self.settings.request_focus();
+                    } else {
+                        let form = ui::settings::Form::new(self.config.as_ref());
+                        // The valid/invalid indicator needs a PATH probe,
+                        // which is filesystem work and therefore the worker's.
                         self.workers
                             .send(Task::ProbeTerminal(form.terminal_command.clone()));
+                        self.settings.open(form);
                     }
                 }
             });
@@ -721,8 +884,8 @@ fn apply_picked(
     target: PickTarget,
     path: PathBuf,
     open_project: &mut Option<String>,
-    create: &mut Option<CreateForm>,
-    settings: &mut Option<ui::settings::Form>,
+    create: &mut Detached<CreateForm>,
+    settings: &mut Detached<ui::settings::Form>,
 ) {
     let text = path.display().to_string();
     match target {
@@ -732,7 +895,7 @@ fn apply_picked(
             }
         }
         PickTarget::WorktreePath => {
-            if let Some(form) = create {
+            if let Some(form) = create.get_mut() {
                 form.path = text;
                 // The user chose this directory; stop re-deriving it from the
                 // branch name behind their back.
@@ -740,7 +903,7 @@ fn apply_picked(
             }
         }
         PickTarget::WorktreeParent => {
-            if let Some(form) = settings {
+            if let Some(form) = settings.get_mut() {
                 form.default_parent = text;
                 form.note = None;
             }
@@ -782,6 +945,13 @@ fn open_project_entry(ui: &mut egui::Ui) -> egui::Response {
 }
 
 impl eframe::App for GroveApp {
+    /// Every viewport is cleared to the theme's window body. eframe's default
+    /// is a translucent grey, which a freshly mapped dialog would show for the
+    /// frame before its panels paint — a pale flash on an otherwise dark app.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BG.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
 
@@ -806,54 +976,9 @@ impl eframe::App for GroveApp {
             }
         }
 
-        if let Some(form) = &mut self.create {
-            match ui::dialogs::create_worktree::show(ctx, form) {
-                ui::dialogs::create_worktree::Outcome::Idle => {}
-                ui::dialogs::create_worktree::Outcome::Browse => {
-                    let start = pick_start(&form.path, Some(&form.default_parent));
-                    self.workers.send(Task::PickDirectory {
-                        target: PickTarget::WorktreePath,
-                        start,
-                    });
-                }
-                ui::dialogs::create_worktree::Outcome::Cancelled => self.create = None,
-                ui::dialogs::create_worktree::Outcome::Create(add) => {
-                    self.workers.send(Task::CreateWorktree {
-                        project_id: form.project_id.clone(),
-                        project_name: form.project_name.clone(),
-                        repository_path: form.repository_path.clone(),
-                        git_common_dir: form.git_common_dir.clone(),
-                        add,
-                        open_after: form.open_after,
-                    });
-                    self.status = Some("Creating the worktree…".to_string());
-                    self.create = None;
-                }
-            }
-        }
-
-        if let Some(form) = &mut self.removal {
-            let mut open = true;
-            let request = ui::dialogs::removal::show(ctx, form, &mut open);
-            if !open {
-                self.removal = None;
-            }
-            if let Some(request) = request {
-                self.apply_removal(request);
-            }
-        }
-
-        if let Some(form) = &mut self.settings {
-            let mut open = true;
-            let action =
-                ui::settings::show(ctx, &mut open, form, &self.paths, self.home.as_deref());
-            if let Some(action) = action {
-                self.apply_settings_action(action);
-            }
-            if !open {
-                self.settings = None;
-            }
-        }
+        self.create_window(ctx);
+        self.removal_window(ctx);
+        self.settings_window(ctx);
 
         let header = egui::TopBottomPanel::top("grove-header")
             .frame(
@@ -1117,8 +1242,10 @@ mod tests {
     #[test]
     fn a_picked_directory_fills_in_the_field_that_asked_for_it() {
         let mut open_project = Some(String::new());
-        let mut create = Some(CreateForm::new(&project("p1", "acme", &[])));
-        let mut settings = Some(ui::settings::Form::default());
+        let mut create = Detached::default();
+        create.open(CreateForm::new(&project("p1", "acme", &[])));
+        let mut settings = Detached::default();
+        settings.open(ui::settings::Form::default());
 
         apply_picked(
             PickTarget::ProjectPath,
@@ -1136,7 +1263,7 @@ mod tests {
             &mut create,
             &mut settings,
         );
-        let form = create.as_ref().expect("form");
+        let form = create.get().expect("form");
         assert_eq!(form.path, "/home/u/wt/feature");
         assert!(
             form.path_edited,
@@ -1151,7 +1278,7 @@ mod tests {
             &mut settings,
         );
         assert_eq!(
-            settings.as_ref().expect("settings").default_parent,
+            settings.get().expect("settings").default_parent,
             "/home/u/trees"
         );
     }
@@ -1160,7 +1287,9 @@ mod tests {
     /// then has nowhere to go and must not panic.
     #[test]
     fn a_picked_directory_for_a_closed_dialog_is_dropped() {
-        let (mut open_project, mut create, mut settings) = (None, None, None);
+        let mut open_project = None;
+        let mut create: Detached<CreateForm> = Detached::default();
+        let mut settings: Detached<ui::settings::Form> = Detached::default();
         for target in [
             PickTarget::ProjectPath,
             PickTarget::WorktreePath,
@@ -1174,6 +1303,6 @@ mod tests {
                 &mut settings,
             );
         }
-        assert!(open_project.is_none() && create.is_none() && settings.is_none());
+        assert!(open_project.is_none() && !create.is_open() && !settings.is_open());
     }
 }

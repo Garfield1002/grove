@@ -1,4 +1,5 @@
-//! The create-worktree dialog (DESIGN.md §10).
+//! The create-worktree dialog (DESIGN.md §10), shown in its own OS window
+//! ([`crate::ui::chrome`]).
 //!
 //! Asks for a branch name, a base branch or commit, a directory, whether to
 //! create the branch, and whether to open the session afterwards. The form
@@ -7,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use egui::{Context, Ui};
+use egui::Ui;
 use grove_core::git::{RefEntry, WorktreeAdd};
 use grove_core::model::{Project, suggest_worktree_path};
 
@@ -130,7 +131,9 @@ impl CreateForm {
 }
 
 /// What the dialog is asking the app to do.
+#[derive(Default)]
 pub enum Outcome {
+    #[default]
     Idle,
     Cancelled,
     Create(Box<WorktreeAdd>),
@@ -138,128 +141,127 @@ pub enum Outcome {
     Browse,
 }
 
-/// Draw the dialog.
-pub fn show(ctx: &Context, form: &mut CreateForm) -> Outcome {
+/// Default inner size of the create-worktree window: three fields, two
+/// checkboxes and a button row, with room for a long path.
+pub const SIZE: [f32; 2] = [480.0, 380.0];
+/// Floor: the labels and a field that still shows a path.
+pub const MIN_SIZE: [f32; 2] = [380.0, 300.0];
+
+/// The window title, which names the project the worktree belongs to.
+pub fn title(form: &CreateForm) -> String {
+    format!("Create worktree — {}", form.project_name)
+}
+
+/// The dialog's contents. The window around it is [`crate::ui::chrome`]'s.
+pub fn body(ui: &mut Ui, form: &mut CreateForm) -> Outcome {
     let mut outcome = Outcome::Idle;
-    let mut open = true;
+    let width = ui.available_width();
+    let mut changed = false;
 
-    egui::Window::new(format!("Create worktree — {}", form.project_name))
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_min_width(340.0);
-            let mut changed = false;
+    changed |= ui
+        .checkbox(&mut form.create_branch, "Create a new branch")
+        .changed();
 
-            changed |= ui
-                .checkbox(&mut form.create_branch, "Create a new branch")
-                .changed();
-
-            if form.create_branch {
-                ui.add_space(8.0);
-                ui.label(theme::caption("Branch name"));
-                changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut form.branch)
-                            .hint_text("feature/auth")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed();
-            }
-
-            ui.add_space(10.0);
-            ui.label(theme::caption(if form.create_branch {
-                "Base branch or commit"
-            } else {
-                "Branch or commit to check out"
-            }));
-            changed |= base_ref_field(ui, form);
-
-            ui.add_space(10.0);
-            ui.label(theme::caption("Worktree directory"));
-            ui.horizontal(|ui| {
-                let browse = crate::ui::NATIVE_FILE_PICKER;
-                let reserved = if browse {
-                    theme::ICON_BUTTON + 8.0
-                } else {
-                    0.0
-                };
-                let width = (ui.available_width() - reserved).max(120.0);
-                let path_field = ui.add(
-                    egui::TextEdit::singleline(&mut form.path)
-                        .hint_text("/home/you/worktrees/feature-auth")
-                        .desired_width(width),
-                );
-                if path_field.changed() {
-                    form.path_edited = true;
-                }
-                if browse
-                    && icons::button(ui, true, icons::folder)
-                        .on_hover_text("Choose a directory")
-                        .clicked()
-                {
-                    outcome = Outcome::Browse;
-                }
-            });
-            if changed {
-                form.sync_path();
-            }
-
-            ui.add_space(10.0);
-            ui.checkbox(&mut form.open_after, "Open the session after creating");
-
-            ui.add_space(10.0);
-            ui.add(
-                egui::Label::new(theme::label(
-                    form.problem().unwrap_or(
-                        "Grove runs `git worktree add` and shows git's own output if it refuses.",
-                    ),
-                    theme::FONT_SMALL,
-                    theme::TEXT_FAINT,
-                ))
-                .wrap(),
-            );
-
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let create = egui::Button::new(theme::label(
-                    "Create",
-                    theme::FONT_BODY,
-                    if form.is_valid() {
-                        theme::TEXT_STRONG
-                    } else {
-                        theme::TEXT_FAINT
-                    },
-                ))
-                .fill(theme::ACCENT_FILL)
-                .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
-                if ui.add_enabled(form.is_valid(), create).clicked()
-                    && let Some(add) = form.to_add()
-                {
-                    outcome = Outcome::Create(Box::new(add));
-                }
-                if ui
-                    .button(theme::label("Cancel", theme::FONT_BODY, theme::TEXT_DIM))
-                    .clicked()
-                {
-                    outcome = Outcome::Cancelled;
-                }
-            });
-        });
-
-    if !open && matches!(outcome, Outcome::Idle) {
-        return Outcome::Cancelled;
+    if form.create_branch {
+        ui.add_space(8.0);
+        ui.label(theme::caption("Branch name"));
+        changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut form.branch)
+                    .hint_text("feature/auth")
+                    .desired_width(width),
+            )
+            .changed();
     }
+
+    ui.add_space(10.0);
+    ui.label(theme::caption(if form.create_branch {
+        "Base branch or commit"
+    } else {
+        "Branch or commit to check out"
+    }));
+    changed |= base_ref_field(ui, form, width);
+
+    ui.add_space(10.0);
+    ui.label(theme::caption("Worktree directory"));
+    ui.horizontal(|ui| {
+        let browse = crate::ui::NATIVE_FILE_PICKER;
+        let reserved = if browse {
+            theme::ICON_BUTTON + 8.0
+        } else {
+            0.0
+        };
+        let field = (width - reserved).max(120.0);
+        let path_field = ui.add(
+            egui::TextEdit::singleline(&mut form.path)
+                .hint_text("/home/you/worktrees/feature-auth")
+                .desired_width(field),
+        );
+        if path_field.changed() {
+            form.path_edited = true;
+        }
+        if browse
+            && icons::button(ui, true, icons::folder)
+                .on_hover_text("Choose a directory")
+                .clicked()
+        {
+            outcome = Outcome::Browse;
+        }
+    });
+    if changed {
+        form.sync_path();
+    }
+
+    ui.add_space(10.0);
+    ui.checkbox(&mut form.open_after, "Open the session after creating");
+
+    ui.add_space(10.0);
+    ui.add(
+        egui::Label::new(theme::label(
+            form.problem().unwrap_or(
+                "Grove runs `git worktree add` and shows git's own output if it refuses.",
+            ),
+            theme::FONT_SMALL,
+            theme::TEXT_FAINT,
+        ))
+        .wrap(),
+    );
+
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        let create = egui::Button::new(theme::label(
+            "Create",
+            theme::FONT_BODY,
+            if form.is_valid() {
+                theme::TEXT_STRONG
+            } else {
+                theme::TEXT_FAINT
+            },
+        ))
+        .fill(theme::ACCENT_FILL)
+        .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+        if ui.add_enabled(form.is_valid(), create).clicked()
+            && let Some(add) = form.to_add()
+        {
+            outcome = Outcome::Create(Box::new(add));
+        }
+        if ui
+            .button(theme::label("Cancel", theme::FONT_BODY, theme::TEXT_DIM))
+            .clicked()
+        {
+            outcome = Outcome::Cancelled;
+        }
+    });
+
     outcome
 }
 
 /// The base-ref field: a free-text entry (any commit-ish is valid to git)
 /// with the known branches offered from a menu.
-fn base_ref_field(ui: &mut Ui, form: &mut CreateForm) -> bool {
+fn base_ref_field(ui: &mut Ui, form: &mut CreateForm, row: f32) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - theme::ICON_BUTTON - 8.0).max(80.0);
+        let width = (row - theme::ICON_BUTTON - 8.0).max(80.0);
         changed = ui
             .add(
                 egui::TextEdit::singleline(&mut form.base_ref)

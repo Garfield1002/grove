@@ -1,4 +1,5 @@
-//! The safe-removal dialog (DESIGN.md §13, ARCHITECTURE.md §8.2-8.3).
+//! The safe-removal dialog (DESIGN.md §13, ARCHITECTURE.md §8.2-8.3), shown in
+//! its own OS window ([`crate::ui::chrome`]).
 //!
 //! Four operations, never bundled:
 //!
@@ -15,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use egui::{Context, Ui};
+use egui::Ui;
 use grove_core::removal::{RemovalReport, Severity};
 
 use crate::ui::{icons, theme};
@@ -123,103 +124,82 @@ impl RemovalForm {
     }
 }
 
-/// Draw the dialog. Returns the operation the user confirmed, if any, and
-/// sets `open` to false when the dialog should close.
-pub fn show(ctx: &Context, form: &mut RemovalForm, open: &mut bool) -> Option<Request> {
-    let mut request = None;
-    let mut closed = false;
+/// Default inner size of the removal window: the risk report plus four
+/// operations, each with its explanation, without scrolling in the common case.
+pub const SIZE: [f32; 2] = [540.0, 560.0];
+/// Floor: the confirmation labels must stay on one line.
+pub const MIN_SIZE: [f32; 2] = [420.0, 320.0];
 
-    egui::Window::new(format!("Remove — {}", form.worktree_label))
-        .collapsible(false)
-        .resizable(false)
-        .open(open)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            ui.set_max_width(460.0);
+/// The window title, which names the worktree at stake.
+pub fn title(form: &RemovalForm) -> String {
+    format!("Remove — {}", form.worktree_label)
+}
 
-            ui.add(
-                egui::Label::new(theme::mono(
-                    form.worktree_path.display().to_string(),
-                    theme::FONT_SMALL,
-                    theme::TEXT_DIM,
-                ))
-                .wrap(),
-            );
+/// The dialog's contents. Returns the operation the user confirmed, if any.
+/// The window around it is [`crate::ui::chrome`]'s.
+pub fn body(ui: &mut Ui, form: &mut RemovalForm) -> Option<Request> {
+    ui.add(
+        egui::Label::new(theme::mono(
+            form.worktree_path.display().to_string(),
+            theme::FONT_SMALL,
+            theme::TEXT_DIM,
+        ))
+        .wrap(),
+    );
+    ui.label(theme::label(
+        match &form.branch {
+            Some(branch) => format!("branch {branch}"),
+            None => "no branch (detached HEAD)".to_string(),
+        },
+        theme::FONT_SMALL,
+        theme::TEXT_FAINT,
+    ));
+
+    ui.add_space(10.0);
+    match &form.report {
+        Some(report) => findings(ui, report),
+        None => {
             ui.label(theme::label(
-                match &form.branch {
-                    Some(branch) => format!("branch {branch}"),
-                    None => "no branch (detached HEAD)".to_string(),
-                },
-                theme::FONT_SMALL,
-                theme::TEXT_FAINT,
+                "Checking for uncommitted changes, unpushed commits and running processes…",
+                theme::FONT_BODY,
+                theme::TEXT_MUTED,
             ));
-
-            ui.add_space(10.0);
-            match &form.report {
-                Some(report) => findings(ui, report),
-                None => {
-                    ui.label(theme::label(
-                        "Checking for uncommitted changes, unpushed commits and running processes…",
-                        theme::FONT_BODY,
-                        theme::TEXT_MUTED,
-                    ));
-                }
-            }
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(theme::label(
-                "Four separate operations. Each one asks again.",
-                theme::FONT_SMALL,
-                theme::TEXT_FAINT,
-            ));
-
-            request = operations(ui, form);
-
-            for detail in &form.done {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(theme::label(detail, theme::FONT_SMALL, theme::TEXT_MUTED))
-                        .wrap(),
-                );
-            }
-            if !form.refusals.is_empty() {
-                ui.add_space(8.0);
-                // git's own words, verbatim and monospaced (ARCHITECTURE.md §8.5).
-                egui::Frame::new()
-                    .fill(theme::BG_SUNKEN)
-                    .stroke(egui::Stroke::new(1.0, theme::DANGER.gamma_multiply(0.3)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        for refusal in &form.refusals {
-                            ui.add(
-                                egui::Label::new(theme::mono(
-                                    refusal,
-                                    theme::FONT_SMALL,
-                                    theme::DANGER,
-                                ))
-                                .wrap(),
-                            );
-                        }
-                    });
-            }
-
-            ui.add_space(12.0);
-            if ui
-                .button(theme::label("Close", theme::FONT_BODY, theme::TEXT_DIM))
-                .clicked()
-            {
-                request = None;
-                closed = true;
-            }
-        });
-
-    if closed {
-        *open = false;
+        }
     }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(theme::label(
+        "Four separate operations. Each one asks again.",
+        theme::FONT_SMALL,
+        theme::TEXT_FAINT,
+    ));
+
+    let request = operations(ui, form);
+
+    for detail in &form.done {
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(theme::label(detail, theme::FONT_SMALL, theme::TEXT_MUTED)).wrap());
+    }
+    if !form.refusals.is_empty() {
+        ui.add_space(8.0);
+        // git's own words, verbatim and monospaced (ARCHITECTURE.md §8.5).
+        egui::Frame::new()
+            .fill(theme::BG_SUNKEN)
+            .stroke(egui::Stroke::new(1.0, theme::DANGER.gamma_multiply(0.3)))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                for refusal in &form.refusals {
+                    ui.add(
+                        egui::Label::new(theme::mono(refusal, theme::FONT_SMALL, theme::DANGER))
+                            .wrap(),
+                    );
+                }
+            });
+    }
+
     request
 }
 

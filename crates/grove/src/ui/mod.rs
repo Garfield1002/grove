@@ -1,6 +1,7 @@
 //! The egui layer. Deliberately thin: it renders `grove-core` values and
 //! turns clicks into [`Action`]s, and it never runs a subprocess.
 
+pub mod chrome;
 pub mod dialogs;
 pub mod icons;
 pub mod project_list;

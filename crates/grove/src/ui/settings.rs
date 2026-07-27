@@ -1,4 +1,4 @@
-//! The settings pane.
+//! The settings pane, shown in its own OS window ([`crate::ui::chrome`]).
 //!
 //! `config.toml` stays user-owned (ARCHITECTURE.md §4): everything shown here
 //! is also editable by hand, and saving goes through
@@ -12,7 +12,6 @@
 
 use std::path::Path;
 
-use egui::Context;
 use grove_core::config::Config;
 use grove_core::config_write::{self, Edit};
 use grove_core::{Paths, terminal};
@@ -158,173 +157,183 @@ pub fn preview(command: &str, socket: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-pub fn show(
-    ctx: &Context,
-    open: &mut bool,
+/// Default inner size of the Settings window. Tall enough for both settings,
+/// the command preview and the paths block without scrolling, and wide enough
+/// for the label column plus a readable command line.
+pub const SIZE: [f32; 2] = [560.0, 600.0];
+/// Floor for the Settings window: the label column plus a usable field.
+pub const MIN_SIZE: [f32; 2] = [420.0, 320.0];
+
+/// Width of the left-hand label column. The pane is laid out as label/field
+/// rows, which is what the detached window's width buys over the sliver.
+const LABEL_COLUMN: f32 = 150.0;
+
+/// The pane's contents. The window around it — chrome, sizing, scrolling — is
+/// [`crate::ui::chrome`]'s.
+pub fn body(
+    ui: &mut egui::Ui,
     form: &mut Form,
     paths: &Paths,
     home: Option<&Path>,
 ) -> Option<Action> {
     let mut action = None;
-    egui::Window::new("Settings")
-        .collapsible(false)
-        .resizable(false)
-        .open(open)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            egui::ScrollArea::vertical()
-                .max_height(560.0)
-                .show(ui, |ui| {
-                    action = body(ui, form, paths, home);
+    let fields = (ui.available_width() - LABEL_COLUMN - 12.0).max(200.0);
+
+    egui::Grid::new("grove-settings-fields")
+        .num_columns(2)
+        .min_col_width(LABEL_COLUMN)
+        .spacing([12.0, 14.0])
+        .show(ui, |ui| {
+            // -------------------------------------------------------- terminal
+            ui.label(theme::caption("Terminal command"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                ui.horizontal(|ui| {
+                    let width = (fields - theme::ICON_BUTTON - 8.0).max(120.0);
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut form.terminal_command)
+                                .font(egui::FontId::monospace(theme::FONT_SMALL))
+                                .hint_text("foot tmux -S {socket} attach-session -t {session}")
+                                .desired_width(width),
+                        )
+                        .changed()
+                    {
+                        form.note = None;
+                        action = Some(Action::Probe(form.terminal_command.clone()));
+                    }
+                    if icons::button(ui, true, icons::refresh)
+                        .on_hover_text("Detect the terminal again and put it in the field")
+                        .clicked()
+                    {
+                        action = Some(Action::DetectTerminal);
+                    }
                 });
+
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Split with shell quoting rules first, then the placeholders are \
+                         substituted into whole arguments: {socket} {session} {worktree} \
+                         {project} {branch}.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+
+                ui.add_space(8.0);
+                match preview(&form.terminal_command, &paths.tmux_socket()) {
+                    Ok(preview) => {
+                        ui.label(theme::caption("Runs"));
+                        ui.add_space(2.0);
+                        code_block(ui, &preview);
+                        ui.add_space(6.0);
+                        probe_line(ui, form);
+                    }
+                    Err(problem) => {
+                        ui.add_space(2.0);
+                        bullet(ui, icons::cross, theme::DANGER, &problem);
+                    }
+                }
+            });
+            ui.end_row();
+
+            // ------------------------------------------------------- worktrees
+            ui.label(theme::caption("Default worktree parent"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                ui.horizontal(|ui| {
+                    let browse = super::NATIVE_FILE_PICKER;
+                    let reserved = if browse {
+                        theme::ICON_BUTTON + 8.0
+                    } else {
+                        0.0
+                    };
+                    let width = (fields - reserved).max(120.0);
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut form.default_parent)
+                                .font(egui::FontId::monospace(theme::FONT_SMALL))
+                                .hint_text(hint_parent(home))
+                                .desired_width(width),
+                        )
+                        .changed()
+                    {
+                        form.note = None;
+                    }
+                    if browse
+                        && icons::button(ui, true, icons::folder)
+                            .on_hover_text("Choose a directory")
+                            .clicked()
+                    {
+                        action = Some(Action::BrowseWorktreeParent);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Where new worktrees are suggested. Empty means beside the \
+                         repository; the create dialog always lets you edit the path.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+            ui.end_row();
+
+            // ------------------------------------------------------------ save
+            ui.label("");
+            ui.horizontal(|ui| {
+                let problem = form.problem();
+                let can_save = form.is_dirty() && problem.is_none() && !form.saving;
+                let save = egui::Button::new(theme::label(
+                    "Save",
+                    theme::FONT_BODY,
+                    if can_save {
+                        theme::TEXT_STRONG
+                    } else {
+                        theme::TEXT_FAINT
+                    },
+                ))
+                .fill(theme::ACCENT_FILL)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+                if ui.add_enabled(can_save, save).clicked() {
+                    form.saving = true;
+                    form.note = None;
+                    action = Some(Action::Save);
+                }
+
+                let status = match (&problem, form.saving, form.is_dirty(), &form.note) {
+                    (Some(problem), ..) => (problem.clone(), theme::DANGER),
+                    (_, true, ..) => ("Saving…".to_string(), theme::TEXT_MUTED),
+                    (_, _, true, _) => ("Unsaved changes".to_string(), theme::WARNING),
+                    (_, _, _, Some(note)) => (note.clone(), theme::TEXT_MUTED),
+                    _ => (
+                        "Edits are written key by key; your comments stay.".to_string(),
+                        theme::TEXT_FAINT,
+                    ),
+                };
+                ui.add(
+                    egui::Label::new(theme::label(status.0, theme::FONT_SMALL, status.1))
+                        .truncate(),
+                );
+            });
+            ui.end_row();
         });
-    action
-}
 
-fn body(ui: &mut egui::Ui, form: &mut Form, paths: &Paths, home: Option<&Path>) -> Option<Action> {
-    let mut action = None;
-
-    // ------------------------------------------------------------ terminal
-    ui.label(theme::caption("Terminal command"));
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let width = (ui.available_width() - theme::ICON_BUTTON - 8.0).max(120.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut form.terminal_command)
-                    .font(egui::FontId::monospace(theme::FONT_SMALL))
-                    .hint_text("foot tmux -S {socket} attach-session -t {session}")
-                    .desired_width(width),
-            )
-            .changed()
-        {
-            form.note = None;
-            action = Some(Action::Probe(form.terminal_command.clone()));
-        }
-        if icons::button(ui, true, icons::refresh)
-            .on_hover_text("Detect the terminal again and put it in the field")
-            .clicked()
-        {
-            action = Some(Action::DetectTerminal);
-        }
-    });
-
-    ui.add_space(6.0);
-    ui.add(
-        egui::Label::new(theme::label(
-            "Split with shell quoting rules first, then the placeholders are \
-             substituted into whole arguments: {socket} {session} {worktree} \
-             {project} {branch}.",
-            theme::FONT_SMALL,
-            theme::TEXT_FAINT,
-        ))
-        .wrap(),
-    );
-
-    ui.add_space(8.0);
-    match preview(&form.terminal_command, &paths.tmux_socket()) {
-        Ok(preview) => {
-            ui.label(theme::caption("Runs"));
-            ui.add_space(2.0);
-            code_block(ui, &preview);
-            ui.add_space(6.0);
-            probe_line(ui, form);
-        }
-        Err(problem) => {
-            ui.add_space(2.0);
-            bullet(ui, icons::cross, theme::DANGER, &problem);
-        }
-    }
-
-    // ----------------------------------------------------------- worktrees
-    ui.add_space(14.0);
-    ui.label(theme::caption("Default worktree parent"));
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let browse = super::NATIVE_FILE_PICKER;
-        let reserved = if browse {
-            theme::ICON_BUTTON + 8.0
-        } else {
-            0.0
-        };
-        let width = (ui.available_width() - reserved).max(120.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut form.default_parent)
-                    .font(egui::FontId::monospace(theme::FONT_SMALL))
-                    .hint_text(hint_parent(home))
-                    .desired_width(width),
-            )
-            .changed()
-        {
-            form.note = None;
-        }
-        if browse
-            && icons::button(ui, true, icons::folder)
-                .on_hover_text("Choose a directory")
-                .clicked()
-        {
-            action = Some(Action::BrowseWorktreeParent);
-        }
-    });
-    ui.add_space(4.0);
-    ui.add(
-        egui::Label::new(theme::label(
-            "Where new worktrees are suggested. Empty means beside the \
-             repository; the create dialog always lets you edit the path.",
-            theme::FONT_SMALL,
-            theme::TEXT_FAINT,
-        ))
-        .wrap(),
-    );
-
-    // --------------------------------------------------------------- save
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        let problem = form.problem();
-        let can_save = form.is_dirty() && problem.is_none() && !form.saving;
-        let save = egui::Button::new(theme::label(
-            "Save",
-            theme::FONT_BODY,
-            if can_save {
-                theme::TEXT_STRONG
-            } else {
-                theme::TEXT_FAINT
-            },
-        ))
-        .fill(theme::ACCENT_FILL)
-        .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
-        if ui.add_enabled(can_save, save).clicked() {
-            form.saving = true;
-            form.note = None;
-            action = Some(Action::Save);
-        }
-
-        let status = match (&problem, form.saving, form.is_dirty(), &form.note) {
-            (Some(problem), ..) => (problem.clone(), theme::DANGER),
-            (_, true, ..) => ("Saving…".to_string(), theme::TEXT_MUTED),
-            (_, _, true, _) => ("Unsaved changes".to_string(), theme::WARNING),
-            (_, _, _, Some(note)) => (note.clone(), theme::TEXT_MUTED),
-            _ => (
-                "Edits are written key by key; your comments stay.".to_string(),
-                theme::TEXT_FAINT,
-            ),
-        };
-        ui.add(egui::Label::new(theme::label(status.0, theme::FONT_SMALL, status.1)).truncate());
-    });
-
-    // -------------------------------------------------------------- paths
+    // ------------------------------------------------------------------ paths
     ui.add_space(14.0);
     ui.separator();
     ui.add_space(8.0);
 
     ui.horizontal(|ui| {
-        ui.label(theme::caption("config.toml"));
+        ui.label(theme::caption("Files"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button(theme::label("Open", theme::FONT_SMALL, theme::TEXT_MUTED))
-                .on_hover_text("Open it with xdg-open")
+                .on_hover_text("Open config.toml with xdg-open")
                 .clicked()
             {
                 action = Some(Action::OpenConfigFile);
@@ -335,6 +344,7 @@ fn body(ui: &mut egui::Ui, form: &mut Form, paths: &Paths, home: Option<&Path>) 
                     theme::FONT_SMALL,
                     theme::TEXT_MUTED,
                 ))
+                .on_hover_text("Copy the path to config.toml")
                 .clicked()
             {
                 ui.ctx()
@@ -343,18 +353,23 @@ fn body(ui: &mut egui::Ui, form: &mut Form, paths: &Paths, home: Option<&Path>) 
             }
         });
     });
-    ui.add_space(2.0);
-    path_line(ui, &paths.config_file());
-
-    for (name, path) in [
-        ("state.toml", paths.state_file()),
-        ("tmux.conf", paths.tmux_config_file()),
-        ("tmux socket", paths.tmux_socket()),
-    ] {
-        ui.add_space(6.0);
-        ui.label(theme::caption(name));
-        path_line(ui, &path);
-    }
+    ui.add_space(4.0);
+    egui::Grid::new("grove-settings-paths")
+        .num_columns(2)
+        .min_col_width(LABEL_COLUMN)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            for (name, path) in [
+                ("config.toml", paths.config_file()),
+                ("state.toml", paths.state_file()),
+                ("tmux.conf", paths.tmux_config_file()),
+                ("tmux socket", paths.tmux_socket()),
+            ] {
+                ui.label(theme::caption(name));
+                path_line(ui, &path);
+                ui.end_row();
+            }
+        });
 
     ui.add_space(10.0);
     ui.separator();
@@ -362,7 +377,7 @@ fn body(ui: &mut egui::Ui, form: &mut Form, paths: &Paths, home: Option<&Path>) 
     ui.add(
         egui::Label::new(theme::label(
             "Ctrl+N new worktree · Ctrl+R refresh · Enter open · Delete remove · \
-             Ctrl+Q close Grove",
+             Esc or Ctrl+W close this window · Ctrl+Q quit Grove",
             theme::FONT_SMALL,
             theme::TEXT_FAINT,
         ))

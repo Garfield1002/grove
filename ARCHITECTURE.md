@@ -95,6 +95,8 @@ grove/
 │           └── ui/
 │               ├── project_list.rs
 │               ├── worktree_row.rs
+│               ├── chrome.rs       # detached-window chrome and lifecycle
+│               ├── window_edge.rs  # resize handles for undecorated windows
 │               ├── dialogs/        # open-project, create-worktree,
 │               │                   # safe-removal, error area
 │               └── settings.rs
@@ -144,6 +146,19 @@ fidelity). Key elements beyond the original spec sketch:
   "no session" with an inline **start** affordance;
 - per-project worktree-count badges on collapsed rows;
 - a filter field under the header; a **Restore** control in the header.
+
+The main window is a narrow vertical sliver, so the three large dialogs —
+**Settings**, **create worktree**, **safe removal** — are not drawn inside it.
+Each opens as its own toplevel via egui multi-viewport
+(`Context::show_viewport_immediate`, so a dialog keeps borrowing app state
+directly; deferred viewports would need `Arc<Mutex<…>>` for no benefit at this
+scale). `ui::chrome` owns their lifecycle (one instance per kind; asking again
+raises it with `ViewportCommand::Focus`) and their chrome, which matches the
+main window: undecorated, header as drag handle, `ui::window_edge` for resize,
+Esc / Ctrl+W / ✕ to close, Ctrl+Q to quit Grove from any window. Placement is
+the compositor's: Wayland toplevels are not positioned by the client. The error
+strip and status line stay in the main window; dialog failures keep flowing
+there. The small open-project prompt remains an in-window `egui::Window`.
 
 ## 6. Status model
 
