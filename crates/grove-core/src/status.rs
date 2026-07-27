@@ -1,0 +1,479 @@
+//! The working / idle / attention state machine (DESIGN.md §6).
+//!
+//! This module is pure: it turns a snapshot of signals about one session into
+//! a status, and remembers the attention latch across polls. Everything that
+//! talks to tmux lives in [`crate::tmux`]; the poller gathers signals there
+//! and feeds them here.
+//!
+//! Two rules from CLAUDE.md are load-bearing and encoded in the tests:
+//!
+//! - Precedence is `attention > working > idle`.
+//! - Attention **latches**: once raised it survives later polls until the user
+//!   opens the session. Activity does not clear it — an agent that keeps
+//!   printing while waiting for a permission answer still needs attention.
+//!
+//! Attention is never inferred from a process name or from terminal contents.
+//! It comes from an explicit signal only: a `grove notify` call (durable in
+//! the `@grove_attention` session option), or a tmux bell when the user has
+//! opted into that.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+/// How long a session stays "working" after its last pane activity.
+pub const DEFAULT_WORKING_WINDOW: Duration = Duration::from_secs(10);
+
+/// Process names that mark a session as working whenever they are running in
+/// one of its panes, regardless of how quiet they are.
+pub const DEFAULT_AGENT_COMMANDS: &[&str] = &["claude", "aider", "codex", "goose"];
+
+/// The status of a session that exists.
+///
+/// A worktree with no session has no status at all; that case is
+/// [`crate::model::SessionPresence::None`], not a variant here.
+///
+/// The `Ord` derive is the precedence rule: `Idle < Working < Attention`, so
+/// merging two observations is `max`. Keep the variants in this order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SessionStatus {
+    /// The session exists but nothing has happened recently. Idle does not
+    /// mean "finished" — only that Grove saw no activity.
+    #[default]
+    Idle,
+    /// Recent pane activity, or a known agent process is running.
+    Working,
+    /// An explicit signal says the user is needed.
+    Attention,
+}
+
+impl SessionStatus {
+    /// Short label for a worktree row's status pill.
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionStatus::Idle => "idle",
+            SessionStatus::Working => "working",
+            SessionStatus::Attention => "attention",
+        }
+    }
+
+    /// Parse the `--state` value of `grove notify`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "idle" => Some(SessionStatus::Idle),
+            "working" => Some(SessionStatus::Working),
+            "attention" => Some(SessionStatus::Attention),
+            _ => None,
+        }
+    }
+}
+
+/// Tunables for [`classify`]. Built from `config.toml`'s `[status]` section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusPolicy {
+    /// A session is working if its last activity is no older than this.
+    pub working_window: Duration,
+    /// Process names that mean "an agent is running here".
+    pub agent_commands: Vec<String>,
+    /// Whether a tmux bell raises attention. Off by default: bells are noisy
+    /// and the explicit `grove notify` path is the reliable one.
+    pub bell_is_attention: bool,
+}
+
+impl Default for StatusPolicy {
+    fn default() -> Self {
+        Self {
+            working_window: DEFAULT_WORKING_WINDOW,
+            agent_commands: DEFAULT_AGENT_COMMANDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            bell_is_attention: false,
+        }
+    }
+}
+
+impl StatusPolicy {
+    /// Does this pane command count as a running agent?
+    ///
+    /// tmux reports `pane_current_command` as a bare command name already, but
+    /// wrappers can leave a path in it, so compare on the last path component
+    /// and ignore case.
+    fn is_agent_command(&self, command: &str) -> bool {
+        let name = command.rsplit(['/', '\\']).next().unwrap_or(command).trim();
+        if name.is_empty() {
+            return false;
+        }
+        self.agent_commands
+            .iter()
+            .any(|agent| agent.eq_ignore_ascii_case(name))
+    }
+}
+
+/// One poll's worth of signals about a single session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSignals {
+    /// Time since the session's last activity (`#{session_activity}`), or
+    /// `None` when tmux did not report a usable timestamp.
+    pub activity_age: Option<Duration>,
+    /// `pane_current_command` for every pane of the session.
+    pub pane_commands: Vec<String>,
+    /// The durable `@grove_attention` option is set on the session.
+    pub attention_flag: bool,
+    /// tmux is flagging a bell for this session.
+    pub bell: bool,
+}
+
+/// Age of an activity timestamp, in whole seconds since the epoch.
+///
+/// tmux clocks and ours are the same clock, but a session's activity stamp can
+/// still read a second or two into the future across a poll boundary; that is
+/// treated as "just now" rather than as a huge age.
+pub fn activity_age(now_epoch: u64, activity_epoch: u64) -> Duration {
+    Duration::from_secs(now_epoch.saturating_sub(activity_epoch))
+}
+
+/// The status implied by one poll, ignoring any latch.
+pub fn classify(signals: &SessionSignals, policy: &StatusPolicy) -> SessionStatus {
+    if signals.attention_flag || (policy.bell_is_attention && signals.bell) {
+        return SessionStatus::Attention;
+    }
+    let recently_active = signals
+        .activity_age
+        .is_some_and(|age| age <= policy.working_window);
+    let agent_running = signals
+        .pane_commands
+        .iter()
+        .any(|cmd| policy.is_agent_command(cmd));
+    if recently_active || agent_running {
+        return SessionStatus::Working;
+    }
+    SessionStatus::Idle
+}
+
+/// Tracks the attention latch across polls, keyed by worktree id.
+///
+/// The engine holds no session state beyond the latch: everything else is
+/// recomputed from each poll, so a dropped poll cannot leave a stale status.
+#[derive(Debug, Clone, Default)]
+pub struct StatusEngine {
+    policy: StatusPolicy,
+    latched: HashSet<String>,
+}
+
+impl StatusEngine {
+    pub fn new(policy: StatusPolicy) -> Self {
+        Self {
+            policy,
+            latched: HashSet::new(),
+        }
+    }
+
+    pub fn policy(&self) -> &StatusPolicy {
+        &self.policy
+    }
+
+    /// Replace the policy, e.g. after the user edits Settings.
+    pub fn set_policy(&mut self, policy: StatusPolicy) {
+        self.policy = policy;
+    }
+
+    /// Fold one poll of a session into the engine and return what to display.
+    pub fn observe(&mut self, worktree_id: &str, signals: &SessionSignals) -> SessionStatus {
+        let observed = classify(signals, &self.policy);
+        if observed == SessionStatus::Attention {
+            self.latched.insert(worktree_id.to_string());
+            return SessionStatus::Attention;
+        }
+        if self.latched.contains(worktree_id) {
+            return SessionStatus::Attention;
+        }
+        observed
+    }
+
+    /// Record an explicit `grove notify` report.
+    ///
+    /// Only `attention` is sticky. A `working` or `idle` report is a hint that
+    /// the next poll will confirm or replace, and it does **not** clear a
+    /// latch: an agent reporting progress while a permission prompt is still
+    /// open must not silently drop the user's attention marker. Only opening
+    /// the session clears it.
+    pub fn notify(&mut self, worktree_id: &str, state: SessionStatus) {
+        if state == SessionStatus::Attention {
+            self.latched.insert(worktree_id.to_string());
+        }
+    }
+
+    /// The user opened this session: clear the latch.
+    ///
+    /// Returns true when a latch was actually cleared, which is the caller's
+    /// signal to also unset the durable `@grove_attention` tmux option.
+    pub fn opened(&mut self, worktree_id: &str) -> bool {
+        self.latched.remove(worktree_id)
+    }
+
+    /// Is attention currently latched for this worktree?
+    pub fn is_latched(&self, worktree_id: &str) -> bool {
+        self.latched.contains(worktree_id)
+    }
+
+    /// Drop all memory of a worktree, after its session is closed or its
+    /// worktree removed. This is bookkeeping, never a deletion trigger.
+    pub fn forget(&mut self, worktree_id: &str) {
+        self.latched.remove(worktree_id);
+    }
+
+    /// Drop latches for worktrees that no longer exist, so the set cannot grow
+    /// without bound over a long-running session.
+    pub fn retain_ids<F: Fn(&str) -> bool>(&mut self, keep: F) {
+        self.latched.retain(|id| keep(id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signals_idle() -> SessionSignals {
+        SessionSignals {
+            activity_age: Some(Duration::from_secs(600)),
+            ..SessionSignals::default()
+        }
+    }
+
+    #[test]
+    fn precedence_is_attention_over_working_over_idle() {
+        assert!(SessionStatus::Attention > SessionStatus::Working);
+        assert!(SessionStatus::Working > SessionStatus::Idle);
+        assert_eq!(
+            SessionStatus::Idle.max(SessionStatus::Attention),
+            SessionStatus::Attention
+        );
+    }
+
+    #[test]
+    fn quiet_session_is_idle() {
+        assert_eq!(
+            classify(&signals_idle(), &StatusPolicy::default()),
+            SessionStatus::Idle
+        );
+    }
+
+    #[test]
+    fn recent_activity_is_working() {
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(3)),
+            ..SessionSignals::default()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn activity_exactly_at_the_window_still_counts() {
+        let signals = SessionSignals {
+            activity_age: Some(DEFAULT_WORKING_WINDOW),
+            ..SessionSignals::default()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn activity_past_the_window_is_idle() {
+        let signals = SessionSignals {
+            activity_age: Some(DEFAULT_WORKING_WINDOW + Duration::from_secs(1)),
+            ..SessionSignals::default()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Idle
+        );
+    }
+
+    #[test]
+    fn missing_activity_timestamp_is_not_working() {
+        let signals = SessionSignals::default();
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Idle
+        );
+    }
+
+    #[test]
+    fn a_quiet_agent_process_is_still_working() {
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(3600)),
+            pane_commands: vec!["bash".into(), "claude".into()],
+            ..SessionSignals::default()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn agent_match_ignores_case_and_leading_path() {
+        let policy = StatusPolicy::default();
+        assert!(policy.is_agent_command("claude"));
+        assert!(policy.is_agent_command("Claude"));
+        assert!(policy.is_agent_command("/usr/local/bin/claude"));
+        assert!(!policy.is_agent_command("claudia"));
+        assert!(!policy.is_agent_command(""));
+        assert!(!policy.is_agent_command("bash"));
+    }
+
+    #[test]
+    fn an_agent_process_alone_never_raises_attention() {
+        // CLAUDE.md: attention is never inferred from a process name.
+        let signals = SessionSignals {
+            pane_commands: vec!["claude".into()],
+            ..SessionSignals::default()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn attention_flag_beats_activity() {
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(1)),
+            pane_commands: vec!["claude".into()],
+            attention_flag: true,
+            bell: false,
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Attention
+        );
+    }
+
+    #[test]
+    fn bell_raises_attention_only_when_opted_in() {
+        let signals = SessionSignals {
+            bell: true,
+            ..signals_idle()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Idle
+        );
+        let opted_in = StatusPolicy {
+            bell_is_attention: true,
+            ..StatusPolicy::default()
+        };
+        assert_eq!(classify(&signals, &opted_in), SessionStatus::Attention);
+    }
+
+    #[test]
+    fn custom_working_window_is_honoured() {
+        let policy = StatusPolicy {
+            working_window: Duration::from_secs(60),
+            ..StatusPolicy::default()
+        };
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(30)),
+            ..SessionSignals::default()
+        };
+        assert_eq!(classify(&signals, &policy), SessionStatus::Working);
+    }
+
+    #[test]
+    fn activity_age_clamps_a_future_timestamp_to_zero() {
+        assert_eq!(activity_age(100, 40), Duration::from_secs(60));
+        assert_eq!(activity_age(100, 100), Duration::ZERO);
+        assert_eq!(activity_age(100, 140), Duration::ZERO);
+    }
+
+    #[test]
+    fn attention_latches_across_later_quiet_polls() {
+        let mut engine = StatusEngine::default();
+        let raised = SessionSignals {
+            attention_flag: true,
+            ..SessionSignals::default()
+        };
+        assert_eq!(engine.observe("abc123", &raised), SessionStatus::Attention);
+        // The durable option was consumed; later polls see nothing special.
+        assert_eq!(
+            engine.observe("abc123", &signals_idle()),
+            SessionStatus::Attention
+        );
+        assert!(engine.is_latched("abc123"));
+    }
+
+    #[test]
+    fn new_activity_does_not_clear_the_latch() {
+        let mut engine = StatusEngine::default();
+        engine.notify("abc123", SessionStatus::Attention);
+        let busy = SessionSignals {
+            activity_age: Some(Duration::from_secs(1)),
+            ..SessionSignals::default()
+        };
+        assert_eq!(engine.observe("abc123", &busy), SessionStatus::Attention);
+    }
+
+    #[test]
+    fn opening_the_session_clears_the_latch() {
+        let mut engine = StatusEngine::default();
+        engine.notify("abc123", SessionStatus::Attention);
+        assert!(engine.opened("abc123"));
+        assert_eq!(
+            engine.observe("abc123", &signals_idle()),
+            SessionStatus::Idle
+        );
+        // Opening again has nothing to clear.
+        assert!(!engine.opened("abc123"));
+    }
+
+    #[test]
+    fn a_working_report_does_not_clear_a_latch() {
+        let mut engine = StatusEngine::default();
+        engine.notify("abc123", SessionStatus::Attention);
+        engine.notify("abc123", SessionStatus::Working);
+        engine.notify("abc123", SessionStatus::Idle);
+        assert!(engine.is_latched("abc123"));
+    }
+
+    #[test]
+    fn latches_are_per_worktree() {
+        let mut engine = StatusEngine::default();
+        engine.notify("aaaaaa", SessionStatus::Attention);
+        assert_eq!(
+            engine.observe("bbbbbb", &signals_idle()),
+            SessionStatus::Idle
+        );
+        assert!(engine.is_latched("aaaaaa"));
+    }
+
+    #[test]
+    fn forget_and_retain_drop_stale_latches() {
+        let mut engine = StatusEngine::default();
+        engine.notify("aaaaaa", SessionStatus::Attention);
+        engine.notify("bbbbbb", SessionStatus::Attention);
+        engine.forget("aaaaaa");
+        assert!(!engine.is_latched("aaaaaa"));
+        engine.retain_ids(|_| false);
+        assert!(!engine.is_latched("bbbbbb"));
+    }
+
+    #[test]
+    fn parse_accepts_the_notify_state_names() {
+        assert_eq!(
+            SessionStatus::parse("attention"),
+            Some(SessionStatus::Attention)
+        );
+        assert_eq!(
+            SessionStatus::parse(" Working "),
+            Some(SessionStatus::Working)
+        );
+        assert_eq!(SessionStatus::parse("IDLE"), Some(SessionStatus::Idle));
+        assert_eq!(SessionStatus::parse("busy"), None);
+        assert_eq!(SessionStatus::parse(""), None);
+    }
+}

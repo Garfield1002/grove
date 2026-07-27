@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::error::{Error, ParseError, Result};
 use crate::ids;
+use crate::status::{self, SessionSignals};
 use crate::tmux::server::TmuxServer;
 
 const SOURCE: &str = "tmux list-sessions";
@@ -18,6 +19,7 @@ const SEP: char = '\u{1}';
 const SESSION_FORMAT: &str = concat!(
     "#{session_name}\u{1}#{session_path}\u{1}#{session_attached}",
     "\u{1}#{@grove_id}\u{1}#{@grove_project}\u{1}#{@grove_worktree}\u{1}#{@grove_repo}",
+    "\u{1}#{@grove_attention}\u{1}#{session_activity}\u{1}#{session_alerts}",
 );
 
 /// Name of window 0 in a Grove session.
@@ -30,6 +32,13 @@ pub const OPT_ID: &str = "@grove_id";
 pub const OPT_PROJECT: &str = "@grove_project";
 pub const OPT_WORKTREE: &str = "@grove_worktree";
 pub const OPT_REPO: &str = "@grove_repo";
+/// Durable attention marker, set by `grove notify` (Milestone 4).
+///
+/// It lives on the tmux server rather than in Grove's memory so an attention
+/// signal raised while the GUI is closed is still there when it reopens.
+pub const OPT_ATTENTION: &str = "@grove_attention";
+/// Value written to [`OPT_ATTENTION`] when attention is raised.
+pub const ATTENTION_SET: &str = "1";
 
 /// Everything needed to create a session for a worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +84,13 @@ pub struct SessionInfo {
     pub attached: u32,
     /// The `@grove_*` user options, absent for sessions Grove did not create.
     pub metadata: SessionMetadata,
+    /// The durable `@grove_attention` marker is set on this session.
+    pub attention: bool,
+    /// `#{session_activity}`: seconds since the epoch of the last activity,
+    /// or `None` when tmux reported nothing usable.
+    pub activity_epoch: Option<u64>,
+    /// tmux is flagging a bell for this session (`#{session_alerts}`).
+    pub bell: bool,
 }
 
 impl SessionInfo {
@@ -86,6 +102,30 @@ impl SessionInfo {
             .as_deref()
             .or_else(|| ids::id_from_session_name(&self.name))
     }
+
+    /// The status signals for this session, given the current time and the
+    /// commands running in its panes.
+    pub fn signals(&self, now_epoch: u64, pane_commands: Vec<String>) -> SessionSignals {
+        SessionSignals {
+            activity_age: self
+                .activity_epoch
+                .map(|epoch| status::activity_age(now_epoch, epoch)),
+            pane_commands,
+            attention_flag: self.attention,
+            bell: self.bell,
+        }
+    }
+}
+
+/// Is a tmux user option's value truthy?
+///
+/// Grove writes `1`, but the option is user-visible and hand-settable, so
+/// accept the usual spellings and treat explicit off values as unset.
+fn option_is_set(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "off" | "false" | "no"
+    )
 }
 
 /// Parse the output of `list-sessions -F` with [`SESSION_FORMAT`].
@@ -123,11 +163,20 @@ pub fn parse_sessions(output: &str) -> std::result::Result<Vec<SessionInfo>, Par
             worktree: next().map(PathBuf::from),
             repo: next().map(PathBuf::from),
         };
+        let attention = next().is_some_and(|v| option_is_set(&v));
+        // An unparseable activity stamp is "unknown", not an error: it only
+        // costs this session its "working" hint for one poll, and a poller
+        // that failed the whole list over it would show nothing at all.
+        let activity_epoch = next().and_then(|v| v.trim().parse::<u64>().ok());
+        let bell = next().is_some_and(|v| v.split(',').any(|a| a.trim() == "bell"));
         sessions.push(SessionInfo {
             name: name.to_string(),
             path: PathBuf::from(path),
             attached,
             metadata,
+            attention,
+            activity_epoch,
+            bell,
         });
     }
     Ok(sessions)
@@ -176,6 +225,50 @@ pub fn set_option_args(session: &str, name: &str, value: &OsStr) -> Vec<OsString
         OsString::from(name),
         value.to_os_string(),
     ]
+}
+
+/// Build one `set-option -t <session> -u <name>` invocation, unsetting it.
+pub fn unset_option_args(session: &str, name: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("set-option"),
+        OsString::from("-t"),
+        OsString::from(session),
+        OsString::from("-u"),
+        OsString::from(name),
+    ]
+}
+
+/// Raise the durable attention marker on a session.
+///
+/// Called by the `grove notify` CLI so the signal outlives the GUI, and it is
+/// what a later poll reads back as [`SessionInfo::attention`]. A missing
+/// session or server is not an error: the agent may have exited already, and
+/// `notify` must never fail an agent's hook.
+pub fn set_attention(server: &TmuxServer, session: &str) -> Result<bool> {
+    let out = server.run_allow_failure(set_option_args(
+        session,
+        OPT_ATTENTION,
+        OsStr::new(ATTENTION_SET),
+    ))?;
+    if out.success {
+        return Ok(true);
+    }
+    if TmuxServer::is_no_server(&out.stderr) || out.stderr.contains("can't find") {
+        return Ok(false);
+    }
+    Err(out.failure.into())
+}
+
+/// Clear the durable attention marker, when the user opens the session.
+pub fn clear_attention(server: &TmuxServer, session: &str) -> Result<bool> {
+    let out = server.run_allow_failure(unset_option_args(session, OPT_ATTENTION))?;
+    if out.success {
+        return Ok(true);
+    }
+    if TmuxServer::is_no_server(&out.stderr) || out.stderr.contains("can't find") {
+        return Ok(false);
+    }
+    Err(out.failure.into())
 }
 
 /// The `@grove_*` user options to stamp on a new session, in order.
@@ -368,6 +461,96 @@ mod tests {
     fn rejects_an_empty_session_name() {
         let err = parse_sessions("\u{1}/p\u{1}0\n").expect_err("empty name");
         assert!(err.reason.contains("empty session name"));
+    }
+
+    /// A full line as tmux emits it for a Grove session with attention raised.
+    #[test]
+    fn parses_the_status_fields() {
+        let text = "wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}proj\u{1}/w\u{1}/g\u{1}1\u{1}1753600000\u{1}bell\n";
+        let sessions = parse_sessions(text).expect("valid");
+        assert!(sessions[0].attention);
+        assert_eq!(sessions[0].activity_epoch, Some(1_753_600_000));
+        assert!(sessions[0].bell);
+    }
+
+    #[test]
+    fn absent_status_fields_default_to_quiet() {
+        let text = "wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}proj\u{1}/w\u{1}/g\n";
+        let sessions = parse_sessions(text).expect("valid");
+        assert!(!sessions[0].attention);
+        assert_eq!(sessions[0].activity_epoch, None);
+        assert!(!sessions[0].bell);
+    }
+
+    #[test]
+    fn an_unset_attention_option_is_not_attention() {
+        // tmux renders an unset user option as the empty string; the option is
+        // hand-editable, so explicit off values count as unset too.
+        for value in ["", "0", "off", "false", "no", "OFF"] {
+            let text =
+                format!("wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}p\u{1}/w\u{1}/g\u{1}{value}\n");
+            let sessions = parse_sessions(&text).expect("valid");
+            assert!(!sessions[0].attention, "{value} should not be attention");
+        }
+        for value in ["1", "yes", "on", "true"] {
+            let text =
+                format!("wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}p\u{1}/w\u{1}/g\u{1}{value}\n");
+            let sessions = parse_sessions(&text).expect("valid");
+            assert!(sessions[0].attention, "{value} should be attention");
+        }
+    }
+
+    #[test]
+    fn alerts_are_matched_exactly_within_the_list() {
+        let line = |alerts: &str| {
+            format!(
+                "wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}p\u{1}/w\u{1}/g\u{1}\u{1}0\u{1}{alerts}\n"
+            )
+        };
+        for alerts in ["bell", "activity,bell", "bell,silence"] {
+            let sessions = parse_sessions(&line(alerts)).expect("valid");
+            assert!(sessions[0].bell, "{alerts} carries a bell");
+        }
+        for alerts in ["", "activity", "silence", "activity,silence"] {
+            let sessions = parse_sessions(&line(alerts)).expect("valid");
+            assert!(!sessions[0].bell, "{alerts} carries no bell");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_activity_stamp_is_unknown_not_an_error() {
+        let text = "wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}p\u{1}/w\u{1}/g\u{1}\u{1}soon\n";
+        let sessions = parse_sessions(text).expect("valid");
+        assert_eq!(sessions[0].activity_epoch, None);
+    }
+
+    #[test]
+    fn signals_carry_the_activity_age_and_flags() {
+        let text =
+            "wt-a1b2c3\u{1}/w\u{1}0\u{1}a1b2c3\u{1}p\u{1}/w\u{1}/g\u{1}1\u{1}1000\u{1}bell\n";
+        let sessions = parse_sessions(text).expect("valid");
+        let signals = sessions[0].signals(1042, vec!["claude".into()]);
+        assert_eq!(
+            signals.activity_age,
+            Some(std::time::Duration::from_secs(42))
+        );
+        assert_eq!(signals.pane_commands, vec!["claude".to_string()]);
+        assert!(signals.attention_flag);
+        assert!(signals.bell);
+    }
+
+    #[test]
+    fn attention_option_args_set_and_unset_the_same_key() {
+        let set = set_option_args("wt-a1b2c3", OPT_ATTENTION, OsStr::new(ATTENTION_SET));
+        assert_eq!(
+            set,
+            ["set-option", "-t", "wt-a1b2c3", "@grove_attention", "1"]
+        );
+        let unset = unset_option_args("wt-a1b2c3", OPT_ATTENTION);
+        assert_eq!(
+            unset,
+            ["set-option", "-t", "wt-a1b2c3", "-u", "@grove_attention"]
+        );
     }
 
     #[test]
