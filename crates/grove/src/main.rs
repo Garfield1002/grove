@@ -45,10 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_app_id("grove")
             // Grove draws its own header, so the compositor's (or winit's)
             // title bar would be a second, redundant one. Dropping it means
-            // dropping the drag handle with it: `app::GroveApp::header` makes
-            // the header bar itself draggable, and Ctrl+Q / Ctrl+W close the
-            // window since there is no close button either.
+            // dropping the decorations' interactions with it, and Grove
+            // provides all three itself: `app::GroveApp::header` makes the
+            // header bar draggable, `ui::window_edge` puts resize handles on
+            // the four edges and corners, and Ctrl+Q / Ctrl+W close the window
+            // since there is no close button either.
             .with_decorations(false)
+            .with_resizable(true)
             .with_inner_size(ui::theme::WINDOW_SIZE)
             .with_min_inner_size(ui::theme::MIN_WINDOW_SIZE),
         ..Default::default()

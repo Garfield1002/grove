@@ -103,7 +103,9 @@ pub const FONT_SUB: f32 = 9.5;
 
 /// Recommended window size: a narrow vertical panel (DESIGN.md §5).
 pub const WINDOW_SIZE: [f32; 2] = [360.0, 720.0];
-pub const MIN_WINDOW_SIZE: [f32; 2] = [280.0, 320.0];
+/// Smallest useful window: the narrow layout with the header, a row or two,
+/// and the footer still legible. Resizing (`ui::window_edge`) stops here.
+pub const MIN_WINDOW_SIZE: [f32; 2] = [280.0, 360.0];
 
 pub fn apply(ctx: &egui::Context) {
     let mut visuals = Visuals::dark();

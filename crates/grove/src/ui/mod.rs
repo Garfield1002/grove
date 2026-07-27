@@ -6,6 +6,7 @@ pub mod icons;
 pub mod project_list;
 pub mod settings;
 pub mod theme;
+pub mod window_edge;
 pub mod worktree_row;
 
 /// Something the user asked for in the list.

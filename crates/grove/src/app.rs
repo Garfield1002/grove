@@ -658,6 +658,11 @@ impl eframe::App for GroveApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
 
+        // First thing in the frame: the window is undecorated, so its resize
+        // edges are Grove's to provide, and registering them here puts every
+        // other widget on top of them (`ui::window_edge`).
+        ui::window_edge::show(ctx);
+
         if let Some(path) = &mut self.open_project_path {
             match ui::dialogs::open_project(ctx, path) {
                 ui::dialogs::OpenProject::Idle => {}
