@@ -20,6 +20,7 @@ This document records the *resolved* architecture. The full product design
 | Worktree IDs | **Deterministic hash** | First 6 hex chars of a hash over `(git-common-dir, canonical worktree path)`. Session name = `wt-<id>`. Losing `state.toml` is recoverable: restore re-derives identical IDs and reattaches to live tmux sessions. |
 | Terminal default | **Auto-detect on first run** | Probe PATH in order (`ptyxis`, `foot`, `alacritty`, `kitty`, `gnome-terminal`); write the winning template into `config.toml` so it is visible and editable. |
 | Agent attention | **`grove notify` CLI + IPC** | The `grove` binary doubles as a CLI. Agent wrappers (e.g. Claude Code hooks) call `grove notify --session <id> --state attention`; the GUI receives it over a local IPC socket. Architected from v1, fully wired in Milestone 4. |
+| Resource accounting | **systemd scopes (opt-in setting)** | On systemd machines, agent/user commands launched inside panes are wrapped in `systemd-run --user --scope --collect --unit=grove-<wt-id>-<kind>-<nonce>.scope --`. Each agent gets its own cgroup → per-agent/per-project RAM/CPU read from `/sys/fs/cgroup` (`memory.current`, `cpu.stat`), later `MemoryMax`/kill-by-scope. Auto-detected (systemd user manager present), off otherwise. Plain shells stay unwrapped. Implemented in Milestone 4. |
 | Crate layout | **Workspace: `grove-core` + `grove`** | Core (git, tmux, state, reconcile — no UI deps, fully testable) plus the binary crate (egui UI + CLI subcommands). |
 | Quality bar | **Strict** | Edition 2024, `clippy -D warnings`, rustfmt defaults, no `unwrap()`/`expect()` outside tests, `thiserror` error types, unit tests mandatory for all git/tmux output parsers. |
 
@@ -216,6 +217,7 @@ These are load-bearing; every feature must preserve them.
 3. **Persistence & restore** — state.toml, startup reconciliation, missing/
    orphaned handling.
 4. **Agent workflow** — agent command templates, `grove notify` wiring,
-   attention notifications, project-specific commands.
+   attention notifications, project-specific commands, systemd-scope
+   wrapping with per-agent/per-project RAM & CPU display.
 
 Acceptance criteria for the first release are in docs/DESIGN.md §24.
