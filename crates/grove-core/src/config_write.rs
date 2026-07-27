@@ -44,6 +44,38 @@ pub const WORKTREES_DEFAULT_PARENT: Key = Key {
     name: "default_parent",
 };
 
+/// `status.working_window_secs` — quiet period before a session stops
+/// counting as working.
+pub const STATUS_WORKING_WINDOW: Key = Key {
+    table: "status",
+    name: "working_window_secs",
+};
+
+/// `status.bell_is_attention` — whether a tmux bell raises attention.
+pub const STATUS_BELL_IS_ATTENTION: Key = Key {
+    table: "status",
+    name: "bell_is_attention",
+};
+
+/// `status.desktop_notifications` — whether attention also posts a desktop
+/// notification.
+pub const STATUS_DESKTOP_NOTIFICATIONS: Key = Key {
+    table: "status",
+    name: "desktop_notifications",
+};
+
+/// `agents.command` — the default agent command template.
+pub const AGENTS_COMMAND: Key = Key {
+    table: "agents",
+    name: "command",
+};
+
+/// `agents.resource_accounting` — auto | always | never.
+pub const AGENTS_RESOURCE_ACCOUNTING: Key = Key {
+    table: "agents",
+    name: "resource_accounting",
+};
+
 /// One typed key assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
@@ -180,6 +212,59 @@ pub fn set_integer(path: &Path, key: Key, number: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writing a Milestone 4 key into the first-run file must create the real
+    /// table without disturbing the commented-out documentation block that
+    /// describes it.
+    #[test]
+    fn status_and_agent_keys_land_beside_their_own_documentation() {
+        let original = crate::config::first_run_document("foot");
+        let edits = vec![
+            Edit::Int(STATUS_WORKING_WINDOW, 45),
+            Edit::Bool(STATUS_BELL_IS_ATTENTION, true),
+            Edit::Bool(STATUS_DESKTOP_NOTIFICATIONS, false),
+            Edit::string(AGENTS_COMMAND, "claude"),
+            Edit::string(AGENTS_RESOURCE_ACCOUNTING, "never"),
+        ];
+        let edited = edit_document(&original, &edits, Path::new("config.toml")).expect("edits");
+
+        // The commented documentation survives untouched.
+        assert!(edited.contains("# [status]"));
+        assert!(edited.contains("# working_window_secs = 10"));
+        assert!(edited.contains("# [agents.per_project]"));
+        assert!(edited.contains("# ever wrote it once, on first run"));
+
+        // And the values are readable back as themselves.
+        let config = crate::config::Config::from_toml(&edited, Path::new("config.toml"))
+            .expect("still valid toml");
+        assert_eq!(config.status.working_window_secs, 45);
+        assert!(config.status.bell_is_attention);
+        assert!(!config.status.desktop_notifications);
+        assert_eq!(config.agents.command, "claude");
+        assert_eq!(config.agents.accounting(), crate::agent::Accounting::Never);
+        // The terminal the file was created with is untouched.
+        assert_eq!(config.terminal.command, "foot");
+    }
+
+    #[test]
+    fn editing_one_status_key_leaves_the_others_alone() {
+        let original = "# my notes\n\
+                        [status]\n\
+                        # why I raised this\n\
+                        working_window_secs = 120\n\
+                        bell_is_attention = true\n";
+        let edited = edit_document(
+            original,
+            &[Edit::Bool(STATUS_DESKTOP_NOTIFICATIONS, false)],
+            Path::new("config.toml"),
+        )
+        .expect("edits");
+        assert!(edited.contains("# my notes"));
+        assert!(edited.contains("# why I raised this"));
+        assert!(edited.contains("working_window_secs = 120"));
+        assert!(edited.contains("bell_is_attention = true"));
+        assert!(edited.contains("desktop_notifications = false"));
+    }
 
     const COMMENTED: &str = "\
 # Grove configuration. Mine, hand-written.

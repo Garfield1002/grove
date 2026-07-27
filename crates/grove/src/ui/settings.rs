@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use grove_core::agent::Accounting;
 use grove_core::config::Config;
 use grove_core::config_write::{self, Edit};
 use grove_core::{Paths, terminal};
@@ -57,9 +58,23 @@ pub struct Probe {
 pub struct Form {
     pub terminal_command: String,
     pub default_parent: String,
+    /// The agent template started in a session's `agent` window.
+    pub agent_command: String,
+    /// `auto`, `always` or `never`.
+    pub resource_accounting: Accounting,
+    /// Seconds of quiet before a session stops counting as working, as typed:
+    /// a half-finished number must not be read as a policy change.
+    pub working_window: String,
+    pub bell_is_attention: bool,
+    pub desktop_notifications: bool,
     /// The values as they are in `config.toml`, to tell what actually changed.
     loaded_terminal: String,
     loaded_parent: String,
+    loaded_agent_command: String,
+    loaded_accounting: Accounting,
+    loaded_working_window: String,
+    loaded_bell: bool,
+    loaded_notifications: bool,
     pub probe: Option<Probe>,
     /// A save is in flight; the button stays down until the worker answers.
     pub saving: bool,
@@ -75,15 +90,37 @@ impl Form {
         let parent = config
             .map(|c| c.worktrees.default_parent.clone())
             .unwrap_or_default();
+        let status = config.map(|c| c.status.clone()).unwrap_or_default();
+        let agents = config.map(|c| c.agents.clone()).unwrap_or_default();
+        let window = status.working_window_secs.to_string();
         Self {
             terminal_command: terminal.clone(),
             default_parent: parent.clone(),
+            agent_command: agents.command.clone(),
+            resource_accounting: agents.accounting(),
+            working_window: window.clone(),
+            bell_is_attention: status.bell_is_attention,
+            desktop_notifications: status.desktop_notifications,
             loaded_terminal: terminal,
             loaded_parent: parent,
+            loaded_accounting: agents.accounting(),
+            loaded_agent_command: agents.command,
+            loaded_working_window: window,
+            loaded_bell: status.bell_is_attention,
+            loaded_notifications: status.desktop_notifications,
             probe: None,
             saving: false,
             note: None,
         }
+    }
+
+    /// The working window as a number, when the field holds a usable one.
+    pub fn working_window_secs(&self) -> Option<i64> {
+        self.working_window
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n > 0)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -107,15 +144,56 @@ impl Form {
                 self.default_parent.trim(),
             ));
         }
+        if self.agent_command != self.loaded_agent_command {
+            edits.push(Edit::string(
+                config_write::AGENTS_COMMAND,
+                self.agent_command.trim(),
+            ));
+        }
+        if self.resource_accounting != self.loaded_accounting {
+            edits.push(Edit::string(
+                config_write::AGENTS_RESOURCE_ACCOUNTING,
+                self.resource_accounting.as_str(),
+            ));
+        }
+        // Only when it parses: a field mid-edit ("1" on the way to "15") must
+        // not be written, and `problem()` refuses the save anyway.
+        if self.working_window != self.loaded_working_window
+            && let Some(secs) = self.working_window_secs()
+        {
+            edits.push(Edit::Int(config_write::STATUS_WORKING_WINDOW, secs));
+        }
+        if self.bell_is_attention != self.loaded_bell {
+            edits.push(Edit::Bool(
+                config_write::STATUS_BELL_IS_ATTENTION,
+                self.bell_is_attention,
+            ));
+        }
+        if self.desktop_notifications != self.loaded_notifications {
+            edits.push(Edit::Bool(
+                config_write::STATUS_DESKTOP_NOTIFICATIONS,
+                self.desktop_notifications,
+            ));
+        }
         edits
     }
 
     /// Why the form cannot be saved yet, if it cannot.
     pub fn problem(&self) -> Option<String> {
-        match terminal::tokenize(&self.terminal_command) {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
+        if let Err(e) = terminal::tokenize(&self.terminal_command) {
+            return Some(e.to_string());
         }
+        // An empty agent command is legitimate — it means "offer no agent" —
+        // but a malformed one is not.
+        if !self.agent_command.trim().is_empty()
+            && let Err(e) = terminal::tokenize(&self.agent_command)
+        {
+            return Some(format!("agent command: {e}"));
+        }
+        if self.working_window_secs().is_none() {
+            return Some("the working window must be a positive number of seconds".to_string());
+        }
+        None
     }
 
     /// Adopt the file's values as the new baseline after a successful save or
@@ -123,6 +201,11 @@ impl Form {
     pub fn reloaded(&mut self, config: &Config) {
         self.loaded_terminal = config.terminal.command.clone();
         self.loaded_parent = config.worktrees.default_parent.clone();
+        self.loaded_agent_command = config.agents.command.clone();
+        self.loaded_accounting = config.agents.accounting();
+        self.loaded_working_window = config.status.working_window_secs.to_string();
+        self.loaded_bell = config.status.bell_is_attention;
+        self.loaded_notifications = config.status.desktop_notifications;
         if !self.saving {
             return;
         }
@@ -130,6 +213,11 @@ impl Form {
         // not jump if the file normalised anything.
         self.terminal_command = self.loaded_terminal.clone();
         self.default_parent = self.loaded_parent.clone();
+        self.agent_command = self.loaded_agent_command.clone();
+        self.resource_accounting = self.loaded_accounting;
+        self.working_window = self.loaded_working_window.clone();
+        self.bell_is_attention = self.loaded_bell;
+        self.desktop_notifications = self.loaded_notifications;
         self.saving = false;
     }
 
@@ -275,6 +363,148 @@ pub fn body(
                     egui::Label::new(theme::label(
                         "Where new worktrees are suggested. Empty means beside the \
                          repository; the create dialog always lets you edit the path.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+            ui.end_row();
+
+            // ----------------------------------------------------------- agent
+            ui.label(theme::caption("Agent command"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut form.agent_command)
+                            .font(egui::FontId::monospace(theme::FONT_SMALL))
+                            .hint_text("claude")
+                            .desired_width(fields),
+                    )
+                    .changed()
+                {
+                    form.note = None;
+                }
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Started in the session's `agent` window. Split with shell \
+                         quoting rules first, then {worktree}, {branch}, {project}, \
+                         {session} and {socket} are substituted into the arguments. \
+                         Empty offers no agent action. Per-project commands are set \
+                         under [agents.per_project] in the file.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+            ui.end_row();
+
+            ui.label(theme::caption("Resource accounting"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                ui.horizontal(|ui| {
+                    for option in [Accounting::Auto, Accounting::Always, Accounting::Never] {
+                        if ui
+                            .selectable_label(
+                                form.resource_accounting == option,
+                                theme::label(option.as_str(), theme::FONT_BODY, theme::TEXT_DIM),
+                            )
+                            .clicked()
+                        {
+                            form.resource_accounting = option;
+                            form.note = None;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Runs each agent in its own systemd scope, so Grove can show \
+                         its RAM and CPU. `auto` wraps only when a systemd user \
+                         manager is present. Shells are never wrapped.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+            ui.end_row();
+
+            // ---------------------------------------------------------- status
+            ui.label(theme::caption("Working window"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut form.working_window)
+                                .font(egui::FontId::monospace(theme::FONT_SMALL))
+                                .desired_width(60.0),
+                        )
+                        .changed()
+                    {
+                        form.note = None;
+                    }
+                    ui.label(theme::label(
+                        "seconds",
+                        theme::FONT_SMALL,
+                        theme::TEXT_MUTED,
+                    ));
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "How long a session keeps counting as working after its last \
+                         pane activity. A known agent process counts as working \
+                         however quiet it is; the list of those is `agent_commands` \
+                         in the file.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+            ui.end_row();
+
+            ui.label(theme::caption("Attention"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                if ui
+                    .checkbox(
+                        &mut form.desktop_notifications,
+                        theme::label(
+                            "Post a desktop notification",
+                            theme::FONT_BODY,
+                            theme::TEXT_DIM,
+                        ),
+                    )
+                    .changed()
+                {
+                    form.note = None;
+                }
+                if ui
+                    .checkbox(
+                        &mut form.bell_is_attention,
+                        theme::label(
+                            "A tmux bell means attention",
+                            theme::FONT_BODY,
+                            theme::TEXT_DIM,
+                        ),
+                    )
+                    .changed()
+                {
+                    form.note = None;
+                }
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Attention otherwise comes only from `grove notify --state \
+                         attention`, run from your agent's hooks, and stays until you \
+                         open the session. Bells are off by default because they are \
+                         noisy.",
                         theme::FONT_SMALL,
                         theme::TEXT_FAINT,
                     ))
@@ -466,6 +696,116 @@ mod tests {
             Path::new("config.toml"),
         )
         .expect("valid test config")
+    }
+
+    #[test]
+    fn a_fresh_form_from_the_new_sections_has_nothing_to_save() {
+        let text = "[terminal]\ncommand = \"foot\"\n\
+                    [status]\nworking_window_secs = 30\nbell_is_attention = true\n\
+                    [agents]\ncommand = \"claude\"\nresource_accounting = \"never\"\n";
+        let config = Config::from_toml(text, Path::new("config.toml")).expect("valid");
+        let form = Form::new(Some(&config));
+        assert_eq!(form.working_window, "30");
+        assert!(form.bell_is_attention);
+        assert!(form.desktop_notifications, "the default is on");
+        assert_eq!(form.agent_command, "claude");
+        assert_eq!(form.resource_accounting, Accounting::Never);
+        assert!(!form.is_dirty(), "reading a file is not a change to it");
+    }
+
+    #[test]
+    fn each_new_field_writes_only_its_own_key() {
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        form.agent_command = "claude --resume".into();
+        assert_eq!(
+            form.edits(),
+            vec![Edit::string(
+                config_write::AGENTS_COMMAND,
+                "claude --resume"
+            )]
+        );
+
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        form.resource_accounting = Accounting::Always;
+        assert_eq!(
+            form.edits(),
+            vec![Edit::string(
+                config_write::AGENTS_RESOURCE_ACCOUNTING,
+                "always"
+            )]
+        );
+
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        form.working_window = "45".into();
+        assert_eq!(
+            form.edits(),
+            vec![Edit::Int(config_write::STATUS_WORKING_WINDOW, 45)]
+        );
+
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        form.bell_is_attention = true;
+        form.desktop_notifications = false;
+        assert_eq!(
+            form.edits(),
+            vec![
+                Edit::Bool(config_write::STATUS_BELL_IS_ATTENTION, true),
+                Edit::Bool(config_write::STATUS_DESKTOP_NOTIFICATIONS, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_half_typed_working_window_blocks_the_save_rather_than_being_written() {
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        for bad in ["", "  ", "0", "-5", "ten", "10s"] {
+            form.working_window = bad.into();
+            assert!(
+                form.problem().is_some(),
+                "`{bad}` must not be saveable as a working window"
+            );
+            assert!(
+                !form
+                    .edits()
+                    .iter()
+                    .any(|e| e.key() == config_write::STATUS_WORKING_WINDOW),
+                "`{bad}` must never reach the file"
+            );
+        }
+        form.working_window = "15".into();
+        assert_eq!(form.problem(), None);
+    }
+
+    #[test]
+    fn an_empty_agent_command_is_allowed_but_a_malformed_one_is_not() {
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        // Empty means "offer no agent", which is a legitimate choice.
+        form.agent_command = "  ".into();
+        assert_eq!(form.problem(), None);
+
+        form.agent_command = "claude --flag 'unclosed".into();
+        assert!(
+            form.problem().is_some_and(|p| p.contains("agent command")),
+            "an unbalanced quote must be named as the agent command's"
+        );
+    }
+
+    #[test]
+    fn reloading_adopts_the_new_sections_as_the_baseline() {
+        let text = "[terminal]\ncommand = \"foot\"\n\
+                    [status]\nworking_window_secs = 30\n\
+                    [agents]\ncommand = \"claude\"\n";
+        let saved = Config::from_toml(text, Path::new("config.toml")).expect("valid");
+
+        let mut form = Form::new(Some(&config("foot", "")));
+        form.agent_command = "claude".into();
+        form.working_window = "30".into();
+        form.saving = true;
+        form.reloaded(&saved);
+
+        assert!(!form.saving);
+        assert!(!form.is_dirty(), "what was written is now the baseline");
+        assert_eq!(form.agent_command, "claude");
+        assert_eq!(form.working_window, "30");
     }
 
     #[test]

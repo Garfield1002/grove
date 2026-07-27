@@ -48,6 +48,15 @@ impl Accounting {
         }
     }
 
+    /// The value written back to `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Accounting::Auto => "auto",
+            Accounting::Always => "always",
+            Accounting::Never => "never",
+        }
+    }
+
     /// Should a command be wrapped, given whether systemd is available?
     pub fn wraps(self, systemd_available: bool) -> bool {
         match self {
@@ -188,6 +197,10 @@ mod tests {
         assert_eq!(Accounting::parse("off"), Some(Accounting::Never));
         assert_eq!(Accounting::parse("maybe"), None);
         assert_eq!(Accounting::default(), Accounting::Auto);
+        // Every spelling Grove writes must be one it reads back.
+        for value in [Accounting::Auto, Accounting::Always, Accounting::Never] {
+            assert_eq!(Accounting::parse(value.as_str()), Some(value));
+        }
     }
 
     #[test]
