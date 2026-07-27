@@ -4,7 +4,6 @@
 use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
 
-use super::worktree_row::RowAction;
 use super::{Action, icons, theme, window_row, worktree_row};
 
 /// Draw every project, applying the filter. Returns the user's action.
@@ -12,6 +11,8 @@ pub fn show(
     ui: &mut Ui,
     projects: &[Project],
     selected: Option<&str>,
+    // The window row the user last opened, as (worktree id, window index).
+    selected_window: Option<(&str, u32)>,
     filter: &str,
     home: Option<&std::path::Path>,
 ) -> Option<Action> {
@@ -28,6 +29,28 @@ pub fn show(
             && matches.is_empty()
             && !project.name.to_ascii_lowercase().contains(&needle)
         {
+            continue;
+        }
+
+        // A project with a single worktree is drawn as that one row, under the
+        // project's name: a header with exactly one child says nothing the
+        // child does not. An unavailable project keeps its header, which is
+        // where its Retry and Locate live (DESIGN.md §11).
+        if project.is_available() && project.worktrees.len() == 1 && matches.len() == 1 {
+            let worktree = matches[0];
+            if let Some(row_action) = worktree_row::show(
+                ui,
+                worktree,
+                selected == Some(worktree.id.as_str()),
+                home,
+                Some(project),
+            ) {
+                action = Some(row_action.into_action(&project.id, &worktree.id));
+            }
+            if let Some(window_action) = windows(ui, project, worktree, selected_window) {
+                action = Some(window_action);
+            }
+            ui.add_space(8.0);
             continue;
         }
 
@@ -51,48 +74,12 @@ pub fn show(
             let mut inner = None;
             for worktree in &matches {
                 let is_selected = selected == Some(worktree.id.as_str());
-                if let Some(row_action) = worktree_row::show(ui, worktree, is_selected, home) {
-                    let project_id = project.id.clone();
-                    let worktree_id = worktree.id.clone();
-                    inner = Some(match row_action {
-                        RowAction::Activate => Action::ActivateWorktree {
-                            project_id,
-                            worktree_id,
-                        },
-                        RowAction::Select => Action::SelectWorktree {
-                            project_id,
-                            worktree_id,
-                        },
-                        RowAction::OpenInNewTerminal => Action::OpenInNewTerminal {
-                            project_id,
-                            worktree_id,
-                        },
-                        RowAction::OpenNewWindow => Action::OpenNewWindow {
-                            project_id,
-                            worktree_id,
-                        },
-                        RowAction::StartAgent => Action::StartAgent {
-                            project_id,
-                            worktree_id,
-                        },
-                        RowAction::Refresh => Action::RefreshProject(project_id),
-                        RowAction::Remove => Action::RemoveWorktree {
-                            project_id,
-                            worktree_id,
-                        },
-                    });
+                if let Some(row_action) = worktree_row::show(ui, worktree, is_selected, home, None)
+                {
+                    inner = Some(row_action.into_action(&project.id, &worktree.id));
                 }
-                // The worktree's tmux windows, as child rows. There are none
-                // until a poll has reported some, so a worktree with no
-                // session simply has no children.
-                for window in &worktree.windows {
-                    if window_row::show(ui, window).is_some() {
-                        inner = Some(Action::ActivateWindow {
-                            project_id: project.id.clone(),
-                            worktree_id: worktree.id.clone(),
-                            window_index: window.index,
-                        });
-                    }
+                if let Some(window_action) = windows(ui, project, worktree, selected_window) {
+                    inner = Some(window_action);
                 }
             }
             if matches.is_empty() {
@@ -129,6 +116,34 @@ pub fn show(
         });
     }
 
+    action
+}
+
+/// The worktree's tmux windows, as child rows.
+///
+/// A single window gets no row of its own: the worktree row already stands for
+/// it, exactly as a project with one worktree gets no header. Rows appear only
+/// once a poll has reported windows, so a worktree with no session has none.
+fn windows(
+    ui: &mut Ui,
+    project: &Project,
+    worktree: &grove_core::model::Worktree,
+    selected_window: Option<(&str, u32)>,
+) -> Option<Action> {
+    if worktree.windows.len() < 2 {
+        return None;
+    }
+    let mut action = None;
+    for window in &worktree.windows {
+        let selected = selected_window == Some((worktree.id.as_str(), window.index));
+        if window_row::show(ui, window, selected).is_some() {
+            action = Some(Action::ActivateWindow {
+                project_id: project.id.clone(),
+                worktree_id: worktree.id.clone(),
+                window_index: window.index,
+            });
+        }
+    }
     action
 }
 

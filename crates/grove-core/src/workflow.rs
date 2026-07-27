@@ -623,6 +623,7 @@ mod tests {
             index,
             name: name.to_string(),
             active: index == 0,
+            bell: false,
         }
     }
 

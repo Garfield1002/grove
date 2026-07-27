@@ -41,6 +41,10 @@ pub struct GroveApp {
     projects: Vec<Project>,
 
     selected: Option<String>,
+    /// The window row the user last opened, as (worktree id, window index).
+    /// Cleared when the selection moves to another worktree, so only one row
+    /// in the tree is ever drawn as selected.
+    selected_window: Option<(String, u32)>,
     filter: String,
     status: Option<String>,
     errors: Vec<ErrorReport>,
@@ -124,6 +128,7 @@ impl GroveApp {
             state: loaded,
             projects,
             selected: None,
+            selected_window: None,
             filter: String::new(),
             status: None,
             errors,
@@ -746,6 +751,7 @@ impl GroveApp {
                         window_index,
                     });
                     self.clear_attention(&worktree_id, &session);
+                    self.selected_window = Some((worktree_id.clone(), window_index));
                     self.selected = Some(worktree_id);
                 }
             }
@@ -766,6 +772,15 @@ impl GroveApp {
                     ));
                 }
             }
+        }
+        // Exactly one row in the tree is selected: a window's highlight only
+        // survives while its own worktree is the selected one.
+        if self
+            .selected_window
+            .as_ref()
+            .is_some_and(|(id, _)| Some(id.as_str()) != self.selected.as_deref())
+        {
+            self.selected_window = None;
         }
     }
 
@@ -1503,6 +1518,9 @@ impl eframe::App for GroveApp {
                             ui,
                             &self.projects,
                             self.selected.as_deref(),
+                            self.selected_window
+                                .as_ref()
+                                .map(|(id, index)| (id.as_str(), *index)),
                             &self.filter,
                             self.home.as_deref(),
                         );

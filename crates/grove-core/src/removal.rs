@@ -306,6 +306,7 @@ mod tests {
             window_index: 0,
             window_name: "shell".into(),
             window_active: true,
+            window_bell: false,
         }
     }
 

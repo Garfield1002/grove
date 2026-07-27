@@ -81,6 +81,9 @@ pub const STATUS_ATTENTION: Color32 = WARNING;
 // ---------------------------------------------------------------- geometry
 
 pub const ROW_RADIUS: u8 = 9;
+/// A terminal row's corner radius. Deliberately larger than [`ROW_RADIUS`]:
+/// the child rows read as chips under their worktree rather than as more rows.
+pub const WINDOW_ROW_RADIUS: u8 = 11;
 pub const CHIP_RADIUS: u8 = 8;
 pub const BADGE_RADIUS: u8 = 10;
 
@@ -190,7 +193,169 @@ pub fn label(text: impl Into<String>, size: f32, color: Color32) -> egui::RichTe
     egui::RichText::new(text).size(size).color(color)
 }
 
+/// Fill a rounded rectangle with a linear gradient running from its
+/// bottom-left corner to its top-right one.
+///
+/// egui's rect shapes take a single fill colour, so the shape is tessellated
+/// here: the outline of the rounded rectangle, fanned from its centre, with
+/// every vertex coloured by how far along that diagonal it sits.
+pub fn diagonal_gradient(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    radius: f32,
+    from: Color32,
+    to: Color32,
+) {
+    let outline = rounded_rect_points(rect, radius);
+    if outline.is_empty() {
+        return;
+    }
+    let mut mesh = egui::epaint::Mesh::default();
+    let vertex = |pos: egui::Pos2| egui::epaint::Vertex {
+        pos,
+        uv: egui::epaint::WHITE_UV,
+        color: lerp_color(from, to, gradient_t(rect, pos)),
+    };
+    mesh.vertices.push(vertex(rect.center()));
+    for point in &outline {
+        mesh.vertices.push(vertex(*point));
+    }
+    let last = outline.len() as u32;
+    for i in 0..last {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % last);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// How far along the bottom-left → top-right diagonal a point sits, clamped to
+/// `0.0..=1.0`.
+fn gradient_t(rect: egui::Rect, pos: egui::Pos2) -> f32 {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return 0.0;
+    }
+    let across = (pos.x - rect.left()) / rect.width();
+    let up = (rect.bottom() - pos.y) / rect.height();
+    ((across + up) / 2.0).clamp(0.0, 1.0)
+}
+
+/// Straight per-channel interpolation. Both endpoints are premultiplied, which
+/// is what makes this sound to do channel by channel.
+fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
+    let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        channel(from.r(), to.r()),
+        channel(from.g(), to.g()),
+        channel(from.b(), to.b()),
+        channel(from.a(), to.a()),
+    )
+}
+
+/// The outline of a rounded rectangle, clockwise from its top-right arc.
+fn rounded_rect_points(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
+    if !rect.is_positive() {
+        return Vec::new();
+    }
+    let radius = radius
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .max(0.0);
+    /// Points per corner arc. Six is smooth at the radii Grove uses and keeps
+    /// the mesh at 25 vertices, which the row list redraws every frame.
+    const SEGMENTS: usize = 6;
+    let corners = [
+        (
+            egui::pos2(rect.right() - radius, rect.top() + radius),
+            -std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(rect.right() - radius, rect.bottom() - radius),
+            0.0,
+        ),
+        (
+            egui::pos2(rect.left() + radius, rect.bottom() - radius),
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(rect.left() + radius, rect.top() + radius),
+            std::f32::consts::PI,
+        ),
+    ];
+    let mut points = Vec::with_capacity(corners.len() * (SEGMENTS + 1));
+    for (center, start) in corners {
+        for step in 0..=SEGMENTS {
+            let angle = start + std::f32::consts::FRAC_PI_2 * (step as f32 / SEGMENTS as f32);
+            points.push(egui::pos2(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+            ));
+        }
+    }
+    points
+}
+
 /// A section caption: small, uppercase-weight, muted.
 pub fn caption(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).size(FONT_CHIP).color(TEXT_MUTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 40.0))
+    }
+
+    #[test]
+    fn the_gradient_runs_from_bottom_left_to_top_right() {
+        let rect = rect();
+        assert_eq!(gradient_t(rect, rect.left_bottom()), 0.0);
+        assert_eq!(gradient_t(rect, rect.right_top()), 1.0);
+        assert_eq!(gradient_t(rect, rect.center()), 0.5);
+        // The other two corners sit halfway along it, as a diagonal implies.
+        assert_eq!(gradient_t(rect, rect.left_top()), 0.5);
+        assert_eq!(gradient_t(rect, rect.right_bottom()), 0.5);
+    }
+
+    #[test]
+    fn a_degenerate_rect_has_no_gradient_and_no_outline() {
+        let empty = egui::Rect::from_min_size(egui::pos2(1.0, 1.0), egui::vec2(0.0, 0.0));
+        assert_eq!(gradient_t(empty, egui::pos2(1.0, 1.0)), 0.0);
+        assert!(rounded_rect_points(empty, 8.0).is_empty());
+    }
+
+    #[test]
+    fn interpolation_hits_both_endpoints() {
+        let from = Color32::from_rgba_premultiplied(10, 20, 30, 40);
+        let to = Color32::from_rgba_premultiplied(50, 60, 70, 80);
+        assert_eq!(lerp_color(from, to, 0.0), from);
+        assert_eq!(lerp_color(from, to, 1.0), to);
+        assert_eq!(
+            lerp_color(from, to, 0.5),
+            Color32::from_rgba_premultiplied(30, 40, 50, 60)
+        );
+    }
+
+    #[test]
+    fn the_outline_stays_inside_the_rect() {
+        let rect = rect();
+        let points = rounded_rect_points(rect, WINDOW_ROW_RADIUS as f32);
+        assert_eq!(points.len(), 28, "four arcs of seven points");
+        for point in points {
+            assert!(
+                rect.expand(0.01).contains(point),
+                "{point:?} escaped {rect:?}"
+            );
+        }
+    }
+
+    /// A radius larger than the rect can hold is clamped rather than folding
+    /// the outline inside out.
+    #[test]
+    fn an_oversized_radius_is_clamped() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(20.0, 10.0));
+        for point in rounded_rect_points(rect, 40.0) {
+            assert!(rect.expand(0.01).contains(point), "{point:?} escaped");
+        }
+    }
 }

@@ -439,6 +439,9 @@ pub struct PaneInfo {
     pub window_name: String,
     /// This is the session's current window.
     pub window_active: bool,
+    /// tmux is flagging a bell for this window. Unlike the session-wide alert,
+    /// this says *which* window rang.
+    pub window_bell: bool,
 }
 
 /// A window of a session, as the tree lists it under a worktree.
@@ -449,6 +452,9 @@ pub struct WindowInfo {
     pub name: String,
     /// The session's current window — where an attaching client lands.
     pub active: bool,
+    /// tmux rang a bell in this window and no client has looked at it yet.
+    /// Grove treats that as "this one wants the user", per window.
+    pub bell: bool,
 }
 
 impl WindowInfo {
@@ -476,6 +482,7 @@ pub fn windows_of(panes: &[PaneInfo]) -> Vec<WindowInfo> {
                 index: pane.window_index,
                 name: pane.window_name.clone(),
                 active: pane.window_active,
+                bell: pane.window_bell,
             });
     }
     windows.into_values().collect()
@@ -484,7 +491,7 @@ pub fn windows_of(panes: &[PaneInfo]) -> Vec<WindowInfo> {
 const PANE_SOURCE: &str = "tmux list-panes";
 const PANE_FORMAT: &str = concat!(
     "#{session_name}\u{1}#{pane_pid}\u{1}#{pane_current_command}",
-    "\u{1}#{window_index}\u{1}#{window_name}\u{1}#{window_active}",
+    "\u{1}#{window_index}\u{1}#{window_name}\u{1}#{window_active}\u{1}#{window_bell_flag}",
 );
 
 /// Parse the output of `list-panes -F` with [`PANE_FORMAT`].
@@ -503,7 +510,9 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             Some(window_index),
             Some(window_name),
             Some(window_active),
+            Some(window_bell),
         ) = (
+            fields.next(),
             fields.next(),
             fields.next(),
             fields.next(),
@@ -535,6 +544,7 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             window_index,
             window_name: window_name.to_string(),
             window_active: window_active.trim() == "1",
+            window_bell: window_bell.trim() == "1",
         });
     }
     Ok(panes)
@@ -866,8 +876,8 @@ mod tests {
 
     #[test]
     fn parses_a_pane_listing() {
-        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\n\
-                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\n";
+        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n\
+                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\u{1}1\n";
         let panes = parse_panes(text).expect("valid");
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].session, "wt-a1b2c3");
@@ -876,16 +886,18 @@ mod tests {
         assert_eq!(panes[0].window_index, 0);
         assert_eq!(panes[0].window_name, "shell");
         assert!(panes[0].window_active);
+        assert!(!panes[0].window_bell);
         assert_eq!(panes[1].command, "cargo");
         assert_eq!(panes[1].window_index, 1);
         assert_eq!(panes[1].window_name, "agent");
         assert!(!panes[1].window_active);
+        assert!(panes[1].window_bell, "the second window rang");
     }
 
     #[test]
     fn a_window_name_may_hold_spaces_and_colons() {
-        let panes =
-            parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\n").expect("valid");
+        let panes = parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\u{1}0\n")
+            .expect("valid");
         assert_eq!(panes[0].window_name, "notes: draft");
     }
 
@@ -903,32 +915,34 @@ mod tests {
 
     #[test]
     fn rejects_a_non_numeric_pid() {
-        let err = parse_panes("wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\n")
+        let err = parse_panes("wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n")
             .expect_err("bad pid");
         assert!(err.reason.contains("is not a pid"));
     }
 
     #[test]
     fn rejects_a_non_numeric_window_index() {
-        let err = parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\n")
+        let err = parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\u{1}0\n")
             .expect_err("bad window index");
         assert!(err.reason.contains("is not a window index"));
     }
 
     #[test]
     fn panes_collapse_into_their_windows() {
-        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\n\
-                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\n\
-                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\n\
-                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\n";
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n\
+                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\u{1}0\n\
+                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\u{1}1\n\
+                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows.len(), 3, "two panes of window 0 are one window");
         assert_eq!(windows[0].target(), "wt-a1b2c3:0");
         assert_eq!(windows[0].name, "shell");
         assert!(windows[0].active);
+        assert!(!windows[0].bell);
         assert_eq!(windows[1].target(), "wt-a1b2c3:1");
         assert_eq!(windows[1].name, "agent");
         assert!(!windows[1].active);
+        assert!(windows[1].bell, "the bell belongs to the window that rang");
         assert_eq!(windows[2].session, "wt-ddeeff");
     }
 

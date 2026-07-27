@@ -3,7 +3,7 @@
 //! markers for a locked or detached worktree and a dirty working tree.
 
 use egui::{Align, Layout, Sense, Stroke, StrokeKind, Ui, vec2};
-use grove_core::model::{SessionPresence, Worktree};
+use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::status::SessionStatus;
 
 use super::{icons, theme};
@@ -18,6 +18,48 @@ pub enum RowAction {
     StartAgent,
     Refresh,
     Remove,
+    /// Only offered on a row standing in for its project, which is the only
+    /// place those two have no header of their own to hang off.
+    CreateWorktree,
+    RemoveProject,
+}
+
+impl RowAction {
+    /// What this row action means for the project and worktree it came from.
+    pub fn into_action(self, project_id: &str, worktree_id: &str) -> super::Action {
+        use super::Action;
+        let project_id = project_id.to_string();
+        let worktree_id = worktree_id.to_string();
+        match self {
+            RowAction::Activate => Action::ActivateWorktree {
+                project_id,
+                worktree_id,
+            },
+            RowAction::Select => Action::SelectWorktree {
+                project_id,
+                worktree_id,
+            },
+            RowAction::OpenInNewTerminal => Action::OpenInNewTerminal {
+                project_id,
+                worktree_id,
+            },
+            RowAction::OpenNewWindow => Action::OpenNewWindow {
+                project_id,
+                worktree_id,
+            },
+            RowAction::StartAgent => Action::StartAgent {
+                project_id,
+                worktree_id,
+            },
+            RowAction::Refresh => Action::RefreshProject(project_id),
+            RowAction::Remove => Action::RemoveWorktree {
+                project_id,
+                worktree_id,
+            },
+            RowAction::CreateWorktree => Action::CreateWorktree(project_id),
+            RowAction::RemoveProject => Action::RemoveProject(project_id),
+        }
+    }
 }
 
 /// A quiet right-edge marker. Only ever built from something git reported.
@@ -28,7 +70,6 @@ pub enum Marker {
     Unavailable,
     Locked,
     Detached,
-    Dirty,
 }
 
 impl Marker {
@@ -37,14 +78,13 @@ impl Marker {
             Marker::Unavailable => "the worktree directory is missing",
             Marker::Locked => "locked",
             Marker::Detached => "detached HEAD",
-            Marker::Dirty => "uncommitted changes",
         }
     }
 
     fn color(self) -> egui::Color32 {
         match self {
             Marker::Locked | Marker::Detached => theme::TEXT_MUTED,
-            Marker::Unavailable | Marker::Dirty => theme::WARNING,
+            Marker::Unavailable => theme::WARNING,
         }
     }
 
@@ -53,9 +93,6 @@ impl Marker {
             Marker::Unavailable => icons::warning(painter, rect, color),
             Marker::Locked => icons::lock(painter, rect, color),
             Marker::Detached => icons::unlink(painter, rect, color),
-            Marker::Dirty => {
-                painter.circle_filled(rect.center(), rect.width() * 0.26, color);
-            }
         }
     }
 }
@@ -89,11 +126,17 @@ const MARKER_SIZE: f32 = 11.0;
 const CPU_ICON: f32 = 9.0;
 
 /// Draw a worktree row.
+///
+/// `project` is `Some` when this row is standing in for its whole project —
+/// the project has this one worktree, so the tree draws one row instead of a
+/// header with a single child. That row takes the project's name and carries
+/// the project's menu entries as well as the worktree's.
 pub fn show(
     ui: &mut Ui,
     worktree: &Worktree,
     selected: bool,
     home: Option<&std::path::Path>,
+    project: Option<&Project>,
 ) -> Option<RowAction> {
     let mut action = None;
     let width = ui.available_width();
@@ -127,8 +170,13 @@ pub fn show(
             (None, false, false) => None,
         };
         if let Some(color) = edge_color {
+            // A 3 px-wide rect cannot carry a 9 px corner, so the edge is the
+            // row's own rounded shape, clipped to the first few pixels: its
+            // left corners then follow the row's curve exactly.
             let edge = egui::Rect::from_min_size(rect.min, vec2(theme::ROW_EDGE, rect.height()));
-            painter.rect_filled(edge, radius, color);
+            painter
+                .with_clip_rect(edge)
+                .rect_filled(rect, radius, color);
         }
 
         let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
@@ -187,7 +235,10 @@ pub fn show(
         };
         content.add(
             egui::Label::new(theme::mono(
-                worktree.label(),
+                match project {
+                    Some(project) => project.name.clone(),
+                    None => worktree.label(),
+                },
                 theme::FONT_BRANCH,
                 name_color,
             ))
@@ -210,7 +261,7 @@ pub fn show(
                     );
                     ui.add(
                         egui::Label::new(theme::label(
-                            format!("· {}", sublabel(worktree, home)),
+                            format!("· {}", sublabel(worktree, home, project.is_some())),
                             theme::FONT_SUB,
                             sublabel_color(worktree),
                         ))
@@ -222,7 +273,7 @@ pub fn show(
             None => {
                 content.add(
                     egui::Label::new(theme::label(
-                        sublabel(worktree, home),
+                        sublabel(worktree, home, project.is_some()),
                         theme::FONT_SUB,
                         sublabel_color(worktree),
                     ))
@@ -262,6 +313,37 @@ pub fn show(
         if ui.button("Refresh").clicked() {
             action = Some(RowAction::Refresh);
             ui.close();
+        }
+        // With no project header above it, this row is the only way to reach
+        // the project's own actions.
+        if let Some(project) = project {
+            ui.separator();
+            if ui.button("Create worktree…").clicked() {
+                action = Some(RowAction::CreateWorktree);
+                ui.close();
+            }
+            if ui.button("Copy repository path").clicked() {
+                ui.ctx()
+                    .copy_text(project.repository_path.display().to_string());
+                action = Some(RowAction::Select);
+                ui.close();
+            }
+            if ui
+                .button(theme::label(
+                    "Remove project from Grove",
+                    theme::FONT_BODY,
+                    theme::DANGER,
+                ))
+                .clicked()
+            {
+                action = Some(RowAction::RemoveProject);
+                ui.close();
+            }
+            ui.label(theme::label(
+                "Removing a project only removes it from Grove.",
+                theme::FONT_SUB,
+                theme::TEXT_FAINT,
+            ));
         }
         ui.separator();
         if ui
@@ -332,13 +414,9 @@ fn markers(worktree: &Worktree) -> Markers {
     if worktree.is_detached {
         markers.push(Marker::Detached);
     }
-    if worktree
-        .git_status
-        .as_ref()
-        .is_some_and(|status| !status.is_clean())
-    {
-        markers.push(Marker::Dirty);
-    }
+    // A dirty working tree earns no marker: the sublabel already counts the
+    // modified and untracked files, and a dot beside it said the same thing
+    // twice.
     markers
 }
 
@@ -379,8 +457,16 @@ fn sublabel_color(worktree: &Worktree) -> egui::Color32 {
 
 /// Sublabel: the git summary and session state, plus the abbreviated path,
 /// which is what a user needs when two worktrees share a branch name.
-fn sublabel(worktree: &Worktree, home: Option<&std::path::Path>) -> String {
-    format!("{} · {}", worktree.sublabel(), worktree.short_path(home))
+///
+/// A row standing in for its project leads with the branch, which its name
+/// no longer says.
+fn sublabel(worktree: &Worktree, home: Option<&std::path::Path>, collapsed: bool) -> String {
+    let tail = format!("{} · {}", worktree.sublabel(), worktree.short_path(home));
+    if collapsed {
+        format!("{} · {tail}", worktree.label())
+    } else {
+        tail
+    }
 }
 
 #[cfg(test)]
@@ -497,19 +583,12 @@ mod tests {
     }
 
     #[test]
-    fn locked_detached_and_dirty_each_get_a_marker() {
+    fn locked_and_detached_each_get_a_marker() {
         let mut worktree = worktree();
         worktree.is_locked = true;
         worktree.is_detached = true;
-        worktree.git_status = Some(StatusSummary {
-            modified: 1,
-            ..StatusSummary::default()
-        });
         let hints: Vec<&str> = markers(&worktree).iter().map(Marker::hint).collect();
-        assert_eq!(
-            hints,
-            vec!["locked", "detached HEAD", "uncommitted changes"]
-        );
+        assert_eq!(hints, vec!["locked", "detached HEAD"]);
     }
 
     /// A worktree whose directory has gone leads the markers: it is the one
@@ -529,16 +608,12 @@ mod tests {
     }
 
     #[test]
-    fn all_four_markers_fit_at_once() {
+    fn every_marker_fits_at_once() {
         let mut worktree = worktree();
         worktree.is_missing = true;
         worktree.is_locked = true;
         worktree.is_detached = true;
-        worktree.git_status = Some(StatusSummary {
-            modified: 1,
-            ..StatusSummary::default()
-        });
-        assert_eq!(markers(&worktree).iter().count(), 4);
+        assert_eq!(markers(&worktree).iter().count(), 3);
     }
 
     #[test]
@@ -561,8 +636,19 @@ mod tests {
             ..StatusSummary::default()
         });
         assert_eq!(
-            sublabel(&worktree, Some(Path::new("/home/u"))),
+            sublabel(&worktree, Some(Path::new("/home/u")), false),
             "3 mod · 1 untracked · no session · ~/wt/auth"
+        );
+    }
+
+    /// A row standing in for its project takes the project's name, so the
+    /// branch it is on has to move into the sublabel.
+    #[test]
+    fn a_collapsed_row_keeps_its_branch_in_the_sublabel() {
+        let worktree = worktree();
+        assert_eq!(
+            sublabel(&worktree, Some(Path::new("/home/u")), true),
+            "feature/auth · no session · ~/wt/auth"
         );
     }
 
@@ -572,11 +658,24 @@ mod tests {
     fn markers_fit_inline_and_stay_ordered() {
         let mut worktree = worktree();
         worktree.is_locked = true;
+        worktree.is_detached = true;
+        let list: Vec<Marker> = markers(&worktree).iter().collect();
+        assert_eq!(list, vec![Marker::Locked, Marker::Detached]);
+    }
+
+    /// The dirty dot is gone: the sublabel counts the files instead.
+    #[test]
+    fn a_dirty_working_tree_earns_no_marker() {
+        let mut worktree = worktree();
         worktree.git_status = Some(StatusSummary {
             modified: 1,
             ..StatusSummary::default()
         });
-        let list: Vec<Marker> = markers(&worktree).iter().collect();
-        assert_eq!(list, vec![Marker::Locked, Marker::Dirty]);
+        assert!(markers(&worktree).is_empty());
+        assert!(
+            !hover_lines(&worktree)
+                .iter()
+                .any(|line| line == "uncommitted changes")
+        );
     }
 }
