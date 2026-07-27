@@ -1,0 +1,12 @@
+[package]
+name = "grove"
+description = "Native GUI for navigating Git projects, worktrees and tmux sessions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+grove-core = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }

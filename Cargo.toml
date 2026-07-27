@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/grove-core", "crates/grove"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+grove-core = { path = "crates/grove-core" }
+eframe = { version = "0.32", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = "0.32"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+thiserror = "2"
+shell-words = "1"
+tempfile = "3"
