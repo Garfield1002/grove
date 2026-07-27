@@ -39,6 +39,11 @@ pub enum Action {
         project_id: String,
         worktree_id: String,
     },
+    /// Open an extra shell window inside a worktree's tmux session.
+    OpenNewWindow {
+        project_id: String,
+        worktree_id: String,
+    },
     /// Start the configured agent in a worktree's session.
     StartAgent {
         project_id: String,

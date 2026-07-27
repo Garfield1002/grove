@@ -5,7 +5,7 @@
 //! wrappers can call `grove notify` without configuration.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, ParseError, Result};
 use crate::ids;
@@ -216,6 +216,36 @@ pub fn new_session_args(spec: &SessionSpec) -> Vec<OsString> {
         OsString::from("-e"),
         OsString::from(format!("{SESSION_ENV_VAR}={}", spec.worktree_id)),
     ]
+}
+
+/// Build the `new-window` invocation for an extra shell in a worktree's
+/// session.
+///
+/// No command is given, so tmux starts the user's default shell — Grove never
+/// builds a shell string here. The window is created in the worktree, and
+/// `-P -F` makes tmux print the window it created so the caller can say which
+/// one it was.
+pub fn new_window_args(session: &str, worktree: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("new-window"),
+        OsString::from("-t"),
+        OsString::from(session),
+        OsString::from("-n"),
+        OsString::from(SHELL_WINDOW),
+        OsString::from("-c"),
+        worktree.as_os_str().to_os_string(),
+        OsString::from("-P"),
+        OsString::from("-F"),
+        OsString::from("#{window_index}"),
+    ]
+}
+
+/// Open an extra shell window in an existing session, returning its index.
+pub fn new_window(server: &TmuxServer, session: &str, worktree: &Path) -> Result<String> {
+    Ok(server
+        .run(new_window_args(session, worktree))?
+        .trim()
+        .to_string())
 }
 
 /// Build one `set-option -t <session> <name> <value>` invocation.
@@ -630,6 +660,35 @@ mod tests {
                 "GROVE_SESSION=a1b2c3",
             ]
         );
+    }
+
+    #[test]
+    fn new_window_is_rooted_in_the_worktree_and_runs_no_command() {
+        let args: Vec<String> = new_window_args("wt-a1b2c3", Path::new("/home/u/my wt"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "new-window",
+                "-t",
+                "wt-a1b2c3",
+                "-n",
+                "shell",
+                "-c",
+                "/home/u/my wt",
+                "-P",
+                "-F",
+                "#{window_index}",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_worktree_path_with_shell_metacharacters_stays_one_argument() {
+        let args = new_window_args("wt-a1b2c3", Path::new("/tmp/x; rm -rf ~"));
+        assert_eq!(args[6], OsString::from("/tmp/x; rm -rf ~"));
     }
 
     #[test]

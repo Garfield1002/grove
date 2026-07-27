@@ -296,6 +296,16 @@ impl GroveApp {
                         }
                     });
                 }
+                Message::WindowOpened {
+                    worktree_id,
+                    window,
+                } => {
+                    self.selected = Some(worktree_id);
+                    self.status = Some(format!(
+                        "Opened window {} in {}",
+                        window.window, window.session
+                    ));
+                }
                 Message::Failed(report) => {
                     // A failed save must release the Save button, or the pane
                     // would sit on "Saving…" for ever.
@@ -526,6 +536,21 @@ impl GroveApp {
                 {
                     self.selected = Some(worktree_id);
                     self.workers.send(Task::OpenInNewTerminal {
+                        project_name: project.name.clone(),
+                        git_common_dir: project.git_common_dir.clone(),
+                        worktree: Box::new(worktree.clone()),
+                    });
+                }
+            }
+            Action::OpenNewWindow {
+                project_id,
+                worktree_id,
+            } => {
+                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
+                    && let Some(worktree) = project.worktree(&worktree_id)
+                {
+                    self.selected = Some(worktree_id);
+                    self.workers.send(Task::OpenNewWindow {
                         project_name: project.name.clone(),
                         git_common_dir: project.git_common_dir.clone(),
                         worktree: Box::new(worktree.clone()),

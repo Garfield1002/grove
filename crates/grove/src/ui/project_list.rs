@@ -67,6 +67,10 @@ pub fn show(
                             project_id,
                             worktree_id,
                         },
+                        RowAction::OpenNewWindow => Action::OpenNewWindow {
+                            project_id,
+                            worktree_id,
+                        },
                         RowAction::StartAgent => Action::StartAgent {
                             project_id,
                             worktree_id,

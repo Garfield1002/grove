@@ -21,7 +21,7 @@ use grove_core::process::Invocation;
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
 use grove_core::status::{SessionReport, SessionStatus};
-use grove_core::workflow::{self, Activation};
+use grove_core::workflow::{self, Activation, NewWindow};
 use grove_core::{Error, Paths, TmuxServer, config, git, state, terminal, tmux};
 
 /// Work requested by the UI.
@@ -59,6 +59,12 @@ pub enum Task {
     },
     /// Attach an additional terminal without retargeting the primary client.
     OpenInNewTerminal {
+        project_name: String,
+        git_common_dir: PathBuf,
+        worktree: Box<Worktree>,
+    },
+    /// Open an extra shell window inside a worktree's tmux session.
+    OpenNewWindow {
         project_name: String,
         git_common_dir: PathBuf,
         worktree: Box<Worktree>,
@@ -209,6 +215,11 @@ pub enum Message {
     Activated {
         worktree_id: String,
         activation: Activation,
+    },
+    /// An extra shell window was opened inside a worktree's session.
+    WindowOpened {
+        worktree_id: String,
+        window: NewWindow,
     },
     BaseRefsLoaded {
         project_id: String,
@@ -546,6 +557,31 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
                     &format!("could not open a terminal on {}", worktree.label()),
+                    &e,
+                ))],
+            };
+            messages.extend(handle(worker, Task::RefreshSessions));
+            messages
+        }
+
+        Task::OpenNewWindow {
+            project_name,
+            git_common_dir,
+            worktree,
+        } => {
+            let worktree_id = worktree.id.clone();
+            let mut messages = match workflow::open_new_window(
+                &worker.server,
+                &project_name,
+                &git_common_dir,
+                &worktree,
+            ) {
+                Ok(window) => vec![Message::WindowOpened {
+                    worktree_id,
+                    window,
+                }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not open a window on {}", worktree.label()),
                     &e,
                 ))],
             };

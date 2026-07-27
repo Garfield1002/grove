@@ -154,6 +154,53 @@ fn window_zero_is_named_shell() {
 }
 
 #[test]
+fn opening_a_new_window_adds_a_shell_beside_the_first() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let git_common_dir = worktree.join(".git");
+
+    let test = TestServer::new();
+    let wt = worktree_at(&worktree, &git_common_dir, "main");
+
+    // The session does not exist yet: opening a window must create it.
+    let first = workflow::open_new_window(&test.server, "acme-web", &git_common_dir, &wt)
+        .expect("opens a window");
+    assert_eq!(first.session, wt.session_name());
+
+    let second = workflow::open_new_window(&test.server, "acme-web", &git_common_dir, &wt)
+        .expect("opens another window");
+    assert_ne!(
+        first.window, second.window,
+        "each request must get its own window"
+    );
+
+    let windows = test
+        .server
+        .run([
+            "list-windows".to_string(),
+            "-t".to_string(),
+            first.session.clone(),
+            "-F".to_string(),
+            "#{window_name}:#{pane_current_path}".to_string(),
+        ])
+        .expect("lists windows");
+    let lines: Vec<&str> = windows.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one from the session, two opened: {windows}"
+    );
+    for line in lines {
+        assert_eq!(
+            line,
+            format!("shell:{}", worktree.display()),
+            "every window is a shell rooted in the worktree"
+        );
+    }
+}
+
+#[test]
 fn ensure_session_is_idempotent() {
     require!("tmux");
     let dir = tempfile::tempdir().expect("tempdir");

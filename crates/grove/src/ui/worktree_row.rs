@@ -14,6 +14,7 @@ pub enum RowAction {
     Activate,
     Select,
     OpenInNewTerminal,
+    OpenNewWindow,
     StartAgent,
     Refresh,
     Remove,
@@ -238,6 +239,10 @@ pub fn show(
         }
         if ui.button("Open in a new terminal").clicked() {
             action = Some(RowAction::OpenInNewTerminal);
+            ui.close();
+        }
+        if ui.button("New tmux window").clicked() {
+            action = Some(RowAction::OpenNewWindow);
             ui.close();
         }
         if ui.button("Copy worktree path").clicked() {

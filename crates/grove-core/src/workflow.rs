@@ -415,6 +415,37 @@ pub fn open_in_new_terminal(
     })
 }
 
+/// Open an extra shell window inside a worktree's tmux session (DESIGN.md §5).
+///
+/// This is the tmux-side counterpart of [`open_in_new_terminal`]: no terminal
+/// emulator is launched, so an already-attached client simply sees a new
+/// window appear. The session is ensured first, since asking for another
+/// window is also a reasonable way to open a worktree.
+///
+/// Runs subprocesses: worker thread only.
+pub fn open_new_window(
+    server: &TmuxServer,
+    project_name: &str,
+    git_common_dir: &Path,
+    worktree: &Worktree,
+) -> Result<NewWindow> {
+    if !worktree.path.is_dir() {
+        return Err(Error::WorktreeMissing(worktree.path.clone()));
+    }
+    let spec = session_spec(project_name, git_common_dir, worktree);
+    let (session, _created) = tmux::ensure_session(server, &spec)?;
+    let window = tmux::session::new_window(server, &session, &worktree.path)?;
+    Ok(NewWindow { session, window })
+}
+
+/// A shell window Grove opened inside a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWindow {
+    pub session: String,
+    /// The window index tmux reported, for the status line.
+    pub window: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +549,19 @@ mod tests {
         let err = open_in_new_terminal(
             &server,
             &Config::default(),
+            "proj",
+            Path::new("/home/u/proj/.git"),
+            &worktree("/nonexistent-grove/wt"),
+        )
+        .expect_err("worktree is gone");
+        assert!(matches!(err, Error::WorktreeMissing(_)));
+    }
+
+    #[test]
+    fn opening_a_new_window_on_a_missing_worktree_fails_before_touching_tmux() {
+        let server = TmuxServer::new("/tmp/grove-test-never-used.sock");
+        let err = open_new_window(
+            &server,
             "proj",
             Path::new("/home/u/proj/.git"),
             &worktree("/nonexistent-grove/wt"),
