@@ -1137,6 +1137,7 @@ dependencies = [
  "grove-core",
  "rfd",
  "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

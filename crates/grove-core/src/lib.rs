@@ -12,6 +12,7 @@ pub mod config_write;
 pub mod error;
 pub mod git;
 pub mod ids;
+pub mod ipc;
 pub mod model;
 pub mod paths;
 pub mod process;

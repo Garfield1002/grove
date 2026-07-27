@@ -15,6 +15,7 @@ native-file-picker = ["dep:rfd"]
 
 [dependencies]
 grove-core = { workspace = true }
+thiserror = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 rfd = { workspace = true, optional = true }

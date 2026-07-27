@@ -115,6 +115,18 @@ impl TmuxServer {
             || stderr.contains("server exited unexpectedly")
     }
 
+    /// Is this failure just "that session or pane is not there"?
+    ///
+    /// Addressing a session that has since exited is a normal race for the
+    /// poller and for `grove notify`, not an error to report. tmux words it
+    /// differently per command, hence both spellings.
+    pub fn is_missing_target(stderr: &str) -> bool {
+        let stderr = stderr.to_ascii_lowercase();
+        Self::is_no_server(&stderr)
+            || stderr.contains("no such session")
+            || stderr.contains("can't find")
+    }
+
     /// Terminate the private server. Only used by tests and by an explicit
     /// user action — never on Grove shutdown (FR-7: sessions outlive the GUI).
     pub fn kill_server(&self) -> Result<()> {
@@ -222,6 +234,22 @@ mod tests {
         ));
         assert!(!TmuxServer::is_no_server("can't find session: wt-abc123"));
         assert!(!TmuxServer::is_no_server(""));
+    }
+
+    #[test]
+    fn recognises_missing_target_messages() {
+        // Real tmux wordings: `set-option` and `list-panes` differ.
+        assert!(TmuxServer::is_missing_target(
+            "no such session: wt-ffffff\n"
+        ));
+        assert!(TmuxServer::is_missing_target(
+            "can't find session: wt-abc123"
+        ));
+        // A missing server means the target is missing too.
+        assert!(TmuxServer::is_missing_target("no server running on /tmp/x"));
+        // But a real failure is still a real failure.
+        assert!(!TmuxServer::is_missing_target("permission denied"));
+        assert!(!TmuxServer::is_missing_target(""));
     }
 
     #[test]

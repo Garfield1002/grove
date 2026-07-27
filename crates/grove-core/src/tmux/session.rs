@@ -253,7 +253,7 @@ pub fn set_attention(server: &TmuxServer, session: &str) -> Result<bool> {
     if out.success {
         return Ok(true);
     }
-    if TmuxServer::is_no_server(&out.stderr) || out.stderr.contains("can't find") {
+    if TmuxServer::is_missing_target(&out.stderr) {
         return Ok(false);
     }
     Err(out.failure.into())
@@ -265,7 +265,7 @@ pub fn clear_attention(server: &TmuxServer, session: &str) -> Result<bool> {
     if out.success {
         return Ok(true);
     }
-    if TmuxServer::is_no_server(&out.stderr) || out.stderr.contains("can't find") {
+    if TmuxServer::is_missing_target(&out.stderr) {
         return Ok(false);
     }
     Err(out.failure.into())
@@ -387,7 +387,7 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
 pub fn list_panes(server: &TmuxServer, session: &str) -> Result<Vec<PaneInfo>> {
     let out = server.run_allow_failure(["list-panes", "-s", "-t", session, "-F", PANE_FORMAT])?;
     if !out.success {
-        if TmuxServer::is_no_server(&out.stderr) || out.stderr.contains("can't find") {
+        if TmuxServer::is_missing_target(&out.stderr) {
             return Ok(Vec::new());
         }
         return Err(out.failure.into());

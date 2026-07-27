@@ -533,6 +533,88 @@ fn session_metadata_round_trips_through_tmux_user_options() {
 }
 
 #[test]
+fn the_attention_marker_round_trips_and_survives_a_relisting() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let test = TestServer::new();
+    let spec = spec_for(&worktree, "acme-web");
+    let (name, _) = tmux::ensure_session(&test.server, &spec).expect("creates");
+
+    let listed = |server: &TmuxServer| {
+        tmux::session::list_sessions(server)
+            .expect("lists")
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("the session is listed")
+    };
+
+    // A fresh session carries no marker and a usable activity stamp.
+    let before = listed(&test.server);
+    assert!(!before.attention);
+    assert!(
+        before.activity_epoch.is_some(),
+        "tmux always reports session_activity"
+    );
+
+    assert!(tmux::session::set_attention(&test.server, &name).expect("sets"));
+    assert!(listed(&test.server).attention);
+
+    assert!(tmux::session::clear_attention(&test.server, &name).expect("clears"));
+    assert!(!listed(&test.server).attention);
+}
+
+#[test]
+fn marking_attention_on_a_missing_session_is_a_no_op() {
+    require!("tmux");
+    let test = TestServer::new();
+    // No server at all: `grove notify` must not fail an agent's hook.
+    assert!(!tmux::session::set_attention(&test.server, "wt-a1b2c3").expect("no server is fine"));
+    assert!(!tmux::session::clear_attention(&test.server, "wt-a1b2c3").expect("no server is fine"));
+
+    // A live server, but no such session.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+    assert!(!tmux::session::set_attention(&test.server, "wt-ffffff").expect("missing is fine"));
+    assert!(!tmux::session::clear_attention(&test.server, "wt-ffffff").expect("missing is fine"));
+}
+
+#[test]
+fn a_hand_set_attention_option_is_read_as_attention() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let test = TestServer::new();
+    let spec = spec_for(&worktree, "acme-web");
+    let (name, _) = tmux::ensure_session(&test.server, &spec).expect("creates");
+
+    // The option is user-visible, so a hand-set `on` must work like Grove's 1.
+    test.server
+        .run([
+            "set-option".to_string(),
+            "-t".to_string(),
+            name.clone(),
+            tmux::session::OPT_ATTENTION.to_string(),
+            "on".to_string(),
+        ])
+        .expect("sets by hand");
+    let session = tmux::session::list_sessions(&test.server)
+        .expect("lists")
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("listed");
+    assert!(session.attention);
+
+    // And the signals it produces classify as attention regardless of quiet.
+    let signals = session.signals(session.activity_epoch.unwrap_or(0) + 3600, Vec::new());
+    assert_eq!(
+        grove_core::status::classify(&signals, &grove_core::StatusPolicy::default()),
+        grove_core::SessionStatus::Attention
+    );
+}
+
+#[test]
 fn a_session_grove_did_not_create_carries_no_metadata() {
     require!("tmux");
     let dir = tempfile::tempdir().expect("tempdir");

@@ -1,9 +1,9 @@
 //! Grove: a native GUI for Git projects, worktrees and tmux sessions.
 //!
-//! `grove` launches the GUI. The `notify` subcommand reserved in
-//! ARCHITECTURE.md §1 arrives with the agent workflow in Milestone 4.
+//! `grove` launches the GUI; `grove notify` reports an agent's status to it.
 
 mod app;
+mod notify;
 mod ui;
 mod workers;
 
@@ -14,6 +14,7 @@ grove — Git worktree and tmux session manager
 
 Usage:
   grove            launch the GUI
+  grove notify     report a session's status (see `grove notify --help`)
   grove --help     show this message
   grove --version  show the version
 ";
@@ -22,6 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => {}
+        Some("notify") => {
+            notify::run(&args[1..])?;
+            return Ok(());
+        }
         Some("-h" | "--help") => {
             print!("{USAGE}");
             return Ok(());

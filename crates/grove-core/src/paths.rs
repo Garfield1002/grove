@@ -111,6 +111,12 @@ impl Paths {
         self.runtime_dir.join(SOCKET_FILE)
     }
 
+    /// The socket `grove notify` writes to, beside the tmux socket in the
+    /// runtime directory so both die with the login session.
+    pub fn notify_socket(&self) -> PathBuf {
+        crate::ipc::socket_path(&self.runtime_dir)
+    }
+
     /// Grove's own tmux configuration, passed as `-f`. Without it a private
     /// server would still read `~/.tmux.conf`.
     pub fn tmux_config_file(&self) -> PathBuf {
@@ -180,6 +186,10 @@ mod tests {
         assert_eq!(
             paths.tmux_socket(),
             PathBuf::from("/run/user/1000/grove/tmux.sock")
+        );
+        assert_eq!(
+            paths.notify_socket(),
+            PathBuf::from("/run/user/1000/grove/notify.sock")
         );
         assert_eq!(
             paths.tmux_config_file(),

@@ -59,15 +59,20 @@ pub fn session_name(worktree_id: &str) -> String {
     format!("wt-{worktree_id}")
 }
 
+/// Could this string be a worktree id?
+///
+/// A shape check only — it says nothing about whether such a worktree exists.
+/// `grove notify` uses it to reject a bad `--session` up front instead of
+/// silently addressing a session that cannot exist.
+pub fn is_worktree_id(value: &str) -> bool {
+    value.len() == ID_LEN && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The worktree id encoded in a tmux session name, if it looks like one of
 /// ours.
 pub fn id_from_session_name(session_name: &str) -> Option<&str> {
     let id = session_name.strip_prefix("wt-")?;
-    if id.len() == ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(id)
-    } else {
-        None
-    }
+    if is_worktree_id(id) { Some(id) } else { None }
 }
 
 /// A stable id for a project, derived from its canonical git-common-dir.
