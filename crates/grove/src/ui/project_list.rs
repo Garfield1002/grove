@@ -27,6 +27,12 @@ pub fn show(
     let needle = filter.trim().to_ascii_lowercase();
 
     for project in projects {
+        let level = Level {
+            project,
+            selected,
+            selected_window,
+            home,
+        };
         let matches: Vec<&grove_core::model::Worktree> = project
             .worktrees
             .iter()
@@ -47,12 +53,10 @@ pub fn show(
             let worktree = matches[0];
             if let Some(inner) = worktree_level(
                 ui,
-                project,
+                level,
                 worktree,
                 worktree_row::Stands::Project(project),
-                selected,
-                selected_window,
-                home,
+                0,
             ) {
                 action = Some(inner);
             }
@@ -79,15 +83,9 @@ pub fn show(
         let body = state.show_body_unindented(ui, |ui| {
             let mut inner = None;
             for worktree in &matches {
-                if let Some(worktree_action) = worktree_level(
-                    ui,
-                    project,
-                    worktree,
-                    worktree_row::Stands::Worktree,
-                    selected,
-                    selected_window,
-                    home,
-                ) {
+                if let Some(worktree_action) =
+                    worktree_level(ui, level, worktree, worktree_row::Stands::Worktree, 1)
+                {
                     inner = Some(worktree_action);
                 }
             }
@@ -128,6 +126,16 @@ pub fn show(
     action
 }
 
+/// Everything a level of the tree needs beyond the worktree it is drawing:
+/// which project it belongs to, what is selected, and where home is.
+#[derive(Clone, Copy)]
+struct Level<'a> {
+    project: &'a Project,
+    selected: Option<&'a str>,
+    selected_window: Option<(&'a str, u32)>,
+    home: Option<&'a std::path::Path>,
+}
+
 /// One worktree of a project: either a single leaf row, or a dropdown header
 /// with one leaf row per tmux window.
 ///
@@ -137,16 +145,22 @@ pub fn show(
 /// header, and the badge on it counts them.
 fn worktree_level(
     ui: &mut Ui,
-    project: &Project,
+    level: Level,
     worktree: &grove_core::model::Worktree,
     stands: worktree_row::Stands,
-    selected: Option<&str>,
-    selected_window: Option<(&str, u32)>,
-    home: Option<&std::path::Path>,
+    // How far in this worktree sits: 0 when it stands for its project and so
+    // has no header above it, 1 under a project header.
+    depth: u8,
 ) -> Option<Action> {
+    let Level {
+        project,
+        selected,
+        selected_window,
+        home,
+    } = level;
     let is_selected = selected == Some(worktree.id.as_str());
     if !has_window_rows(worktree) {
-        let row_action = worktree_row::show(ui, worktree, is_selected, home, stands)?;
+        let row_action = worktree_row::show(ui, worktree, is_selected, home, stands, depth)?;
         return row_action.into_action(&project.id, &worktree.id);
     }
 
@@ -158,9 +172,14 @@ fn worktree_level(
     let openness = state.openness(ui.ctx());
 
     let mut action = None;
-    if let Some(row_action) =
-        worktree_row::header(ui, worktree, stands, worktree.windows.len(), openness)
-    {
+    if let Some(row_action) = worktree_row::header(
+        ui,
+        worktree,
+        stands,
+        worktree.windows.len(),
+        openness,
+        depth,
+    ) {
         if row_action == worktree_row::RowAction::Fold {
             state.toggle(ui);
         }
@@ -177,6 +196,7 @@ fn worktree_level(
                 selected,
                 home,
                 worktree_row::Stands::Window(window),
+                depth + 1,
             ) else {
                 continue;
             };
@@ -460,6 +480,14 @@ mod tests {
         assert!(!has_window_rows(&worktree), "one shell is not a level");
         worktree.windows.push(window(1));
         assert!(has_window_rows(&worktree), "a second window earns a header");
+    }
+
+    /// One step per header above a row, and nothing for a row that has none.
+    #[test]
+    fn each_level_indents_by_one_step() {
+        assert_eq!(worktree_row::indent(0), 0.0);
+        assert_eq!(worktree_row::indent(1), worktree_row::INDENT_STEP);
+        assert_eq!(worktree_row::indent(2), 2.0 * worktree_row::INDENT_STEP);
     }
 
     #[test]
