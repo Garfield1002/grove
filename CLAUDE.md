@@ -4,8 +4,8 @@ Native Rust GUI (egui/eframe) for navigating Git projects, worktrees, and
 persistent tmux sessions. It launches terminals attached to a private tmux
 server — it never renders terminals itself.
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) before structural changes; the full
-product design is in [docs/DESIGN.md](docs/DESIGN.md).
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before structural changes;
+the full product design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Workspace
 

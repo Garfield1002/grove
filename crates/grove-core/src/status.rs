@@ -107,6 +107,18 @@ impl StatusPolicy {
             .iter()
             .any(|agent| agent.eq_ignore_ascii_case(name))
     }
+
+    /// Is an agent already running in a session, given its pane commands?
+    ///
+    /// The question a restart asks before resuming anything: an agent someone
+    /// started by hand, in the shell window rather than Grove's `agent` one,
+    /// counts just as much as one Grove launched itself. Resuming beside it
+    /// would put two processes on the same conversation.
+    pub fn agent_running(&self, pane_commands: &[String]) -> bool {
+        pane_commands
+            .iter()
+            .any(|command| self.is_agent_command(command))
+    }
 }
 
 /// One poll's worth of signals about a single session.
@@ -147,11 +159,7 @@ pub fn classify(signals: &SessionSignals, policy: &StatusPolicy) -> SessionStatu
     let recently_active = signals
         .activity_age
         .is_some_and(|age| age <= policy.working_window);
-    let agent_running = signals
-        .pane_commands
-        .iter()
-        .any(|cmd| policy.is_agent_command(cmd));
-    if recently_active || agent_running {
+    if recently_active || policy.agent_running(&signals.pane_commands) {
         return SessionStatus::Working;
     }
     SessionStatus::Idle

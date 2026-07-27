@@ -22,7 +22,7 @@ use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::process::Invocation;
 use grove_core::reconcile::{self, ProjectRef, Reconciliation};
 use grove_core::removal::RemovalReport;
-use grove_core::state::State;
+use grove_core::state::{AgentRecord, State};
 use grove_core::status::SessionReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{self, Activation, NewWindow};
@@ -119,6 +119,16 @@ pub enum Task {
         worktree: Box<Worktree>,
         /// The conversation to resume, when the user asked to resume one.
         resume: Option<String>,
+    },
+    /// Bring back the conversations `state.toml` recorded, once per launch,
+    /// in worktrees where no agent is running any more (DESIGN.md §11).
+    ///
+    /// Deciding needs one poll of the tmux server to know what is still
+    /// running, so it happens here rather than on the UI thread — over the
+    /// reconciled project list the UI already holds.
+    ResumeAgents {
+        projects: Vec<Project>,
+        records: Vec<AgentRecord>,
     },
     /// Install or remove Grove's hooks in Claude Code's `settings.json`, or
     /// just look at what is there. File work, so never the UI thread.
@@ -277,6 +287,13 @@ pub enum Message {
     /// An orphaned session was closed, on its own confirmation.
     OrphanClosed {
         session: String,
+    },
+    /// Startup resumed the conversations whose agents were gone. Carries the
+    /// worktree ids so the rows can be selected as they come back, and is
+    /// sent even when it resumed nothing: that is the answer to "did anything
+    /// happen?", and silence would look like a failure.
+    AgentsResumed {
+        worktree_ids: Vec<String>,
     },
     /// An agent was started in a session's `agent` window.
     AgentStarted {
@@ -601,6 +618,54 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     &e,
                 ))],
             }
+        }
+
+        Task::ResumeAgents { projects, records } => {
+            let signals =
+                match workflow::poll_session_signals(&worker.server, workflow::now_epoch()) {
+                    Ok(signals) => signals,
+                    // Without a poll there is no way to tell a dead agent from a
+                    // live one, and resuming beside a live one is the outcome
+                    // worth avoiding. So: report, resume nothing.
+                    Err(e) => {
+                        return vec![Message::Failed(ErrorReport::new(
+                            "could not read the tmux server, so no conversation was resumed",
+                            &e,
+                        ))];
+                    }
+                };
+            let policy = worker.config.status.policy();
+            let plans = workflow::agents_to_resume(&projects, &records, &signals, &policy);
+
+            let mut messages = Vec::new();
+            let mut worktree_ids = Vec::new();
+            for plan in plans {
+                // One failure is one conversation's failure: the rest are
+                // still worth bringing back.
+                match workflow::start_agent(
+                    &worker.server,
+                    &worker.config,
+                    &worker.paths.runtime_dir,
+                    &plan.project_name,
+                    &plan.git_common_dir,
+                    &plan.worktree,
+                    workflow::AgentStart::Resume(&plan.session_id),
+                ) {
+                    Ok(_) => worktree_ids.push(plan.worktree.id),
+                    Err(e) => messages.push(Message::Failed(ErrorReport::new(
+                        &format!(
+                            "could not resume the agent in {}",
+                            plan.worktree.path.display()
+                        ),
+                        &e,
+                    ))),
+                }
+            }
+            if !worktree_ids.is_empty() {
+                worker.enqueue(Task::RefreshSessions);
+            }
+            messages.push(Message::AgentsResumed { worktree_ids });
+            messages
         }
 
         Task::ClaudeHooks(op) => match claude_hooks(op) {

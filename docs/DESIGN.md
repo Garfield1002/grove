@@ -1,7 +1,7 @@
 # Worktree Session Manager — Design Document
 
 > Original design document for Grove. Resolved implementation decisions are
-> recorded in [../ARCHITECTURE.md](../ARCHITECTURE.md), which supersedes this
+> recorded in [ARCHITECTURE.md](ARCHITECTURE.md), which supersedes this
 > document where they differ (persistence is TOML, not SQLite; crate layout
 > is a two-crate workspace).
 
@@ -498,6 +498,26 @@ Actions:
 A worktree without a session should remain usable.
 
 Clicking it may recreate the session automatically after user confirmation or according to a setting.
+
+### Agent conversations
+
+Quitting Grove does not stop an agent: agents live in the tmux server, and a
+restart normally finds them all still running. Startup therefore resumes only
+the conversations whose agent is *gone* — the session was closed, the machine
+rebooted, or the agent exited on its own.
+
+On startup, after the first reconciliation, for each conversation `state.toml`
+recorded:
+
+* leave it alone if any pane of its session runs a known agent command,
+  including one the user started by hand in a shell window,
+* leave it alone if its worktree is missing or its project unavailable,
+* otherwise run `[agents] resume_command` in the worktree's `agent` window,
+  ensuring the session first.
+
+One pass per launch, never on a later refresh. `[agents] resume_on_startup`
+turns it off, leaving resuming to the row menu. A conversation the agent has
+since forgotten produces a command that says so — never a removed record.
 
 ## 12. Persistence
 

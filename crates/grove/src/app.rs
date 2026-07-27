@@ -82,6 +82,10 @@ pub struct GroveApp {
     /// The number `grove toggle <n>` started this process for, opened as soon
     /// as the first reconciliation says what that number points at.
     pending_toggle: Option<u8>,
+    /// Whether this launch has already asked to bring its agents back. One
+    /// pass per process: reconciliation also runs on refresh, on adopting an
+    /// orphan and on closing one, and none of those is a restart.
+    agents_resumed: bool,
     /// The three detached windows. The main window is a narrow sliver, so
     /// these render as their own toplevels (`ui::chrome`), one of each.
     create: Detached<CreateForm>,
@@ -162,6 +166,7 @@ impl GroveApp {
             open_project_path: None,
             pending_selection: None,
             pending_toggle,
+            agents_resumed: false,
             create: Detached::default(),
             removal: Detached::default(),
             settings: Detached::default(),
@@ -277,6 +282,20 @@ impl GroveApp {
                     ));
                     self.orphan_armed = None;
                     self.reconcile();
+                }
+                // Said either way. "Every agent was still running" is the
+                // common answer after a quick restart, and it is a different
+                // thing from Grove having done nothing.
+                Message::AgentsResumed { worktree_ids } => {
+                    self.status = Some(match worktree_ids.len() {
+                        0 => "No conversation needed resuming.".to_string(),
+                        1 => "Resumed 1 agent conversation.".to_string(),
+                        n => format!("Resumed {n} agent conversations."),
+                    });
+                    if let Some(first) = worktree_ids.first() {
+                        self.selected = Some(first.clone());
+                    }
+                    self.watch.send(Control::PollNow);
                 }
                 Message::AgentStarted { worktree_id, unit } => {
                     self.selected = Some(worktree_id);
@@ -729,6 +748,36 @@ impl GroveApp {
         if let Some(slot) = self.pending_toggle.take() {
             self.activate_slot(slot);
         }
+        self.resume_agents_once();
+    }
+
+    /// Ask the worker to bring back the conversations this launch lost.
+    ///
+    /// After the first reconciliation, because that is the point where the
+    /// rows are what git and tmux actually say — resuming into a worktree
+    /// Grove had not yet checked would be acting on last session's index.
+    fn resume_agents_once(&mut self) {
+        if self.agents_resumed {
+            return;
+        }
+        // Config first: until it has loaded, "resume on startup" has no
+        // answer, and treating that as "no" would spend the one pass this
+        // launch gets on a question nobody asked yet.
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let enabled = config.agents.resume_on_startup;
+        // Nothing to do is still done: a config that says no, or a state file
+        // with no conversations in it, must not leave this armed for a later
+        // refresh to fire.
+        self.agents_resumed = true;
+        if !enabled || self.state.agents.is_empty() {
+            return;
+        }
+        self.workers.send(Task::ResumeAgents {
+            projects: self.projects.clone(),
+            records: self.state.agents.clone(),
+        });
     }
 
     /// Drop reports for worktrees reconciliation no longer lists, so a Grove
@@ -807,8 +856,9 @@ impl GroveApp {
         self.save_state();
     }
 
-    /// Is there a `resume_command` to offer at all? Grove ships no default:
-    /// only the user knows how their agent spells "resume".
+    /// Is there a `resume_command` to offer at all? There is one by default —
+    /// Claude Code's, since Claude Code is what reports the ids — so this is
+    /// false only for a user who blanked the key.
     fn can_resume_agents(&self) -> bool {
         self.config
             .as_ref()

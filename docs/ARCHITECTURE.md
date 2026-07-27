@@ -239,6 +239,12 @@ would otherwise have to carry:
   `claude --resume {agent_session}`: the ids it substitutes are the ones
   Claude Code reported, so that spelling is known rather than guessed. Another
   agent overrides the key; blanking it removes the action.
+- **resuming on startup** — one pass after the first reconciliation
+  (`workflow::agents_to_resume`, `Task::ResumeAgents`), for the recorded
+  conversations whose agent is gone. What counts as gone is one poll of the
+  tmux server: a session with any pane running a known agent command is left
+  strictly alone, because two processes on one conversation is a worse outcome
+  than no resume. Off with `[agents] resume_on_startup = false`.
 
 Nothing here parses terminal output or infers state from process names.
 

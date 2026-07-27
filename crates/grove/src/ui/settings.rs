@@ -66,6 +66,8 @@ pub struct Form {
     pub agent_command: String,
     /// The template that reopens the conversation an agent reported.
     pub resume_command: String,
+    /// Whether starting Grove brings those conversations back.
+    pub resume_on_startup: bool,
     /// `auto`, `always` or `never`.
     pub resource_accounting: Accounting,
     /// Seconds of quiet before a session stops counting as working, as typed:
@@ -78,6 +80,7 @@ pub struct Form {
     loaded_parent: String,
     loaded_agent_command: String,
     loaded_resume_command: String,
+    loaded_resume_on_startup: bool,
     loaded_accounting: Accounting,
     loaded_working_window: String,
     loaded_bell: bool,
@@ -105,6 +108,7 @@ impl Form {
             default_parent: parent.clone(),
             agent_command: agents.command.clone(),
             resume_command: agents.resume_command.clone(),
+            resume_on_startup: agents.resume_on_startup,
             resource_accounting: agents.accounting(),
             working_window: window.clone(),
             bell_is_attention: status.bell_is_attention,
@@ -114,6 +118,7 @@ impl Form {
             loaded_accounting: agents.accounting(),
             loaded_agent_command: agents.command,
             loaded_resume_command: agents.resume_command,
+            loaded_resume_on_startup: agents.resume_on_startup,
             loaded_working_window: window,
             loaded_bell: status.bell_is_attention,
             loaded_notifications: status.desktop_notifications,
@@ -163,6 +168,12 @@ impl Form {
             edits.push(Edit::string(
                 config_write::AGENTS_RESUME_COMMAND,
                 self.resume_command.trim(),
+            ));
+        }
+        if self.resume_on_startup != self.loaded_resume_on_startup {
+            edits.push(Edit::Bool(
+                config_write::AGENTS_RESUME_ON_STARTUP,
+                self.resume_on_startup,
             ));
         }
         if self.resource_accounting != self.loaded_accounting {
@@ -224,6 +235,7 @@ impl Form {
         self.loaded_parent = config.worktrees.default_parent.clone();
         self.loaded_agent_command = config.agents.command.clone();
         self.loaded_resume_command = config.agents.resume_command.clone();
+        self.loaded_resume_on_startup = config.agents.resume_on_startup;
         self.loaded_accounting = config.agents.accounting();
         self.loaded_working_window = config.status.working_window_secs.to_string();
         self.loaded_bell = config.status.bell_is_attention;
@@ -237,6 +249,7 @@ impl Form {
         self.default_parent = self.loaded_parent.clone();
         self.agent_command = self.loaded_agent_command.clone();
         self.resume_command = self.loaded_resume_command.clone();
+        self.resume_on_startup = self.loaded_resume_on_startup;
         self.resource_accounting = self.loaded_accounting;
         self.working_window = self.loaded_working_window.clone();
         self.bell_is_attention = self.loaded_bell;
@@ -448,6 +461,29 @@ pub fn body(
                          through `grove notify --agent-session`. Defaults to Claude \
                          Code's spelling, since Claude Code is what reports those ids; \
                          empty offers no resume at all.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .checkbox(
+                        &mut form.resume_on_startup,
+                        theme::label(
+                            "Resume them when Grove starts",
+                            theme::FONT_BODY,
+                            theme::TEXT_DIM,
+                        ),
+                    )
+                    .changed()
+                {
+                    form.note = None;
+                }
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Only where the agent is gone. One that outlived Grove — or \
+                         that you started yourself in a shell window — is left running.",
                         theme::FONT_SMALL,
                         theme::TEXT_FAINT,
                     ))

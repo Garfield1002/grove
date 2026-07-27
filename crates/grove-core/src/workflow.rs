@@ -5,7 +5,7 @@
 //! and so the sequencing is testable without a display.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent;
 use crate::cgroup;
@@ -18,7 +18,8 @@ use crate::model::{
 };
 use crate::notice::Notices;
 use crate::removal::{RemovalInputs, Unpushed};
-use crate::status::{SessionReport, SessionSignals};
+use crate::state::AgentRecord;
+use crate::status::{SessionReport, SessionSignals, StatusPolicy};
 use crate::terminal::{self, TemplateVars};
 use crate::tmux::{self, SessionSpec, TmuxServer};
 
@@ -321,6 +322,79 @@ pub fn start_agent(
     )?;
     server.run(launch.args.clone())?;
     Ok(launch)
+}
+
+/// One conversation a restart should bring back, with everything
+/// [`start_agent`] needs to do it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumePlan {
+    pub project_name: String,
+    pub git_common_dir: PathBuf,
+    pub worktree: Worktree,
+    /// The conversation id the agent last reported in that worktree.
+    pub session_id: String,
+}
+
+/// Which recorded conversations a startup should resume (DESIGN.md §11).
+///
+/// Quitting Grove does not stop an agent — agents live in the tmux server —
+/// so this is deliberately not "everything `state.toml` remembers". It is the
+/// conversations whose agent is *gone*: the session was closed, the machine
+/// rebooted, or the agent exited on its own. Anything still running is left
+/// strictly alone, including an agent the user started by hand in a shell
+/// window, because a second process on one conversation is worse than no
+/// resume at all.
+///
+/// Nothing here launches anything or reads the filesystem: it is a decision
+/// over a reconciled project list and one poll's signals, so the caller can
+/// run it on a worker thread and the rules can be tested without a tmux
+/// server.
+pub fn agents_to_resume(
+    projects: &[Project],
+    records: &[AgentRecord],
+    signals: &HashMap<String, SessionSignals>,
+    policy: &StatusPolicy,
+) -> Vec<ResumePlan> {
+    let mut plans = Vec::new();
+    for record in records {
+        // A record with no conversation id is a transcript pointer and
+        // nothing more; there is no command to build from it.
+        if record.session_id.is_empty() {
+            continue;
+        }
+        // An unavailable project's rows are the last thing Grove saw, not
+        // what is there now. Acting on them would be acting on a guess.
+        let Some((project, worktree)) = projects
+            .iter()
+            .filter(|project| project.is_available())
+            .find_map(|project| {
+                project
+                    .worktree(&record.worktree_id)
+                    .map(|worktree| (project, worktree))
+            })
+        else {
+            continue;
+        };
+        // A worktree that is not on disk is reported missing, never restarted
+        // into: the safety rules say reconciliation marks and does nothing
+        // else, and this runs on its result.
+        if worktree.is_missing {
+            continue;
+        }
+        if signals
+            .get(&worktree.id)
+            .is_some_and(|signal| policy.agent_running(&signal.pane_commands))
+        {
+            continue;
+        }
+        plans.push(ResumePlan {
+            project_name: project.name.clone(),
+            git_common_dir: project.git_common_dir.clone(),
+            worktree: worktree.clone(),
+            session_id: record.session_id.clone(),
+        });
+    }
+    plans
 }
 
 /// Stamp polled session statuses onto a worktree list.
@@ -750,6 +824,146 @@ mod tests {
                 .expect("configured"),
             ("claude --resume {agent_session}", "0f3a")
         );
+    }
+
+    fn project_of(worktrees: Vec<Worktree>) -> Project {
+        Project {
+            id: "p1".into(),
+            name: "acme-web".into(),
+            repository_path: PathBuf::from("/home/u/proj"),
+            git_common_dir: PathBuf::from("/home/u/proj/.git"),
+            default_worktree_path: PathBuf::from("/home/u"),
+            is_expanded: true,
+            worktrees,
+            unavailable: None,
+        }
+    }
+
+    fn record_for(worktree: &Worktree, session_id: &str) -> AgentRecord {
+        AgentRecord {
+            worktree_id: worktree.id.clone(),
+            session_id: session_id.into(),
+            transcript_path: PathBuf::new(),
+        }
+    }
+
+    fn signals_running(commands: &[&str]) -> SessionSignals {
+        SessionSignals {
+            pane_commands: commands.iter().map(|c| c.to_string()).collect(),
+            ..SessionSignals::default()
+        }
+    }
+
+    /// The case the whole feature exists for: Grove was quit, the agent went
+    /// with the terminal or the reboot, and starting Grove brings it back.
+    #[test]
+    fn a_conversation_whose_agent_is_gone_is_resumed() {
+        let worktree = worktree("/home/u/proj");
+        let record = record_for(&worktree, "0f3a");
+        let projects = vec![project_of(vec![worktree.clone()])];
+
+        // No signals at all: the session is not even there any more.
+        let plans = agents_to_resume(
+            &projects,
+            std::slice::from_ref(&record),
+            &HashMap::new(),
+            &StatusPolicy::default(),
+        );
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].session_id, "0f3a");
+        assert_eq!(plans[0].worktree.id, worktree.id);
+        assert_eq!(plans[0].project_name, "acme-web");
+
+        // The session outlived Grove but the agent did not: a shell alone is
+        // still nothing to resume beside.
+        let mut signals = HashMap::new();
+        signals.insert(worktree.id.clone(), signals_running(&["bash", "less"]));
+        let plans = agents_to_resume(&projects, &[record], &signals, &StatusPolicy::default());
+        assert_eq!(plans.len(), 1, "a shell is not an agent");
+    }
+
+    /// Quitting Grove does not stop an agent, so most restarts find them all
+    /// still running. Resuming beside a live one would put two processes on a
+    /// single conversation, which is worse than doing nothing at all.
+    #[test]
+    fn a_running_agent_is_never_resumed_beside_itself() {
+        let worktree = worktree("/home/u/proj");
+        let record = record_for(&worktree, "0f3a");
+        let projects = vec![project_of(vec![worktree.clone()])];
+
+        for running in [
+            // Grove's own `agent` window.
+            vec!["bash", "claude"],
+            // Started by hand in the shell window, which Grove did not open
+            // and cannot tell apart — and must not resume over.
+            vec!["claude"],
+            // Wrappers can leave a path in `pane_current_command`.
+            vec!["/usr/local/bin/claude"],
+        ] {
+            let mut signals = HashMap::new();
+            signals.insert(worktree.id.clone(), signals_running(&running));
+            assert!(
+                agents_to_resume(
+                    &projects,
+                    std::slice::from_ref(&record),
+                    &signals,
+                    &StatusPolicy::default()
+                )
+                .is_empty(),
+                "{running:?} is a running agent"
+            );
+        }
+    }
+
+    /// Every reason a record names nothing Grove can act on. None of them is
+    /// an error and none of them removes the record: a restart is not the
+    /// moment to decide a conversation is finished.
+    #[test]
+    fn a_record_that_names_nothing_actionable_resumes_nothing() {
+        let worktree = worktree("/home/u/proj");
+        let policy = StatusPolicy::default();
+
+        // A transcript pointer with no conversation id: no command to build.
+        let plans = agents_to_resume(
+            &[project_of(vec![worktree.clone()])],
+            &[record_for(&worktree, "")],
+            &HashMap::new(),
+            &policy,
+        );
+        assert!(plans.is_empty(), "no id is nothing to resume");
+
+        // A worktree no loaded project has a row for.
+        let plans = agents_to_resume(
+            &[project_of(Vec::new())],
+            &[record_for(&worktree, "0f3a")],
+            &HashMap::new(),
+            &policy,
+        );
+        assert!(plans.is_empty(), "no row is nothing to resume into");
+
+        // The directory is gone. Reconciliation marks it and removes nothing;
+        // starting a process in it is not Grove's answer either.
+        let mut missing = worktree.clone();
+        missing.is_missing = true;
+        let plans = agents_to_resume(
+            &[project_of(vec![missing])],
+            &[record_for(&worktree, "0f3a")],
+            &HashMap::new(),
+            &policy,
+        );
+        assert!(plans.is_empty(), "a missing worktree is not resumed into");
+
+        // The project could not be read this pass, so its rows are the last
+        // thing Grove saw rather than what is there.
+        let mut unavailable = project_of(vec![worktree.clone()]);
+        unavailable.unavailable = Some("no such directory".into());
+        let plans = agents_to_resume(
+            &[unavailable],
+            &[record_for(&worktree, "0f3a")],
+            &HashMap::new(),
+            &policy,
+        );
+        assert!(plans.is_empty(), "an unavailable project is not acted on");
     }
 
     /// The two commands are independent: one configured is not the other.

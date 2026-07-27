@@ -229,8 +229,8 @@ cargo fmt --all
 
 Or `just gate` to run all of it. All four must pass.
 
-Architecture notes are in [ARCHITECTURE.md](ARCHITECTURE.md); the full
-product design is in [docs/DESIGN.md](docs/DESIGN.md).
+Architecture notes are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the
+full product design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License
 

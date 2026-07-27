@@ -77,6 +77,13 @@ pub const AGENTS_RESUME_COMMAND: Key = Key {
     name: "resume_command",
 };
 
+/// `agents.resume_on_startup` — whether starting Grove brings back the
+/// conversations whose agents are gone.
+pub const AGENTS_RESUME_ON_STARTUP: Key = Key {
+    table: "agents",
+    name: "resume_on_startup",
+};
+
 /// `agents.resource_accounting` — auto | always | never.
 pub const AGENTS_RESOURCE_ACCOUNTING: Key = Key {
     table: "agents",

@@ -49,6 +49,11 @@ pub struct AgentConfig {
     /// used by the agent that reports those ids; empty means Grove offers no
     /// "resume" action at all.
     pub resume_command: String,
+    /// Whether starting Grove brings back the conversations `state.toml`
+    /// recorded, for worktrees where no agent is running any more. On by
+    /// default: an agent that outlived Grove is left alone, and one that did
+    /// not is what the user quit with.
+    pub resume_on_startup: bool,
     /// Per-project overrides, keyed by project name.
     pub per_project: std::collections::BTreeMap<String, String>,
     /// `auto` (wrap when a systemd user manager is present), `always` or
@@ -62,6 +67,7 @@ impl Default for AgentConfig {
         Self {
             command: String::new(),
             resume_command: DEFAULT_RESUME_COMMAND.to_string(),
+            resume_on_startup: true,
             per_project: std::collections::BTreeMap::new(),
             resource_accounting: String::new(),
         }
@@ -217,6 +223,11 @@ pub fn first_run_document(terminal_command: &str) -> String {
          # default below is Claude Code's spelling, since Claude Code is what\n\
          # reports those ids; set it to \"\" to offer no resume at all.\n\
          # resume_command = \"claude --resume {{agent_session}}\"\n\
+         #\n\
+         # Starting Grove brings those conversations back, in worktrees where\n\
+         # no agent is running any more. An agent that outlived Grove is left\n\
+         # alone. Set to false to resume only from the row menu.\n\
+         # resume_on_startup = true\n\
          #\n\
          # [agents.per_project]\n\
          # acme-web = \"claude --resume\"\n",

@@ -64,8 +64,9 @@ impl<'a> Stands<'a> {
 pub struct AgentActions<'a> {
     /// The conversation the agent last reported here.
     pub session_id: Option<&'a str>,
-    /// Whether `[agents] resume_command` is configured. Grove ships no
-    /// default: only the user knows how their agent spells "resume".
+    /// Whether `[agents] resume_command` is configured. It is by default —
+    /// Claude Code's spelling — so this is false only where the user blanked
+    /// the key for an agent that resumes differently or not at all.
     pub can_resume: bool,
     /// Whether that conversation reported a transcript to open.
     pub has_transcript: bool,
