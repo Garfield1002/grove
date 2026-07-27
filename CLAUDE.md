@@ -64,8 +64,11 @@ All four of build/test/clippy/fmt must pass before any commit.
 - Reconciliation (startup/refresh/restore) marks things missing, stopped,
   or orphaned — it never auto-deletes.
 - `state.toml` writes are atomic (temp file in same dir + rename).
-  `config.toml` is user-owned: the app writes it only on first-run terminal
-  auto-detect, never afterwards.
+  `config.toml` is user-owned first: hand edits are first-class and must
+  survive. The app may write it only via `toml_edit` (surgical per-key
+  edits preserving comments and formatting) — first-run auto-detect and
+  explicit changes made in the Settings UI. Never serialize the whole
+  config over the file.
 - Never log terminal contents.
 
 ## Design constraints

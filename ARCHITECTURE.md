@@ -111,8 +111,10 @@ existence. TOML files are only an index and configuration store.
 
 - `$XDG_CONFIG_HOME/grove/config.toml` — user-owned. Terminal template,
   shell command, default worktree parent dir, agent command templates
-  (global / per-project / per-worktree), timeouts, toggles. The app reads it
-  and writes it only once (first-run auto-detect); it never clobbers edits.
+  (global / per-project / per-worktree), timeouts, toggles. Hand edits are
+  first-class; the app writes it only via `toml_edit` (surgical per-key
+  changes preserving comments/formatting) on first-run auto-detect and on
+  explicit Settings-UI changes — never whole-file serialization.
 - `$XDG_STATE_HOME/grove/state.toml` — app-owned. Registered projects,
   worktree ↔ session mappings, selection, UI expansion, manual status
   overrides, last-activity timestamps. Written atomically: serialize to a
