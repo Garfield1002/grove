@@ -1,8 +1,8 @@
 # Grove — Handoff
 
-_Last updated: 2026-07-27. Repo state: branch `m4-agent-workflow` @ `55be5b6`
+_Last updated: 2026-07-27. Repo state: branch `m4-agent-workflow` @ `3f5545a`
 (branched from `main` @ `5c9bd62`), working tree clean, all gates green
-(460 tests, clippy `-D warnings`, fmt, `--no-default-features` build)._
+(484 tests, clippy `-D warnings`, fmt, `--no-default-features` build)._
 
 ## What this is
 
@@ -24,7 +24,7 @@ Read in this order: [CLAUDE.md](../CLAUDE.md) (binding rules),
 | M2 — Worktree management (create worktree, refresh, git status sublabels, four-way safe removal with risk report) | **Done** |
 | M2.5 — Fresh paint (theme.rs, epaint icons, undecorated window, drag + edge-resize, editable Settings via `toml_edit`, feature-gated native file picker, detached dialog windows) | **Done** |
 | M3 — Persistence & restore (startup reconciliation, orphaned/missing handling, Restore UI) | **Not started** — the header Restore chip is a disabled placeholder |
-| M4 — Agent workflow | **Mostly done** on branch `m4-agent-workflow` — see below |
+| M4 — Agent workflow | **Done** on branch `m4-agent-workflow` — see below |
 
 ### M4 breakdown
 
@@ -38,9 +38,12 @@ Read in this order: [CLAUDE.md](../CLAUDE.md) (binding rules),
 | Status on rows: accent edge, dot, attention mark, agent message in tooltip | **Done** |
 | `[status]` and `[agents]` config sections | **Done** |
 | Agent commands in an `agent` window + systemd-scope wrapping | **Done** |
-| **Per-agent RAM/CPU read from `/sys/fs/cgroup` and displayed** | **Not done** — scopes are created and named, nothing reads `memory.current`/`cpu.stat` yet |
-| **Settings UI for `[status]` / `[agents]`** | **Not done** — both sections are file-only; Settings still covers terminal and worktrees only |
-| **10 s git-status poll** | **Not done** — git status still refreshes on demand, only the 2 s tmux poll is on a timer |
+| Per-agent RAM/CPU from `/sys/fs/cgroup` (`grove-core/src/cgroup.rs`) | **Done** — shown in the row tooltip |
+| Settings UI for `[status]` / `[agents]` | **Done** — except `agent_commands` and `[agents.per_project]`, a list and a map, which stay file-only |
+| 10 s git-status poll | **Done** |
+| `just install-claude-hook` | **Done** — merges `grove notify` into Claude Code's settings.json |
+
+Nothing in M4 is machine-verified GUI-side; see the smoke list below.
 
 Commit history is linear and each milestone landed as focused commits with
 tests; `git log --oneline` is a usable index. M4 is on a branch, not `main`.
@@ -106,6 +109,8 @@ tests; `git log --oneline` is a usable index. M4 is on a branch, not `main`.
 
 ## The gate (before every commit)
 
+`just gate` runs all five:
+
 ```bash
 cargo build --workspace
 cargo build -p grove --no-default-features
@@ -114,7 +119,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-Tests: 460. Integration tests run real git in temp repos and real tmux on
+Tests: 484. Integration tests run real git in temp repos and real tmux on
 throwaway sockets in tempdirs (auto-killed by guard structs), and run the
 real `grove notify` binary against a temp `XDG_RUNTIME_DIR`. New features
 land with tests in the same commit.
@@ -149,16 +154,15 @@ land with tests in the same commit.
    diffing state.toml ↔ `git worktree list` ↔ `list-sessions` with
    `@grove_*` options as primary key; missing-project / orphaned-session /
    missing-session flows (DESIGN §11); enable the Restore chip.
-3. **Finish Milestone 4** — the three unticked rows in the M4 table above:
-   cgroup RAM/CPU readout for scoped agents, a Settings pane for `[status]`
-   and `[agents]`, and moving the git-status refresh onto a 10 s timer.
-   Nothing GUI-side of M4 is machine-verified either: the smoke pass wants
+3. **Smoke-test Milestone 4** (nothing GUI-side is machine-verified):
    attention appearing on a row (`grove notify --state attention` from
    inside a session), it clearing when the row is opened and *staying*
    clear across the next poll, the desktop notification firing once rather
-   than every 2 s, and "Start agent" opening an `agent` window.
-4. **Deferred small items**: `.direnv`-style dev loop (`cargo watch -x 'run
-   -p grove'` recipe was discussed, not added); window corner rounding
+   than every 2 s, "Start agent" opening an `agent` window, RAM/CPU in the
+   row tooltip when accounting is on, and the new Settings fields saving
+   without disturbing hand-written comments.
+4. **Merge `m4-agent-workflow` into `main`** once that passes.
+5. **Deferred small items**: window corner rounding
    (mockup has 14 px radius; needs transparent viewport + manual shadow —
    consciously skipped); config hot-reload on external edits (mtime check
    on the poller — discussed, agreed as cheap, not yet implemented).
