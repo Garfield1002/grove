@@ -55,6 +55,7 @@ impl GroveApp {
                 name: record.name.clone(),
                 repository_path: record.repository_path.clone(),
                 git_common_dir: record.git_common_dir.clone(),
+                default_worktree_path: record.default_worktree_path.clone(),
                 is_expanded: record.is_expanded,
                 worktrees: Vec::new(),
             })
@@ -136,6 +137,7 @@ impl GroveApp {
             name: project.name.clone(),
             repository_path: project.repository_path.clone(),
             git_common_dir: project.git_common_dir.clone(),
+            default_worktree_path: project.default_worktree_path.clone(),
             is_expanded: project.is_expanded,
         });
         match self.projects.iter_mut().find(|p| p.id == project.id) {

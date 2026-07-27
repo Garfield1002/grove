@@ -56,15 +56,26 @@ impl CommandFailure {
         out
     }
 
-    /// One-line summary: the first non-empty stderr line, else stdout, else
-    /// the exit status.
+    /// One-line summary: the diagnosis if the command gave one, else the
+    /// first non-empty output line, else the exit status.
+    ///
+    /// git writes progress to stderr before it fails (`Preparing worktree…`
+    /// precedes `fatal: … is already used by worktree …`), so the first line
+    /// is often not the reason. The full stderr is never hidden either way —
+    /// [`CommandFailure::diagnostics`] keeps all of it.
     pub fn summary(&self) -> String {
-        let first = self
-            .stderr
-            .lines()
-            .chain(self.stdout.lines())
-            .map(str::trim)
-            .find(|line| !line.is_empty());
+        let lines = || {
+            self.stderr
+                .lines()
+                .chain(self.stdout.lines())
+                .map(str::trim)
+        };
+        let first = lines()
+            .find(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered.starts_with("fatal:") || lowered.starts_with("error:")
+            })
+            .or_else(|| lines().find(|line| !line.is_empty()));
         match (first, self.status) {
             (Some(line), _) => line.to_string(),
             (None, Some(code)) => format!("{} exited with status {code}", self.program),
@@ -228,6 +239,45 @@ mod tests {
             failure().summary(),
             "fatal: 'feature/auth' is already checked out at '/home/u/auth'"
         );
+    }
+
+    /// git prints progress before it fails; the concise line must be the
+    /// diagnosis, not the noise that preceded it.
+    #[test]
+    fn summary_skips_progress_output_to_find_the_diagnosis() {
+        let failure = CommandFailure {
+            stderr: "Preparing worktree (checking out 'feature/auth')\n\
+                     fatal: 'feature/auth' is already used by worktree at '/home/u/auth'\n"
+                .into(),
+            ..failure()
+        };
+        assert_eq!(
+            failure.summary(),
+            "fatal: 'feature/auth' is already used by worktree at '/home/u/auth'"
+        );
+        // Nothing is hidden: the progress line is still in the diagnostics.
+        assert!(failure.diagnostics().contains("Preparing worktree"));
+    }
+
+    #[test]
+    fn summary_finds_an_error_line_too() {
+        let failure = CommandFailure {
+            stderr: "some noise\nerror: the branch 'x' is not fully merged.\n".into(),
+            ..failure()
+        };
+        assert_eq!(
+            failure.summary(),
+            "error: the branch 'x' is not fully merged."
+        );
+    }
+
+    #[test]
+    fn summary_falls_back_to_the_first_line_when_nothing_is_labelled() {
+        let failure = CommandFailure {
+            stderr: "something went wrong\nand then more\n".into(),
+            ..failure()
+        };
+        assert_eq!(failure.summary(), "something went wrong");
     }
 
     #[test]

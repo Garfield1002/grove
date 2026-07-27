@@ -243,6 +243,65 @@ pub fn session_env(server: &TmuxServer, name: &str, var: &str) -> Result<Option<
         .map(str::to_string))
 }
 
+/// A pane of a session, with the process it is currently running.
+///
+/// Gathered before offering to remove a worktree so the dialog can say what
+/// would be interrupted (DESIGN.md §13). Grove records the command name only;
+/// it never reads terminal contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneInfo {
+    pub session: String,
+    pub pid: u32,
+    /// `pane_current_command` as tmux reports it.
+    pub command: String,
+}
+
+const PANE_SOURCE: &str = "tmux list-panes";
+const PANE_FORMAT: &str = "#{session_name}\u{1}#{pane_pid}\u{1}#{pane_current_command}";
+
+/// Parse the output of `list-panes -F` with [`PANE_FORMAT`].
+pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseError> {
+    let mut panes = Vec::new();
+    for (index, raw) in output.lines().enumerate() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split(SEP);
+        let (Some(session), Some(pid), Some(command)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(ParseError::new(
+                PANE_SOURCE,
+                index + 1,
+                "expected session, pid and command",
+            ));
+        };
+        let pid = pid.trim().parse::<u32>().map_err(|_| {
+            ParseError::new(PANE_SOURCE, index + 1, format!("`{pid}` is not a pid"))
+        })?;
+        panes.push(PaneInfo {
+            session: session.to_string(),
+            pid,
+            command: command.trim().to_string(),
+        });
+    }
+    Ok(panes)
+}
+
+/// Every pane of one session. A missing session or server is an empty list:
+/// "there is nothing running" is a normal answer, not an error.
+pub fn list_panes(server: &TmuxServer, session: &str) -> Result<Vec<PaneInfo>> {
+    let out = server.run_allow_failure(["list-panes", "-s", "-t", session, "-F", PANE_FORMAT])?;
+    if !out.success {
+        if TmuxServer::is_no_server(&out.stderr) || out.stderr.contains("can't find") {
+            return Ok(Vec::new());
+        }
+        return Err(out.failure.into());
+    }
+    Ok(parse_panes(&out.stdout)?)
+}
+
 /// Kill one session. Never called implicitly: closing a session is its own
 /// confirmed operation (ARCHITECTURE.md §8.2).
 pub fn kill_session(server: &TmuxServer, name: &str) -> Result<()> {
@@ -409,6 +468,35 @@ mod tests {
                 "/home/u/my wt",
             ]
         );
+    }
+
+    #[test]
+    fn parses_a_pane_listing() {
+        let text = "wt-a1b2c3\u{1}4242\u{1}bash\nwt-a1b2c3\u{1}4343\u{1}cargo\n";
+        let panes = parse_panes(text).expect("valid");
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].session, "wt-a1b2c3");
+        assert_eq!(panes[0].pid, 4242);
+        assert_eq!(panes[0].command, "bash");
+        assert_eq!(panes[1].command, "cargo");
+    }
+
+    #[test]
+    fn an_empty_pane_listing_is_not_an_error() {
+        assert!(parse_panes("").expect("valid").is_empty());
+        assert!(parse_panes("\n \n").expect("valid").is_empty());
+    }
+
+    #[test]
+    fn rejects_a_truncated_pane_line() {
+        let err = parse_panes("wt-a1b2c3\u{1}4242\n").expect_err("truncated");
+        assert!(err.reason.contains("expected session, pid and command"));
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_pid() {
+        let err = parse_panes("wt-a1b2c3\u{1}none\u{1}bash\n").expect_err("bad pid");
+        assert!(err.reason.contains("is not a pid"));
     }
 
     #[test]

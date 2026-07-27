@@ -46,6 +46,8 @@ pub struct ProjectRecord {
     pub repository_path: PathBuf,
     /// Repository identity: `git rev-parse --git-common-dir`.
     pub git_common_dir: PathBuf,
+    /// Parent directory the create-worktree dialog defaults to.
+    pub default_worktree_path: PathBuf,
     pub is_expanded: bool,
 }
 
@@ -56,6 +58,7 @@ impl Default for ProjectRecord {
             name: String::new(),
             repository_path: PathBuf::new(),
             git_common_dir: PathBuf::new(),
+            default_worktree_path: PathBuf::new(),
             is_expanded: true,
         }
     }
@@ -85,6 +88,7 @@ impl State {
                 existing.name = record.name;
                 existing.repository_path = record.repository_path;
                 existing.git_common_dir = record.git_common_dir;
+                existing.default_worktree_path = record.default_worktree_path;
                 existing.is_expanded = record.is_expanded;
             }
             None => self.projects.push(record),
@@ -167,6 +171,7 @@ mod tests {
             name: name.to_string(),
             repository_path: PathBuf::from(format!("/home/u/{name}")),
             git_common_dir: PathBuf::from(format!("/home/u/{name}/.git")),
+            default_worktree_path: PathBuf::from("/home/u"),
             is_expanded: true,
         }
     }

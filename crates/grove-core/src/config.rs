@@ -15,6 +15,16 @@ use crate::terminal;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub terminal: TerminalConfig,
+    pub worktrees: WorktreeConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorktreeConfig {
+    /// Parent directory new worktrees are created under (DESIGN.md §15).
+    /// Empty means "beside the repository". Only ever a default: the create
+    /// dialog's path field is editable.
+    pub default_parent: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +47,12 @@ impl Config {
     pub fn has_terminal(&self) -> bool {
         !self.terminal.command.trim().is_empty()
     }
+
+    /// The configured default worktree parent, if the user set one.
+    pub fn default_worktree_parent(&self) -> Option<&Path> {
+        let value = self.worktrees.default_parent.trim();
+        (!value.is_empty()).then(|| Path::new(value))
+    }
 }
 
 /// The commented file written on first run.
@@ -50,7 +66,13 @@ pub fn first_run_document(terminal_command: &str) -> String {
          # rules first and only then substitutes the placeholders, so paths and\n\
          # branch names can never add arguments.\n\
          # Placeholders: {{socket}} {{session}} {{worktree}} {{project}} {{branch}}\n\
-         command = {}\n",
+         command = {}\n\
+         \n\
+         # [worktrees]\n\
+         # Parent directory for worktrees created from the GUI. Unset means\n\
+         # \"beside the repository\". The create dialog always lets you edit\n\
+         # the path before anything is created.\n\
+         # default_parent = \"/home/you/worktrees\"\n",
         toml_string(terminal_command)
     )
 }
@@ -250,6 +272,39 @@ mod tests {
         let config = Config::from_toml("", Path::new("config.toml")).expect("valid");
         assert_eq!(config, Config::default());
         assert!(!config.has_terminal());
+    }
+
+    #[test]
+    fn the_default_worktree_parent_is_optional_and_trimmed() {
+        let config = Config::default();
+        assert_eq!(config.default_worktree_parent(), None);
+
+        let config = Config::from_toml(
+            "[worktrees]\ndefault_parent = \"/home/u/my worktrees\"\n",
+            Path::new("config.toml"),
+        )
+        .expect("valid");
+        assert_eq!(
+            config.default_worktree_parent(),
+            Some(Path::new("/home/u/my worktrees"))
+        );
+
+        let config = Config::from_toml(
+            "[worktrees]\ndefault_parent = \"  \"\n",
+            Path::new("c.toml"),
+        )
+        .expect("valid");
+        assert_eq!(config.default_worktree_parent(), None);
+    }
+
+    #[test]
+    fn the_generated_document_only_comments_the_worktree_section() {
+        // Writing the key would make Grove's default look like a user choice.
+        let document = first_run_document(DETECTED);
+        assert!(document.contains("# [worktrees]"));
+        assert!(document.contains("# default_parent ="));
+        let config = Config::from_toml(&document, Path::new("config.toml")).expect("valid toml");
+        assert_eq!(config.default_worktree_parent(), None);
     }
 
     #[test]

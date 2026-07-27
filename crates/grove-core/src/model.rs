@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::git::WorktreeEntry;
+use crate::git::status::StatusSummary;
 use crate::ids;
 
 /// A registered Git repository.
@@ -14,6 +15,9 @@ pub struct Project {
     pub repository_path: PathBuf,
     /// Repository identity; half of every worktree-id hash.
     pub git_common_dir: PathBuf,
+    /// Directory new worktrees are created under by default. Only a default:
+    /// the create dialog's path field is always editable.
+    pub default_worktree_path: PathBuf,
     pub is_expanded: bool,
     pub worktrees: Vec<Worktree>,
 }
@@ -22,6 +26,44 @@ impl Project {
     pub fn worktree(&self, id: &str) -> Option<&Worktree> {
         self.worktrees.iter().find(|w| w.id == id)
     }
+}
+
+/// Where a project's new worktrees go by default: the configured parent
+/// directory when the user set one, else beside the repository itself.
+pub fn default_worktree_parent(configured: Option<&Path>, repository_path: &Path) -> PathBuf {
+    if let Some(configured) = configured.filter(|p| !p.as_os_str().is_empty()) {
+        return configured.to_path_buf();
+    }
+    repository_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repository_path.to_path_buf())
+}
+
+/// Directory name suggested for a branch: `feature/auth` -> `feature-auth`.
+///
+/// A suggestion only — the user edits the path before anything is created —
+/// but it must never produce a name that walks out of the parent directory.
+pub fn worktree_dir_name(branch: &str) -> String {
+    let mut name = String::with_capacity(branch.len());
+    for ch in branch.chars() {
+        if ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+') {
+            name.push(ch);
+        } else if !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_matches(['-', '.']).to_string();
+    if name.is_empty() {
+        "worktree".to_string()
+    } else {
+        name
+    }
+}
+
+/// The path the create-worktree dialog starts with.
+pub fn suggest_worktree_path(parent: &Path, branch: &str) -> PathBuf {
+    parent.join(worktree_dir_name(branch))
 }
 
 /// Whether Grove has a tmux session for a worktree.
@@ -73,6 +115,10 @@ pub struct Worktree {
     pub is_prunable: bool,
     pub prune_reason: Option<String>,
     pub session: SessionPresence,
+    /// Working-tree summary, filled in asynchronously by the worker. `None`
+    /// means "not read yet", which the UI shows as nothing rather than as
+    /// "clean".
+    pub git_status: Option<StatusSummary>,
 }
 
 impl Worktree {
@@ -97,6 +143,7 @@ impl Worktree {
             is_prunable: entry.prunable,
             prune_reason: entry.prune_reason.clone(),
             session: SessionPresence::None,
+            git_status: None,
         }
     }
 
@@ -119,10 +166,14 @@ impl Worktree {
         }
     }
 
-    /// Secondary row label: the session state, plus anything unusual about
-    /// the worktree itself.
+    /// Secondary row label: the git summary once it has been read, the
+    /// session state, and anything unusual about the worktree itself.
     pub fn sublabel(&self) -> String {
-        let mut parts = vec![self.session.label().to_string()];
+        let mut parts = Vec::new();
+        if let Some(status) = &self.git_status {
+            parts.push(status.summary());
+        }
+        parts.push(self.session.label().to_string());
         if self.is_detached {
             parts.push("detached".to_string());
         }
@@ -214,6 +265,67 @@ mod tests {
     }
 
     #[test]
+    fn sublabels_lead_with_the_git_summary_once_it_is_known() {
+        use crate::git::status::StatusSummary;
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        assert_eq!(
+            worktree.sublabel(),
+            "no session",
+            "an unread status shows nothing, not `clean`"
+        );
+
+        worktree.git_status = Some(StatusSummary::default());
+        assert_eq!(worktree.sublabel(), "clean · no session");
+
+        worktree.git_status = Some(StatusSummary {
+            modified: 3,
+            untracked: 2,
+            ..StatusSummary::default()
+        });
+        worktree.session = SessionPresence::Detached;
+        assert_eq!(worktree.sublabel(), "3 mod · 2 untracked · session");
+    }
+
+    #[test]
+    fn default_worktree_parent_prefers_the_configured_directory() {
+        assert_eq!(
+            default_worktree_parent(Some(Path::new("/home/u/worktrees")), Path::new("/home/u/p")),
+            PathBuf::from("/home/u/worktrees")
+        );
+        assert_eq!(
+            default_worktree_parent(None, Path::new("/home/u/projects/acme")),
+            PathBuf::from("/home/u/projects")
+        );
+        assert_eq!(
+            default_worktree_parent(Some(Path::new("")), Path::new("/home/u/projects/acme")),
+            PathBuf::from("/home/u/projects")
+        );
+        // A repository at the filesystem root still yields a usable parent.
+        assert_eq!(
+            default_worktree_parent(None, Path::new("/")),
+            PathBuf::from("/")
+        );
+    }
+
+    #[test]
+    fn suggested_directory_names_are_flat_and_cannot_escape_the_parent() {
+        assert_eq!(worktree_dir_name("feature/auth"), "feature-auth");
+        assert_eq!(worktree_dir_name("main"), "main");
+        assert_eq!(worktree_dir_name("fix/v1.2_hot fix"), "fix-v1.2_hot-fix");
+        assert_eq!(worktree_dir_name("../../etc"), "etc");
+        assert_eq!(worktree_dir_name("//"), "worktree");
+        assert_eq!(worktree_dir_name(""), "worktree");
+        assert_eq!(worktree_dir_name("wörk/träe"), "wörk-träe");
+
+        let path = suggest_worktree_path(Path::new("/home/u/wt"), "feature/auth");
+        assert_eq!(path, PathBuf::from("/home/u/wt/feature-auth"));
+        assert_eq!(
+            suggest_worktree_path(Path::new("/home/u/wt"), "../escape"),
+            PathBuf::from("/home/u/wt/escape")
+        );
+    }
+
+    #[test]
     fn sublabels_report_session_presence_and_worktree_flags() {
         let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
         assert_eq!(worktree.sublabel(), "no session");
@@ -282,6 +394,7 @@ mod tests {
             name: "proj".into(),
             repository_path: PathBuf::from("/home/u/proj"),
             git_common_dir: PathBuf::from("/g"),
+            default_worktree_path: PathBuf::from("/home/u"),
             is_expanded: true,
             worktrees,
         };

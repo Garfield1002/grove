@@ -9,28 +9,119 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::git;
+use crate::git::{self, StatusSummary, WorktreeAdd};
 use crate::ids;
-use crate::model::{Project, SessionPresence, Worktree, worktrees_from_entries};
+use crate::model::{
+    Project, SessionPresence, Worktree, default_worktree_parent, worktrees_from_entries,
+};
+use crate::removal::{RemovalInputs, Unpushed};
 use crate::terminal::{self, TemplateVars};
 use crate::tmux::{self, SessionSpec, TmuxServer};
 
 /// Register the project containing `path`, with its worktrees and current
 /// session presence.
-pub fn open_project(server: &TmuxServer, path: &Path) -> Result<Project> {
+pub fn open_project(server: &TmuxServer, config: &Config, path: &Path) -> Result<Project> {
     let discovery = git::discover_project(path)?;
     let id = ids::project_id(&discovery.git_common_dir);
     let worktrees = worktrees_from_entries(&discovery.worktrees, &id, &discovery.git_common_dir);
+    let default_worktree_path =
+        default_worktree_parent(config.default_worktree_parent(), &discovery.repository_path);
     let mut project = Project {
         id,
         name: discovery.name,
         repository_path: discovery.repository_path,
         git_common_dir: discovery.git_common_dir,
+        default_worktree_path,
         is_expanded: true,
         worktrees,
     };
     apply_session_presence(&mut project.worktrees, &session_presence(server)?);
     Ok(project)
+}
+
+/// Read the working-tree status of every worktree, keyed by worktree id
+/// (DESIGN.md §18).
+///
+/// Bare and missing worktrees have no working tree, so they are skipped
+/// rather than reported as errors, and a single failing worktree does not
+/// hide the others: this runs on the worker to keep sublabels fresh, not as
+/// part of any operation the user is waiting on.
+///
+/// Runs subprocesses: worker thread only.
+pub fn worktree_statuses(worktrees: &[Worktree]) -> HashMap<String, StatusSummary> {
+    let mut statuses = HashMap::new();
+    for worktree in worktrees {
+        if worktree.is_bare || !worktree.path.is_dir() {
+            continue;
+        }
+        if let Ok(status) = git::status_summary(&worktree.path) {
+            statuses.insert(worktree.id.clone(), status);
+        }
+    }
+    statuses
+}
+
+/// Stamp statuses onto a worktree list, leaving worktrees with no reading
+/// untouched.
+pub fn apply_statuses(worktrees: &mut [Worktree], statuses: &HashMap<String, StatusSummary>) {
+    for worktree in worktrees {
+        if let Some(status) = statuses.get(&worktree.id) {
+            worktree.git_status = Some(status.clone());
+        }
+    }
+}
+
+/// Create a worktree, then report where it landed (DESIGN.md §10).
+///
+/// Git's own stderr survives a failure untouched, which is what the create
+/// dialog shows.
+///
+/// Runs a subprocess: worker thread only.
+pub fn create_worktree(repository_path: &Path, add: &WorktreeAdd) -> Result<std::path::PathBuf> {
+    git::worktree_add(repository_path, add)
+}
+
+/// Gather everything the safe-removal dialog must display *before* offering
+/// any destructive operation (DESIGN.md §13).
+///
+/// Best effort by design: a worktree whose directory has vanished, or whose
+/// branch tracks nothing, still produces a report — with the unknowns named
+/// as unknown. Nothing here removes, kills or deletes anything.
+///
+/// Runs subprocesses: worker thread only.
+pub fn removal_inputs(server: &TmuxServer, worktree: &Worktree) -> Result<RemovalInputs> {
+    let status = git::status_summary(&worktree.path).ok();
+
+    let unpushed = match &status {
+        Some(status) => match &status.upstream {
+            Some(upstream) => match git::status::unpushed_count(&worktree.path, upstream) {
+                Ok(count) => Unpushed::Count(count),
+                Err(e) => Unpushed::Unknown(e.to_string()),
+            },
+            None if status.detached => Unpushed::Unknown("HEAD is detached".to_string()),
+            None => Unpushed::NoUpstream,
+        },
+        None => Unpushed::Unknown("the worktree status could not be read".to_string()),
+    };
+
+    let session_name = worktree.session_name();
+    let session = tmux::has_session(server, &session_name)?.then_some(session_name.clone());
+    let panes = match &session {
+        Some(session) => tmux::list_panes(server, session)?,
+        None => Vec::new(),
+    };
+
+    Ok(RemovalInputs {
+        worktree_path: worktree.path.clone(),
+        branch: worktree.branch.clone(),
+        is_main: worktree.is_main,
+        is_locked: worktree.is_locked,
+        lock_reason: worktree.lock_reason.clone(),
+        status,
+        unpushed,
+        session,
+        panes,
+    })
 }
 
 /// Re-read a project's worktrees from git and its sessions from tmux.
@@ -171,6 +262,49 @@ mod tests {
         apply_session_presence(&mut worktrees, &presence);
         assert_eq!(worktrees[0].session, SessionPresence::Attached);
         assert_eq!(worktrees[1].session, SessionPresence::None);
+    }
+
+    #[test]
+    fn statuses_are_matched_by_worktree_id_and_never_invented() {
+        let mut worktrees = vec![worktree("/home/u/proj"), worktree("/home/u/wt/feature")];
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            worktrees[0].id.clone(),
+            StatusSummary {
+                modified: 2,
+                ..StatusSummary::default()
+            },
+        );
+        statuses.insert("ffffff".to_string(), StatusSummary::default());
+        apply_statuses(&mut worktrees, &statuses);
+        assert_eq!(
+            worktrees[0].git_status.as_ref().map(|s| s.modified),
+            Some(2)
+        );
+        assert_eq!(
+            worktrees[1].git_status, None,
+            "a worktree with no reading must not be shown as clean"
+        );
+    }
+
+    #[test]
+    fn a_previous_status_survives_a_refresh_that_could_not_read_it() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        worktrees[0].git_status = Some(StatusSummary {
+            untracked: 1,
+            ..StatusSummary::default()
+        });
+        apply_statuses(&mut worktrees, &HashMap::new());
+        assert!(worktrees[0].git_status.is_some());
+    }
+
+    #[test]
+    fn bare_and_missing_worktrees_are_not_asked_for_a_status() {
+        let mut bare = worktree("/nonexistent-grove/bare");
+        bare.is_bare = true;
+        let missing = worktree("/nonexistent-grove/gone");
+        // Neither runs git: both are skipped before any subprocess.
+        assert!(worktree_statuses(&[bare, missing]).is_empty());
     }
 
     #[test]

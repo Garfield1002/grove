@@ -173,6 +173,7 @@ mod tests {
             name: "acme-web".into(),
             repository_path: PathBuf::from("/home/u/acme-web"),
             git_common_dir: PathBuf::from("/home/u/acme-web/.git"),
+            default_worktree_path: PathBuf::from("/home/u"),
             is_expanded: true,
             worktrees: Vec::new(),
         }

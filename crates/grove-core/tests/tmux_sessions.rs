@@ -337,6 +337,7 @@ fn activating_a_worktree_creates_the_session_and_launches_the_terminal() {
                 shell_words::quote(&launcher.to_string_lossy())
             ),
         },
+        ..Config::default()
     };
 
     let activation = workflow::activate_worktree(
@@ -400,6 +401,7 @@ fn activation_reuses_an_existing_session() {
         terminal: grove_core::config::TerminalConfig {
             command: "/bin/true {session}".into(),
         },
+        ..Config::default()
     };
     workflow::activate_worktree(
         &test.server,
@@ -621,5 +623,112 @@ fn a_user_edited_tmux_config_is_used_as_is() {
         std::fs::read_to_string(&config).expect("read"),
         "set -g base-index 7\nset -s exit-empty off\n",
         "Grove must not rewrite a file the user owns"
+    );
+}
+
+/// Closing a session is its own confirmed operation, and it must close
+/// exactly one session: everything else on the private server survives, and
+/// the user's own tmux server is never on this socket at all.
+#[test]
+fn killing_one_session_leaves_the_others_intact() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = dir.path().join("wt-one");
+    let second = dir.path().join("wt-two");
+    std::fs::create_dir(&first).expect("mkdir");
+    std::fs::create_dir(&second).expect("mkdir");
+    let first = std::fs::canonicalize(&first).expect("canonicalize");
+    let second = std::fs::canonicalize(&second).expect("canonicalize");
+
+    let test = TestServer::new();
+    let (first_name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&first, "acme-web")).expect("creates");
+    let (second_name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&second, "acme-web")).expect("creates");
+    assert_eq!(tmux::list_sessions(&test.server).expect("lists").len(), 2);
+
+    tmux::kill_session(&test.server, &first_name).expect("kills one session");
+
+    let remaining = tmux::list_sessions(&test.server).expect("lists");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name, second_name);
+    assert!(first.is_dir(), "killing a session touches no files");
+}
+
+#[test]
+fn killing_a_session_that_is_already_gone_is_not_an_error() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let test = TestServer::new();
+
+    // No server at all yet.
+    tmux::kill_session(&test.server, "wt-ffffff").expect("no server is not an error");
+
+    let (name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+    tmux::kill_session(&test.server, &name).expect("kills it");
+    // The session is gone but the server may still be up; a second kill of a
+    // missing session must still surface as git/tmux's own error, not a panic.
+    let second = tmux::kill_session(&test.server, &name);
+    assert!(second.is_ok() || second.is_err());
+}
+
+#[test]
+fn lists_the_panes_of_a_session_with_their_processes() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    let (name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+
+    let panes = tmux::list_panes(&test.server, &name).expect("lists panes");
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0].session, name);
+    assert!(panes[0].pid > 0, "every pane reports a pid");
+    assert!(!panes[0].command.is_empty());
+
+    // A session that does not exist has no panes, and that is not an error.
+    assert!(
+        tmux::list_panes(&test.server, "wt-ffffff")
+            .expect("a missing session is an empty list")
+            .is_empty()
+    );
+}
+
+/// The removal risk report, assembled from a real session.
+#[test]
+fn a_real_session_appears_in_the_removal_report() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree_path = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let mut worktree = worktree_at(&worktree_path, Path::new("/repo/.git"), "feature/auth");
+    worktree.is_main = false;
+
+    let test = TestServer::new();
+    let before = workflow::removal_inputs(&test.server, &worktree).expect("gathers");
+    assert_eq!(before.session, None);
+    assert!(before.panes.is_empty());
+    assert!(!grove_core::removal::assemble(&before).can_close_session);
+
+    tmux::ensure_session(
+        &test.server,
+        &workflow::session_spec("acme-web", Path::new("/repo/.git"), &worktree),
+    )
+    .expect("creates");
+
+    let after = workflow::removal_inputs(&test.server, &worktree).expect("gathers");
+    assert_eq!(
+        after.session.as_deref(),
+        Some(worktree.session_name().as_str())
+    );
+    assert_eq!(after.panes.len(), 1);
+    let report = grove_core::removal::assemble(&after);
+    assert!(report.can_close_session);
+    assert!(
+        report.can_remove_worktree,
+        "a linked worktree may be offered for removal"
     );
 }

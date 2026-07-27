@@ -169,13 +169,15 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             messages
         }
 
-        Task::OpenProject(path) => match workflow::open_project(&worker.server, &path) {
-            Ok(project) => vec![Message::ProjectOpened(Box::new(project))],
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                &format!("could not open {}", path.display()),
-                &e,
-            ))],
-        },
+        Task::OpenProject(path) => {
+            match workflow::open_project(&worker.server, &worker.config, &path) {
+                Ok(project) => vec![Message::ProjectOpened(Box::new(project))],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not open {}", path.display()),
+                    &e,
+                ))],
+            }
+        }
 
         Task::RefreshProject {
             project_id,

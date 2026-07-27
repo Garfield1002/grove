@@ -13,6 +13,7 @@ pub mod ids;
 pub mod model;
 pub mod paths;
 pub mod process;
+pub mod removal;
 pub mod state;
 pub mod terminal;
 pub mod tmux;
