@@ -42,8 +42,8 @@ impl Usage {
         }
     }
 
-    /// Memory rendered for a row: whole units, since this is a glanceable
-    /// figure and not a measurement.
+    /// Memory rendered for a row: compact, because it sits inline under a
+    /// branch name in a 360 px window. `1.4G`, `540M`.
     pub fn memory_label(self) -> String {
         const MIB: u64 = 1024 * 1024;
         const GIB: u64 = 1024 * MIB;
@@ -51,11 +51,11 @@ impl Usage {
             // One decimal below 10 GiB, where the difference is still legible.
             let gib = self.memory_bytes as f64 / GIB as f64;
             if gib < 10.0 {
-                return format!("{gib:.1} GB");
+                return format!("{gib:.1}G");
             }
-            return format!("{} GB", self.memory_bytes / GIB);
+            return format!("{}G", self.memory_bytes / GIB);
         }
-        format!("{} MB", self.memory_bytes / MIB)
+        format!("{}M", self.memory_bytes / MIB)
     }
 
     /// CPU percentage between two readings of the same cgroup.
@@ -263,11 +263,11 @@ mod tests {
             }
             .memory_label()
         };
-        assert_eq!(mb(0), "0 MB");
-        assert_eq!(mb(566_853_632), "540 MB");
-        assert_eq!(mb(1024 * 1024 * 1024), "1.0 GB");
-        assert_eq!(mb(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "3.5 GB");
-        assert_eq!(mb(12 * 1024 * 1024 * 1024), "12 GB");
+        assert_eq!(mb(0), "0M");
+        assert_eq!(mb(566_853_632), "540M");
+        assert_eq!(mb(1024 * 1024 * 1024), "1.0G");
+        assert_eq!(mb(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "3.5G");
+        assert_eq!(mb(12 * 1024 * 1024 * 1024), "12G");
     }
 
     #[test]

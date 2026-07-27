@@ -175,14 +175,15 @@ impl SessionReport {
         }
     }
 
-    /// The resource line for a row: memory always, CPU when a rate is known.
+    /// The resource line for a row: `64%  1.4G`, CPU first because it is what
+    /// moves. Memory alone until a rate is known, since CPU needs two polls.
     ///
     /// `None` when there is no scoped agent — which is not the same as zero,
-    /// and must not be rendered as "0 MB".
+    /// and must not be rendered as "0M".
     pub fn resource_label(&self) -> Option<String> {
         let usage = self.usage?;
         Some(match self.cpu_percent {
-            Some(cpu) => format!("{} · {cpu:.0}% CPU", usage.memory_label()),
+            Some(cpu) => format!("{cpu:.0}%  {}", usage.memory_label()),
             None => usage.memory_label(),
         })
     }
@@ -516,10 +517,10 @@ mod tests {
             cpu_usec: 0,
         });
         // The first poll of a session has nothing to compare against.
-        assert_eq!(report.resource_label().as_deref(), Some("540 MB"));
+        assert_eq!(report.resource_label().as_deref(), Some("540M"));
 
-        report.cpu_percent = Some(12.4);
-        assert_eq!(report.resource_label().as_deref(), Some("540 MB · 12% CPU"));
+        report.cpu_percent = Some(64.0);
+        assert_eq!(report.resource_label().as_deref(), Some("64%  540M"));
     }
 
     #[test]

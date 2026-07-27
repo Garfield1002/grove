@@ -78,6 +78,9 @@ impl Markers {
 }
 
 const MARKER_SIZE: f32 = 11.0;
+/// The processor glyph beside the resource figures. Small: it labels the
+/// numbers rather than competing with them.
+const CPU_ICON: f32 = 9.0;
 
 /// Draw a worktree row.
 pub fn show(
@@ -185,15 +188,43 @@ pub fn show(
             .truncate()
             .selectable(false),
         );
-        content.add(
-            egui::Label::new(theme::label(
-                sublabel(worktree, home),
-                theme::FONT_SUB,
-                sublabel_color(worktree),
-            ))
-            .truncate()
-            .selectable(false),
-        );
+        // On the selected row, the agent's own figures lead the sublabel: it
+        // is the row the user is looking at, and putting them first means
+        // truncation eats the path rather than the numbers.
+        match resource_line(worktree, selected) {
+            Some(resources) => {
+                content.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let (icon, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(CPU_ICON), Sense::hover());
+                    icons::cpu(ui.painter(), icon, theme::TEXT_MUTED);
+                    ui.add(
+                        egui::Label::new(theme::mono(resources, theme::FONT_SUB, theme::TEXT_DIM))
+                            .selectable(false),
+                    );
+                    ui.add(
+                        egui::Label::new(theme::label(
+                            format!("· {}", sublabel(worktree, home)),
+                            theme::FONT_SUB,
+                            sublabel_color(worktree),
+                        ))
+                        .truncate()
+                        .selectable(false),
+                    );
+                });
+            }
+            None => {
+                content.add(
+                    egui::Label::new(theme::label(
+                        sublabel(worktree, home),
+                        theme::FONT_SUB,
+                        sublabel_color(worktree),
+                    ))
+                    .truncate()
+                    .selectable(false),
+                );
+            }
+        }
     }
 
     if response.clicked() {
@@ -298,6 +329,19 @@ fn markers(worktree: &Worktree) -> Markers {
     markers
 }
 
+/// The resource figures to show inline, if any.
+///
+/// Only on the selected row: every row carrying live numbers would make the
+/// list twitch, and the tooltip has them for the others. Only when there is a
+/// scoped agent to measure — `resources` is `None` otherwise, which is not the
+/// same as zero.
+fn resource_line(worktree: &Worktree, selected: bool) -> Option<&str> {
+    if !selected || !worktree.session.exists() {
+        return None;
+    }
+    worktree.resources.as_deref()
+}
+
 /// The accent colour a row's status earns, if any.
 ///
 /// Idle earns none: an idle session is the resting state, and colouring every
@@ -374,6 +418,34 @@ mod tests {
         worktree.session = SessionPresence::None;
         worktree.status = Some(SessionStatus::Attention);
         assert_eq!(status_color(&worktree), None);
+    }
+
+    #[test]
+    fn resource_figures_show_on_the_selected_row_only() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.resources = Some("64%  1.4G".into());
+
+        assert_eq!(resource_line(&worktree, true), Some("64%  1.4G"));
+        assert_eq!(
+            resource_line(&worktree, false),
+            None,
+            "unselected rows stay still; the tooltip has the figures"
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_scoped_agent_shows_no_figures() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        // No resource accounting, or no agent: not the same as zero usage.
+        worktree.resources = None;
+        assert_eq!(resource_line(&worktree, true), None);
+
+        // And a closed session never shows a leftover reading.
+        worktree.resources = Some("64%  1.4G".into());
+        worktree.session = SessionPresence::None;
+        assert_eq!(resource_line(&worktree, true), None);
     }
 
     #[test]

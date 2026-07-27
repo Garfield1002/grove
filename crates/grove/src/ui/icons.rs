@@ -251,6 +251,32 @@ pub fn bang(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.circle_filled(at(rect, 0.5, 0.87), stroke.width * 0.72, color);
 }
 
+/// A processor die with pins, labelling the resource figures on a row.
+///
+/// Named `cpu` rather than `chip` because `chip` is already the header's
+/// pill-shaped button widget below.
+///
+/// Drawn small (around 9 px), so the pins are single strokes and the die is a
+/// plain square — anything more detailed turns to mush at this size.
+pub fn cpu(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(line_width(rect).max(1.0), color);
+    // The die, inset to leave room for the pins on all four sides.
+    path(
+        painter,
+        rect,
+        &[(0.26, 0.26), (0.74, 0.26), (0.74, 0.74), (0.26, 0.74)],
+        true,
+        stroke,
+    );
+    // Two pins per side, at the thirds.
+    for t in [0.42, 0.58] {
+        path(painter, rect, &[(t, 0.06), (t, 0.26)], false, stroke);
+        path(painter, rect, &[(t, 0.74), (t, 0.94)], false, stroke);
+        path(painter, rect, &[(0.06, t), (0.26, t)], false, stroke);
+        path(painter, rect, &[(0.74, t), (0.94, t)], false, stroke);
+    }
+}
+
 // ---------------------------------------------------------------- widgets
 
 /// A square icon button with the mockup's chip background.

@@ -573,7 +573,7 @@ mod tests {
         let reports = HashMap::from([(worktrees[0].id.clone(), report)]);
 
         apply_session_status(&mut worktrees, &reports);
-        assert_eq!(worktrees[0].resources.as_deref(), Some("2 MB"));
+        assert_eq!(worktrees[0].resources.as_deref(), Some("2M"));
 
         // And they go when the session does, rather than lingering.
         worktrees[0].session = SessionPresence::None;
