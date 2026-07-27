@@ -146,6 +146,12 @@ fn header(ui: &mut Ui, project: &Project, count: usize, openness: f32) -> Option
         Sense::click(),
     );
     let hovered = response.hovered();
+    let response = match &project.unavailable {
+        Some(reason) => response.on_hover_text(format!(
+            "Project unavailable — {reason}\nNothing has been removed; use the menu to retry or locate it."
+        )),
+        None => response,
+    };
 
     // The ellipsis is a target inside the header, so it is interacted with
     // after (and therefore above) the header itself.
@@ -185,11 +191,30 @@ fn header(ui: &mut Ui, project: &Project, count: usize, openness: f32) -> Option
             theme::TEXT_STRONG,
         );
         let name_left = rect.left() + 21.0;
+        // An unavailable project keeps its row and its name; only the label
+        // beside it says what reconciliation found (DESIGN.md §11).
+        let name_y = if project.is_available() {
+            rect.center().y - name.size().y / 2.0
+        } else {
+            rect.top() + 4.0
+        };
         painter.galley(
-            egui::pos2(name_left, rect.center().y - name.size().y / 2.0),
+            egui::pos2(name_left, name_y),
             name.clone(),
             theme::TEXT_STRONG,
         );
+        if !project.is_available() {
+            let notice = painter.layout_no_wrap(
+                "Project unavailable".to_owned(),
+                egui::FontId::proportional(theme::FONT_SUB),
+                theme::WARNING,
+            );
+            painter.galley(
+                egui::pos2(name_left, rect.bottom() - notice.size().y - 3.0),
+                notice,
+                theme::WARNING,
+            );
+        }
 
         // Count badge, immediately after the name as in the mockup.
         let badge = painter.layout_no_wrap(
@@ -234,7 +259,29 @@ fn header(ui: &mut Ui, project: &Project, count: usize, openness: f32) -> Option
     }
 
     let menu = |ui: &mut Ui, action: &mut Option<Action>| {
-        if ui.button("Refresh").clicked() {
+        // The unavailable-project actions come first, because they are the
+        // only ones that can get the project back (DESIGN.md §11): retry,
+        // locate, or remove it from Grove — never anything on disk.
+        if let Some(reason) = &project.unavailable {
+            ui.label(theme::label(
+                format!("Project unavailable — {reason}"),
+                theme::FONT_SMALL,
+                theme::WARNING,
+            ));
+            if ui.button("Locate project…").clicked() {
+                *action = Some(Action::LocateProject(project.id.clone()));
+                ui.close();
+            }
+            ui.separator();
+        }
+        if ui
+            .button(if project.is_available() {
+                "Refresh"
+            } else {
+                "Retry"
+            })
+            .clicked()
+        {
             *action = Some(Action::RefreshProject(project.id.clone()));
             ui.close();
         }
@@ -289,6 +336,7 @@ mod tests {
             default_worktree_path: PathBuf::from("/home/u"),
             is_expanded: true,
             worktrees: Vec::new(),
+            unavailable: None,
         }
     }
 

@@ -1,7 +1,7 @@
 # Grove — Handoff
 
-_Last updated: 2026-07-27. Repo state: `main` @ `4bf830c`, working tree clean,
-all gates green — `just gate` (498 tests, clippy `-D warnings`, fmt,
+_Last updated: 2026-07-27. Repo state: `ux/grove` @ `cb824db`, working tree
+clean, all gates green — `just gate` (545 tests, clippy `-D warnings`, fmt,
 `--no-default-features` build)._
 
 ## What this is
@@ -23,8 +23,24 @@ Read in this order: [CLAUDE.md](../CLAUDE.md) (binding rules),
 | M1 — Navigation prototype (register project, list worktrees, private tmux sessions, terminal launch, click-to-switch) | **Done** |
 | M2 — Worktree management (create worktree, refresh, git status sublabels, four-way safe removal with risk report) | **Done** |
 | M2.5 — Fresh paint (theme.rs, epaint icons, undecorated window, drag + edge-resize, editable Settings via `toml_edit`, feature-gated native file picker, detached dialog windows) | **Done** |
-| M3 — Persistence & restore (startup reconciliation, orphaned/missing handling, Restore UI) | **Not started** — the header Restore chip is a disabled placeholder |
+| M3 — Persistence & restore (startup reconciliation, orphaned/missing handling, Restore UI) | **Done** — see the breakdown below |
 | M4 — Agent workflow | **Done** — see the breakdown below |
+
+### M3 breakdown
+
+| Piece | Status |
+|---|---|
+| Reconciliation diff, pure (`grove-core/src/reconcile.rs`) | **Done** |
+| Session matching: `@grove_*` options → `wt-<id>` name → worktree path | **Done** — the path fallback is scoped to one repository |
+| `state.toml` `[[session]]` mappings + `ignored_sessions` | **Done** — additive; older files still load |
+| Startup reconciliation, Restore chip, Ctrl+R | **Done** — replaces the per-project refresh on startup |
+| Missing worktree → *unavailable* (marker + sublabel) | **Done** |
+| Missing session → *stopped*; opening the row starts one again | **Done** |
+| Missing project → *unavailable* + Retry / Locate / Remove from Grove | **Done** |
+| Orphaned sessions → section with open / associate / close / ignore | **Done** — close is armed first; ignore is reversible |
+| `tmux::associate_session` (rename + re-stamp options) | **Done** — same session, same panes |
+
+Nothing in M3 is machine-verified GUI-side either; see the smoke list below.
 
 ### M4 breakdown
 
@@ -64,7 +80,12 @@ commits with tests; `git log --oneline` is a usable index.
 - **Private tmux server** at `$XDG_RUNTIME_DIR/grove/tmux.sock`, started
   with Grove-owned `-f …/grove/tmux.conf`. Sessions carry
   `@grove_id/@grove_project/@grove_worktree/@grove_repo` user options —
-  these are the primary reconciliation key for M3.
+  these are the primary reconciliation key, with the `wt-<id>` name and then
+  the recorded worktree path as fallbacks.
+- **Reconciliation marks, never deletes.** `state.toml` is an index in both
+  directions: a live session absent from it is adopted, and a mapping whose
+  session is gone shows the row as *stopped* rather than recreating
+  anything. Orphaned sessions are reported, never closed.
 - **No daemon.** `grove notify` = same binary, Unix-socket IPC to the GUI
   *plus* a durable `@grove_attention` tmux option so notifications survive
   the GUI being closed. Both deliveries are best-effort and notify exits 0
@@ -95,7 +116,9 @@ commits with tests; `git log --oneline` is a usable index.
   (activation sequencing, `poll_session_signals`), `status.rs` (the
   working/idle/attention machine and the attention latch), `ipc.rs` (the
   `grove notify` wire format), `desktop.rs` (`notify-send`), `agent.rs`
-  (agent window + systemd scopes). No UI deps — keep it that way.
+  (agent window + systemd scopes), `reconcile.rs` (the startup/restore diff
+  — the `reconcile` function itself is pure; `reconcile_all` is the thin IO
+  wrapper). No UI deps — keep it that way.
 - `crates/grove` — `app.rs` (eframe app + viewport plumbing), `workers.rs`
   (worker thread, all subprocess work), `notify.rs` (the `notify`
   subcommand), `status_watch.rs` (poller thread + notify listener, sharing
@@ -104,6 +127,7 @@ commits with tests; `git log --oneline` is a usable index.
   egui's bundled fonts lack many glyphs — never use text glyphs for icons),
   `ui/chrome.rs` (detached-window lifecycle `Detached<T>` + chrome),
   `ui/window_edge.rs` (edge resize for undecorated windows), `ui/dialogs/`,
+  `ui/orphans.rs` (the orphaned-session section and its four choices),
   `ui/settings.rs`. Feature `native-file-picker` (default-on, `rfd`/portal);
   `--no-default-features` must always build and is part of the gate.
 
@@ -119,7 +143,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-Tests: 498. Integration tests run real git in temp repos and real tmux on
+Tests: 545. Integration tests run real git in temp repos and real tmux on
 throwaway sockets in tempdirs (auto-killed by guard structs), and run the
 real `grove notify` binary against a temp `XDG_RUNTIME_DIR`. New features
 land with tests in the same commit.
@@ -149,11 +173,16 @@ land with tests in the same commit.
    one-instance focus, no white flash), settings save preserving hand
    comments, native picker on all three entry points, feature-off build
    behavior, tofu-free icons, header drag.
-2. **Milestone 3** — reconciliation in `grove-core/src/reconcile.rs` (file
-   named in ARCHITECTURE §3, not yet created): startup/refresh/restore
-   diffing state.toml ↔ `git worktree list` ↔ `list-sessions` with
-   `@grove_*` options as primary key; missing-project / orphaned-session /
-   missing-session flows (DESIGN §11); enable the Restore chip.
+2. **Smoke-test Milestone 3** (nothing GUI-side is machine-verified):
+   the Restore chip and Ctrl+R producing the summary status line; killing
+   a session outside Grove and seeing the row say "session stopped", then
+   clicking it to start one again; `git worktree remove`-ing a worktree
+   with a live session and seeing the orphan section, then trying each of
+   open / associate / ignore / close (close needs the second, armed
+   click); "Show again" after ignoring; renaming a project directory and
+   seeing "Project unavailable" with Retry and "Locate project…" — and
+   confirming its worktrees and branches are still on disk afterwards;
+   deleting a worktree directory by hand and seeing the warning marker.
 3. **Smoke-test Milestone 4** (nothing GUI-side is machine-verified):
    attention appearing on a row (`grove notify --state attention` from
    inside a session), it clearing when the row is opened and *staying*

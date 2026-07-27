@@ -21,11 +21,20 @@ pub struct Project {
     pub default_worktree_path: PathBuf,
     pub is_expanded: bool,
     pub worktrees: Vec<Worktree>,
+    /// Why the project could not be read, when reconciliation could not read
+    /// it: the directory moved, a drive is unavailable, git refused
+    /// (DESIGN.md §11). `None` is the normal state. Being unavailable never
+    /// removes anything — the record and the last known rows stay.
+    pub unavailable: Option<String>,
 }
 
 impl Project {
     pub fn worktree(&self, id: &str) -> Option<&Worktree> {
         self.worktrees.iter().find(|w| w.id == id)
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.unavailable.is_none()
     }
 }
 
@@ -115,6 +124,13 @@ pub struct Worktree {
     pub lock_reason: Option<String>,
     pub is_prunable: bool,
     pub prune_reason: Option<String>,
+    /// The worktree directory is not there any more (DESIGN.md §11). Set by
+    /// reconciliation, which marks it *unavailable* and removes nothing.
+    pub is_missing: bool,
+    /// Grove has a session record for this worktree but tmux no longer has the
+    /// session: it is *stopped*, not "never started". The row stays usable and
+    /// opening it starts a session again.
+    pub session_stopped: bool,
     pub session: SessionPresence,
     /// Working-tree summary, filled in asynchronously by the worker. `None`
     /// means "not read yet", which the UI shows as nothing rather than as
@@ -154,6 +170,8 @@ impl Worktree {
             lock_reason: entry.lock_reason.clone(),
             is_prunable: entry.prunable,
             prune_reason: entry.prune_reason.clone(),
+            is_missing: false,
+            session_stopped: false,
             session: SessionPresence::None,
             git_status: None,
             status: None,
@@ -195,7 +213,15 @@ impl Worktree {
                 SessionPresence::Attached => format!("{} · attached", status.label()),
                 _ => status.label().to_string(),
             }),
+            // A session Grove knew about and tmux no longer has is *stopped*;
+            // saying "no session" would read as though there never was one.
+            None if self.session_stopped && !self.session.exists() => {
+                parts.push("session stopped".to_string())
+            }
             None => parts.push(self.session.label().to_string()),
+        }
+        if self.is_missing {
+            parts.push("unavailable".to_string());
         }
         if self.is_detached {
             parts.push("detached".to_string());
@@ -390,6 +416,44 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_session_says_so_instead_of_no_session() {
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        worktree.session_stopped = true;
+        assert_eq!(worktree.sublabel(), "session stopped");
+
+        // Once tmux has it again, the record is history and the live state
+        // wins — the row must never claim a running session is stopped.
+        worktree.session = SessionPresence::Detached;
+        assert_eq!(worktree.sublabel(), "session");
+    }
+
+    #[test]
+    fn a_missing_worktree_is_labelled_unavailable() {
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        worktree.is_missing = true;
+        assert_eq!(worktree.sublabel(), "no session · unavailable");
+        worktree.session_stopped = true;
+        assert_eq!(worktree.sublabel(), "session stopped · unavailable");
+    }
+
+    #[test]
+    fn a_project_is_available_until_reconciliation_says_otherwise() {
+        let mut project = Project {
+            id: "p1".into(),
+            name: "acme".into(),
+            repository_path: PathBuf::from("/home/u/acme"),
+            git_common_dir: PathBuf::from("/home/u/acme/.git"),
+            default_worktree_path: PathBuf::from("/home/u"),
+            is_expanded: true,
+            worktrees: Vec::new(),
+            unavailable: None,
+        };
+        assert!(project.is_available());
+        project.unavailable = Some("the directory is gone".into());
+        assert!(!project.is_available());
+    }
+
+    #[test]
     fn session_presence_reports_existence() {
         assert!(!SessionPresence::None.exists());
         assert!(SessionPresence::Detached.exists());
@@ -440,6 +504,7 @@ mod tests {
             default_worktree_path: PathBuf::from("/home/u"),
             is_expanded: true,
             worktrees,
+            unavailable: None,
         };
         assert!(project.worktree(&id).is_some());
         assert!(project.worktree("zzzzzz").is_none());

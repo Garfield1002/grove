@@ -5,6 +5,7 @@ pub mod backdrop;
 pub mod chrome;
 pub mod dialogs;
 pub mod icons;
+pub mod orphans;
 pub mod project_list;
 pub mod settings;
 pub mod theme;
@@ -21,6 +22,9 @@ pub const NATIVE_FILE_PICKER: bool = cfg!(feature = "native-file-picker");
 pub enum Action {
     ToggleProject(String),
     RefreshProject(String),
+    /// Point Grove at a project that has moved (DESIGN.md §11). Opens the
+    /// open-project prompt on its old path; nothing is removed either way.
+    LocateProject(String),
     /// Open the create-worktree dialog for a project.
     CreateWorktree(String),
     /// Open the removal dialog for a project, with no worktree selected.

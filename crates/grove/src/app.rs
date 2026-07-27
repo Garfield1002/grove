@@ -8,7 +8,8 @@ use std::sync::mpsc::Receiver;
 use grove_core::config::Config;
 use grove_core::git::StatusSummary;
 use grove_core::model::{Project, SessionPresence};
-use grove_core::state::{ProjectRecord, State};
+use grove_core::reconcile::{OrphanSession, ProjectRef, Reconciliation};
+use grove_core::state::{ProjectRecord, SessionRecord, State};
 use grove_core::status::{SessionReport, SessionStatus};
 use grove_core::workflow::Activation;
 use grove_core::{Paths, state};
@@ -39,6 +40,16 @@ pub struct GroveApp {
     filter: String,
     status: Option<String>,
     errors: Vec<ErrorReport>,
+
+    /// Sessions the last reconciliation found with no worktree behind them
+    /// (DESIGN.md §11). Listed, never acted on without the user.
+    orphans: Vec<OrphanSession>,
+    /// How many further orphans the user has silenced, so the list can offer
+    /// to report them again.
+    ignored_orphans: usize,
+    /// The orphan whose "close session" is armed. Closing a session is a
+    /// confirmed operation of its own, so the first click only arms it.
+    orphan_armed: Option<String>,
 
     open_project_path: Option<String>,
     /// A worktree Grove just created, selected as soon as a refresh lists it.
@@ -82,17 +93,20 @@ impl GroveApp {
                 default_worktree_path: record.default_worktree_path.clone(),
                 is_expanded: record.is_expanded,
                 worktrees: Vec::new(),
+                unavailable: None,
             })
             .collect();
 
         workers.send(Task::LoadConfig);
-        for project in &projects {
-            workers.send(Task::RefreshProject {
-                project_id: project.id.clone(),
-                repository_path: project.repository_path.clone(),
-                git_common_dir: project.git_common_dir.clone(),
-            });
-        }
+        // Startup reconciliation (ARCHITECTURE.md §7): one pass over git and
+        // tmux rather than a refresh per project, so sessions are reattached,
+        // stopped ones are named as stopped and orphans are found before the
+        // user touches anything.
+        workers.send(Task::Reconcile {
+            projects: project_refs(&projects),
+            recorded: loaded.recorded_session_ids(),
+            ignored: loaded.ignored_sessions.clone(),
+        });
 
         Self {
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -108,6 +122,9 @@ impl GroveApp {
             filter: String::new(),
             status: None,
             errors,
+            orphans: Vec::new(),
+            ignored_orphans: 0,
+            orphan_armed: None,
             open_project_path: None,
             pending_selection: None,
             create: Detached::default(),
@@ -173,6 +190,8 @@ impl GroveApp {
                 } => {
                     if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
                         project.worktrees = worktrees;
+                        // git answered, so the project is there after all.
+                        project.unavailable = None;
                         // Select a worktree Grove has just created, once the
                         // refreshed list actually contains it.
                         if let Some((pending_project, path)) = &self.pending_selection
@@ -185,7 +204,10 @@ impl GroveApp {
                         }
                     }
                     // A fresh list arrives with no statuses on it; re-stamp
-                    // the last poll rather than blanking every pill.
+                    // the last poll rather than blanking every pill, and the
+                    // session index, or a refresh would turn every *stopped*
+                    // row back into "no session".
+                    self.mark_stopped_sessions();
                     self.apply_session_statuses();
                     self.describe_worktrees();
                 }
@@ -194,6 +216,26 @@ impl GroveApp {
                     statuses,
                 } => self.apply_statuses(&project_id, &statuses),
                 Message::SessionsRefreshed(presence) => self.apply_presence(&presence),
+                Message::Reconciled(result) => self.apply_reconciliation(*result),
+                Message::SessionOpened { activation } => {
+                    self.status = Some(describe(&activation));
+                }
+                Message::Associated {
+                    worktree_id,
+                    session,
+                } => {
+                    self.status = Some(format!("{session} is now this worktree's session."));
+                    self.selected = Some(worktree_id);
+                    self.orphan_armed = None;
+                    self.reconcile();
+                }
+                Message::OrphanClosed { session } => {
+                    self.status = Some(format!(
+                        "Closed {session}. No worktree or branch was touched."
+                    ));
+                    self.orphan_armed = None;
+                    self.reconcile();
+                }
                 Message::AgentStarted { worktree_id, unit } => {
                     self.selected = Some(worktree_id);
                     self.status = Some(match unit {
@@ -259,6 +301,14 @@ impl GroveApp {
                         // would otherwise outlive it until the next poll.
                         self.watch.forget(&form.worktree_id);
                         self.statuses.remove(&form.worktree_id);
+                        // A session the *user* closed is not a stopped
+                        // session: forget the mapping, or the row would go on
+                        // offering to bring back what was just dismissed.
+                        if operation == crate::workers::RemovalOp::CloseSession {
+                            self.state.forget_session(&form.worktree_id);
+                            let state = self.state.clone();
+                            self.workers.send(Task::SaveState(Box::new(state)));
+                        }
                         form.note_done(operation, detail);
                     }
                 }
@@ -283,18 +333,12 @@ impl GroveApp {
                     worktree_id,
                     activation,
                 } => {
+                    self.status = Some(describe(&activation));
+                    // The worktree now has a session; recording it is what
+                    // makes a later disappearance read as *stopped* rather
+                    // than as "there was never one" (DESIGN.md §11).
+                    self.record_session(&worktree_id, activation.session());
                     self.selected = Some(worktree_id);
-                    self.status = Some(match activation {
-                        Activation::SwitchedClient {
-                            session,
-                            client_tty,
-                        } => {
-                            format!("Switched {client_tty} to {session}")
-                        }
-                        Activation::LaunchedTerminal { session, .. } => {
-                            format!("Launched a terminal on {session}")
-                        }
-                    });
                 }
                 Message::WindowOpened {
                     worktree_id,
@@ -352,10 +396,23 @@ impl GroveApp {
         }
     }
 
+    /// Re-derive *stopped* from the session index for every row without a live
+    /// session. Reconciliation does this too; doing it here as well keeps an
+    /// ordinary refresh from downgrading "session stopped" to "no session".
+    fn mark_stopped_sessions(&mut self) {
+        for project in &mut self.projects {
+            for worktree in &mut project.worktrees {
+                worktree.session_stopped =
+                    !worktree.session.exists() && self.state.session(&worktree.id).is_some();
+            }
+        }
+    }
+
     fn apply_presence(&mut self, presence: &HashMap<String, SessionPresence>) {
         for project in &mut self.projects {
             grove_core::workflow::apply_session_presence(&mut project.worktrees, presence);
         }
+        self.mark_stopped_sessions();
         // Presence just changed, so a row that lost its session must lose its
         // status with it rather than waiting for the next poll.
         self.apply_session_statuses();
@@ -457,16 +514,106 @@ impl GroveApp {
             .send(Task::SaveState(Box::new(self.state.clone())));
     }
 
-    fn refresh_all(&mut self) {
-        for project in &self.projects {
-            self.workers.send(Task::RefreshProject {
-                project_id: project.id.clone(),
-                repository_path: project.repository_path.clone(),
-                git_common_dir: project.git_common_dir.clone(),
-            });
+    /// Ask the worker for a reconciliation pass (ARCHITECTURE.md §7). This is
+    /// what the header's Restore control, Ctrl+R with no row selected, and
+    /// startup all do.
+    fn reconcile(&mut self) {
+        self.workers.send(Task::Reconcile {
+            projects: project_refs(&self.projects),
+            recorded: self.state.recorded_session_ids(),
+            ignored: self.state.ignored_sessions.clone(),
+        });
+        self.status = Some("Reconciling with git and tmux…".to_string());
+    }
+
+    /// Apply one reconciliation pass to the UI and the index.
+    ///
+    /// It marks and it records; it removes nothing. An unavailable project
+    /// keeps its record *and* its last known rows — a project on an unplugged
+    /// drive must not look as though its worktrees were deleted.
+    fn apply_reconciliation(&mut self, result: Reconciliation) {
+        let summary = result.summary();
+        for status in result.projects {
+            let Some(project) = self.projects.iter_mut().find(|p| p.id == status.id) else {
+                continue;
+            };
+            project.unavailable = status.unavailable;
+            if project.unavailable.is_none() {
+                project.worktrees = status.worktrees;
+            }
         }
-        self.workers.send(Task::RefreshSessions);
-        self.status = Some("Refreshing from git and tmux…".to_string());
+        self.orphans = result.orphans;
+        self.ignored_orphans = result.ignored;
+        if self
+            .orphan_armed
+            .as_ref()
+            .is_some_and(|name| !self.orphans.iter().any(|o| &o.name == name))
+        {
+            self.orphan_armed = None;
+        }
+        self.record_live_sessions();
+        self.apply_session_statuses();
+        self.describe_worktrees();
+        self.status = Some(summary);
+    }
+
+    /// Note every worktree that currently has a session, so a session that
+    /// later disappears is reported as *stopped*. Records for sessions that
+    /// have gone are deliberately kept: that is the whole signal.
+    fn record_live_sessions(&mut self) {
+        let live: Vec<SessionRecord> = self
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| worktree.session.exists())
+                    .map(|worktree| SessionRecord {
+                        worktree_id: worktree.id.clone(),
+                        project_id: project.id.clone(),
+                        worktree_path: worktree.path.clone(),
+                        session_name: worktree.session_name(),
+                        last_activity_at: grove_core::workflow::now_epoch(),
+                    })
+            })
+            .collect();
+        let before = self.state.sessions.clone();
+        for record in live {
+            self.state.record_session(record);
+        }
+        // Every pass restamps the activity time, so compare the mappings
+        // themselves: an unchanged reconciliation must not rewrite state.toml.
+        let changed = before.len() != self.state.sessions.len()
+            || before.iter().zip(&self.state.sessions).any(|(a, b)| {
+                a.worktree_id != b.worktree_id
+                    || a.project_id != b.project_id
+                    || a.session_name != b.session_name
+                    || a.worktree_path != b.worktree_path
+            });
+        if changed {
+            self.save_state();
+        }
+    }
+
+    /// Record one worktree's session mapping, by worktree id.
+    fn record_session(&mut self, worktree_id: &str, session: &str) {
+        let found = self.projects.iter().find_map(|project| {
+            project
+                .worktree(worktree_id)
+                .map(|worktree| (project.id.clone(), worktree.path.clone()))
+        });
+        let Some((project_id, worktree_path)) = found else {
+            return;
+        };
+        self.state.record_session(SessionRecord {
+            worktree_id: worktree_id.to_string(),
+            project_id,
+            worktree_path,
+            session_name: session.to_string(),
+            last_activity_at: grove_core::workflow::now_epoch(),
+        });
+        self.save_state();
     }
 
     fn apply_action(&mut self, action: Action) {
@@ -561,6 +708,76 @@ impl GroveApp {
                 project_id,
                 worktree_id,
             } => self.open_removal_dialog(&project_id, &worktree_id),
+            // "Locate project" is the open-project prompt, pre-filled with
+            // where the project used to be. Registering it again updates the
+            // existing record when it is the same repository, because the
+            // project id is derived from the git-common-dir.
+            Action::LocateProject(id) => {
+                if let Some(project) = self.projects.iter().find(|p| p.id == id) {
+                    self.open_project_path = Some(project.repository_path.display().to_string());
+                    self.status = Some(format!(
+                        "Point Grove at {} where it lives now.",
+                        project.name
+                    ));
+                }
+            }
+        }
+    }
+
+    /// One choice about one orphaned session (DESIGN.md §11). Exactly one, and
+    /// closing is armed before it happens.
+    fn apply_orphan_action(&mut self, action: ui::orphans::OrphanAction) {
+        use ui::orphans::OrphanAction;
+        match action {
+            OrphanAction::Open(session) => {
+                let cwd = self
+                    .orphans
+                    .iter()
+                    .find(|o| o.name == session)
+                    .and_then(|o| o.worktree_path.clone())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                self.workers.send(Task::OpenSession { session, cwd });
+            }
+            OrphanAction::Associate {
+                session,
+                project_id,
+                worktree_id,
+            } => {
+                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
+                    && let Some(worktree) = project.worktree(&worktree_id)
+                {
+                    self.workers.send(Task::AssociateSession {
+                        project_name: project.name.clone(),
+                        git_common_dir: project.git_common_dir.clone(),
+                        worktree: Box::new(worktree.clone()),
+                        session,
+                    });
+                }
+            }
+            // The first click arms; only the second one closes anything.
+            OrphanAction::Close(session) => {
+                if self.orphan_armed.as_deref() == Some(session.as_str()) {
+                    self.workers.send(Task::CloseOrphan { session });
+                } else {
+                    self.status = Some(format!(
+                        "Choose “Confirm: close {session}” to end that session."
+                    ));
+                    self.orphan_armed = Some(session);
+                }
+            }
+            OrphanAction::Ignore(session) => {
+                self.state.ignore_session(&session);
+                self.save_state();
+                self.status = Some(format!(
+                    "Ignoring {session}. It is still running; use Restore to list it again."
+                ));
+                self.reconcile();
+            }
+            OrphanAction::ShowIgnored => {
+                self.state.clear_ignored_sessions();
+                self.save_state();
+                self.reconcile();
+            }
         }
     }
 
@@ -919,11 +1136,11 @@ impl GroveApp {
         if new && let Some(project_id) = self.context_project() {
             self.open_create_dialog(&project_id);
         }
+        // Ctrl+R is the Restore chip: a full reconciliation against git and
+        // tmux. A single project's Refresh stays in its menu, where it is
+        // scoped on purpose.
         if refresh {
-            match self.context_project() {
-                Some(project_id) => self.apply_action(Action::RefreshProject(project_id)),
-                None => self.refresh_all(),
-            }
+            self.reconcile();
         }
     }
 
@@ -956,10 +1173,17 @@ impl GroveApp {
                 {
                     self.open_project_path = Some(String::new());
                 }
-                ui::icons::chip(ui, "Restore", false, ui::icons::refresh).on_hover_text(
-                    "Milestone 3 — restore and reconcile saved state.\n\
-                     Ctrl+R re-reads git and tmux in the meantime.",
-                );
+                if ui::icons::chip(ui, "Restore", true, ui::icons::refresh)
+                    .on_hover_text(
+                        "Rebuild Grove's view from git and tmux.\n\
+                         Reattaches live sessions, marks missing worktrees and\n\
+                         stopped sessions, and lists orphaned sessions.\n\
+                         Nothing is ever deleted. (Ctrl+R)",
+                    )
+                    .clicked()
+                {
+                    self.reconcile();
+                }
             });
         });
 
@@ -1034,6 +1258,33 @@ impl GroveApp {
                 egui::Label::new(theme::label(status, theme::FONT_SMALL, theme::TEXT_FAINT))
                     .truncate(),
             );
+        }
+    }
+}
+
+/// What Grove knows about each project before git is consulted, for a
+/// reconciliation pass.
+fn project_refs(projects: &[Project]) -> Vec<ProjectRef> {
+    projects
+        .iter()
+        .map(|project| ProjectRef {
+            id: project.id.clone(),
+            name: project.name.clone(),
+            repository_path: project.repository_path.clone(),
+            git_common_dir: project.git_common_dir.clone(),
+        })
+        .collect()
+}
+
+/// The status line for an activation, whichever route it took.
+fn describe(activation: &Activation) -> String {
+    match activation {
+        Activation::SwitchedClient {
+            session,
+            client_tty,
+        } => format!("Switched {client_tty} to {session}"),
+        Activation::LaunchedTerminal { session, .. } => {
+            format!("Launched a terminal on {session}")
         }
     }
 }
@@ -1193,6 +1444,7 @@ impl eframe::App for GroveApp {
         }
 
         let mut action = None;
+        let mut orphan_action = None;
         let central = egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1209,6 +1461,13 @@ impl eframe::App for GroveApp {
                             &self.filter,
                             self.home.as_deref(),
                         );
+                        orphan_action = ui::orphans::show(
+                            ui,
+                            &self.orphans,
+                            self.ignored_orphans,
+                            self.orphan_armed.as_deref(),
+                            &self.projects,
+                        );
                         ui.min_rect().bottom()
                     })
                     .inner
@@ -1223,6 +1482,9 @@ impl eframe::App for GroveApp {
         }
         if let Some(action) = action {
             self.apply_action(action);
+        }
+        if let Some(action) = orphan_action {
+            self.apply_orphan_action(action);
         }
         self.keyboard(ctx);
     }
@@ -1313,6 +1575,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            unavailable: None,
         }
     }
 
@@ -1406,6 +1669,42 @@ mod tests {
         assert_eq!(next_selection(&[], None, 1), None);
         assert_eq!(next_selection(&[], Some("a1b2c3"), -1), None);
         assert!(visible_rows(&[], "").is_empty());
+    }
+
+    // ------------------------------------------------------- reconciliation
+
+    #[test]
+    fn project_refs_carry_the_repository_identity_reconciliation_needs() {
+        let projects = vec![project("p1", "acme", &["main"])];
+        let refs = project_refs(&projects);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, "p1");
+        assert_eq!(refs[0].name, "acme");
+        assert_eq!(refs[0].repository_path, PathBuf::from("/home/u/acme"));
+        assert_eq!(
+            refs[0].git_common_dir,
+            PathBuf::from("/home/u/acme/.git"),
+            "matching is by repository identity, not by name"
+        );
+        assert!(project_refs(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_activation_is_described_by_the_route_it_took() {
+        assert_eq!(
+            describe(&Activation::SwitchedClient {
+                session: "wt-a1b2c3".into(),
+                client_tty: "/dev/pts/3".into(),
+            }),
+            "Switched /dev/pts/3 to wt-a1b2c3"
+        );
+        assert_eq!(
+            describe(&Activation::LaunchedTerminal {
+                session: "wt-a1b2c3".into(),
+                command: "foot tmux".into(),
+            }),
+            "Launched a terminal on wt-a1b2c3"
+        );
     }
 
     // ------------------------------------------------ the directory picker
