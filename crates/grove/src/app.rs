@@ -1026,7 +1026,8 @@ impl eframe::App for GroveApp {
                     .inner_margin(egui::Margin::symmetric(theme::LIST_MARGIN_X, 6)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                let panel = ui.max_rect();
+                let list = egui::ScrollArea::vertical().show(ui, |ui| {
                     action = ui::project_list::show(
                         ui,
                         &self.projects,
@@ -1034,7 +1035,14 @@ impl eframe::App for GroveApp {
                         &self.filter,
                         self.home.as_deref(),
                     );
+                    ui.min_rect().bottom()
                 });
+                // Decoration for a short list only, in the background layer so
+                // it can neither cover a row nor take a click. Pinned to the
+                // panel: the list grows down over it, it does not move.
+                if let Some(free) = ui::backdrop::free_space(panel, list.inner) {
+                    ui::backdrop::show(ctx, free);
+                }
             });
         if let Some(action) = action {
             self.apply_action(action);
