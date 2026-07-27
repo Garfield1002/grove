@@ -626,6 +626,10 @@ mod tests {
         assert!(document.contains("extkeys"));
         // Agents signal attention with OSC sequences; tmux must pass them on.
         assert!(document.contains("set -g allow-passthrough on"));
+        // Claude Code rounds every colour to the 256-palette whenever `$TMUX`
+        // is set. The pane negotiates RGB above, so the cap is pure loss —
+        // and neither FORCE_COLOR nor any TERM undoes it, only this.
+        assert!(document.contains("set-environment -g CLAUDE_CODE_TMUX_TRUECOLOR 1"));
     }
 
     #[test]
