@@ -153,6 +153,11 @@ pub enum Task {
         branch: String,
         force: bool,
     },
+    /// Kill the private tmux server, after its own armed confirmation in the
+    /// footer — every Grove session, and everything running inside one, ends.
+    /// Never part of ordinary shutdown (FR-7: sessions outlive the GUI); only
+    /// this explicit user action sends it.
+    KillServer,
     /// Persist the project index.
     SaveState(Box<State>),
     /// Write the changed `config.toml` keys, then re-read the file.
@@ -314,6 +319,10 @@ pub enum Message {
         operation: RemovalOp,
         report: ErrorReport,
     },
+    /// The private tmux server is down. Grove quits when this arrives — and
+    /// only then, so a failed kill leaves the app running with its error
+    /// shown instead of silently abandoning live sessions.
+    ServerKilled,
     /// `config.toml` was written. The reloaded config follows as
     /// [`Message::ConfigLoaded`].
     ConfigSaved {
@@ -627,6 +636,14 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 ))],
             }
         }
+
+        Task::KillServer => match worker.server.kill_server() {
+            Ok(()) => vec![Message::ServerKilled],
+            Err(e) => vec![Message::Failed(ErrorReport::new(
+                "could not kill the tmux server",
+                &e,
+            ))],
+        },
 
         Task::RefreshSessions => {
             match workflow::session_presence(&worker.server)
@@ -1040,6 +1057,28 @@ command = \"foot tmux -S {socket} attach-session -t {session}\"
 [worktrees]
 default_parent = \"/home/u/trees\"
 ";
+
+    /// The footer's kill control against a socket with no server behind it:
+    /// tmux answers "no server running", which is exactly the state the user
+    /// asked for, so the worker still reports `ServerKilled` and Grove quits.
+    #[test]
+    fn killing_an_absent_server_still_reports_server_killed() {
+        if std::process::Command::new(grove_core::tmux::server::TMUX)
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.config_dir).expect("mkdir config");
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("mkdir runtime");
+
+        let messages = handle(&mut worker, Task::KillServer);
+        assert!(matches!(messages.as_slice(), [Message::ServerKilled]));
+    }
 
     /// The whole save path the Settings pane uses: surgical edit, atomic
     /// write, re-read, and the comments still there afterwards.

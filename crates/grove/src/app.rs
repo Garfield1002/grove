@@ -58,6 +58,13 @@ pub struct GroveApp {
     /// The orphan whose "close session" is armed. Closing a session is a
     /// confirmed operation of its own, so the first click only arms it.
     orphan_armed: Option<String>,
+    /// Whether the footer's quit-and-kill-server control is armed. Killing
+    /// the server ends every session at once, so the first click only arms.
+    shutdown_armed: bool,
+    /// Set when the worker confirms the tmux server is down; the next frame
+    /// closes the window. Quitting waits for that confirmation so a failed
+    /// kill leaves Grove open with the error on screen.
+    quit_after_kill: bool,
 
     open_project_path: Option<String>,
     /// A worktree Grove just created, selected as soon as a refresh lists it.
@@ -135,6 +142,8 @@ impl GroveApp {
             orphans: Vec::new(),
             ignored_orphans: 0,
             orphan_armed: None,
+            shutdown_armed: false,
+            quit_after_kill: false,
             open_project_path: None,
             pending_selection: None,
             create: Detached::default(),
@@ -242,6 +251,9 @@ impl GroveApp {
                     self.selected = Some(worktree_id);
                     self.orphan_armed = None;
                     self.reconcile();
+                }
+                Message::ServerKilled => {
+                    self.quit_after_kill = true;
                 }
                 Message::OrphanClosed { session } => {
                     self.status = Some(format!(
@@ -1251,6 +1263,41 @@ impl GroveApp {
         self.filter_field(ui);
     }
 
+    /// The footer's quit-and-kill-server control, next to the gear.
+    ///
+    /// Plain quitting (Ctrl+Q, closing the window) leaves the tmux server and
+    /// every session running — FR-7, sessions outlive the GUI. This is the
+    /// one deliberate exception: end everything, then quit. Ending every
+    /// session at once is destructive, so the first click only arms the
+    /// button and the second one acts; any click elsewhere disarms it.
+    fn shutdown_button(&mut self, ui: &mut egui::Ui) {
+        let armed = self.shutdown_armed;
+        let response = ui::icons::button(ui, true, |painter, rect, tint| {
+            ui::icons::power(painter, rect, if armed { theme::DANGER } else { tint });
+        })
+        .on_hover_text(if armed {
+            "Confirm: kill the tmux server and quit Grove."
+        } else {
+            "Quit Grove and kill its tmux server.\n\
+             Every session — and whatever runs inside — ends.\n\
+             A second click confirms. To quit and leave the\n\
+             sessions running, just close the window (Ctrl+Q)."
+        });
+        if response.clicked() {
+            if armed {
+                self.shutdown_armed = false;
+                self.status = Some("Killing the tmux server…".to_string());
+                self.workers.send(Task::KillServer);
+            } else {
+                self.shutdown_armed = true;
+                self.status =
+                    Some("Click the power button again to end every session and quit.".to_string());
+            }
+        } else if armed && response.clicked_elsewhere() {
+            self.shutdown_armed = false;
+        }
+    }
+
     /// The mockup's filter field: a rounded, subtly bordered pill with a
     /// magnifier and a placeholder.
     fn filter_field(&mut self, ui: &mut egui::Ui) {
@@ -1310,6 +1357,7 @@ impl GroveApp {
                         self.settings.open(form);
                     }
                 }
+                self.shutdown_button(ui);
             });
         });
         if let Some(status) = &self.status {
@@ -1439,6 +1487,12 @@ impl eframe::App for GroveApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
+
+        // The worker has confirmed the tmux server is down (the footer's
+        // quit-and-kill control): nothing is left to outlive the GUI, so quit.
+        if self.quit_after_kill {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // First thing in the frame: the window is undecorated, so its resize
         // edges are Grove's to provide, and registering them here puts every

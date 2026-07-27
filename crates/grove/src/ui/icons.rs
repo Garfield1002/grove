@@ -277,6 +277,23 @@ pub fn cpu(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
+/// The power symbol: the footer's quit-and-kill-server control.
+pub fn power(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(line_width(rect).max(1.2), color);
+    // The ring is open at the top, where the stem passes through it.
+    const GAP: f32 = 0.55;
+    let top = -std::f32::consts::FRAC_PI_2;
+    let ring = arc(
+        (0.5, 0.56),
+        0.34,
+        top + GAP,
+        top + std::f32::consts::TAU - GAP,
+        24,
+    );
+    path(painter, rect, &ring, false, stroke);
+    path(painter, rect, &[(0.5, 0.06), (0.5, 0.5)], false, stroke);
+}
+
 // ---------------------------------------------------------------- widgets
 
 /// A square icon button with the mockup's chip background.
