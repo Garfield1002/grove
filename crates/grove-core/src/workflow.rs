@@ -15,7 +15,7 @@ use crate::model::{
     Project, SessionPresence, Worktree, default_worktree_parent, worktrees_from_entries,
 };
 use crate::removal::{RemovalInputs, Unpushed};
-use crate::status::SessionSignals;
+use crate::status::{SessionSignals, SessionStatus};
 use crate::terminal::{self, TemplateVars};
 use crate::tmux::{self, SessionSpec, TmuxServer};
 
@@ -163,6 +163,24 @@ pub fn apply_session_presence(
             .get(&worktree.session_name())
             .copied()
             .unwrap_or(SessionPresence::None);
+    }
+}
+
+/// Stamp polled session statuses onto a worktree list.
+///
+/// A worktree with no session gets no status at all, whatever the map says:
+/// a status left over from a session that has since been closed would show a
+/// row as working with nothing running in it.
+pub fn apply_session_status(worktrees: &mut [Worktree], statuses: &HashMap<String, SessionStatus>) {
+    for worktree in worktrees {
+        worktree.status = worktree
+            .session
+            .exists()
+            .then(|| statuses.get(&worktree.id).copied())
+            .flatten();
+        if worktree.status.is_none() {
+            worktree.status_message = None;
+        }
     }
 }
 
@@ -426,6 +444,47 @@ mod tests {
         assert_eq!(spec.worktree_path, worktree.path);
         assert_eq!(spec.project_name, "acme-web");
         assert_eq!(spec.git_common_dir, Path::new("/home/u/proj/.git"));
+    }
+
+    #[test]
+    fn status_is_stamped_only_onto_worktrees_that_have_a_session() {
+        let mut worktrees = vec![worktree("/home/u/proj"), worktree("/home/u/wt/feature")];
+        worktrees[0].session = SessionPresence::Detached;
+        worktrees[1].session = SessionPresence::None;
+        let statuses = HashMap::from([
+            (worktrees[0].id.clone(), SessionStatus::Working),
+            // A status left over for a session that has since been closed.
+            (worktrees[1].id.clone(), SessionStatus::Attention),
+        ]);
+
+        apply_session_status(&mut worktrees, &statuses);
+        assert_eq!(worktrees[0].status, Some(SessionStatus::Working));
+        assert_eq!(
+            worktrees[1].status, None,
+            "a closed session must not keep showing a status"
+        );
+    }
+
+    #[test]
+    fn dropping_a_status_drops_its_message_with_it() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        worktrees[0].session = SessionPresence::None;
+        worktrees[0].status = Some(SessionStatus::Attention);
+        worktrees[0].status_message = Some("needs permission".into());
+
+        apply_session_status(&mut worktrees, &HashMap::new());
+        assert_eq!(worktrees[0].status, None);
+        assert_eq!(worktrees[0].status_message, None);
+    }
+
+    #[test]
+    fn an_unpolled_worktree_keeps_no_status() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        worktrees[0].session = SessionPresence::Detached;
+        worktrees[0].status = Some(SessionStatus::Working);
+
+        apply_session_status(&mut worktrees, &HashMap::new());
+        assert_eq!(worktrees[0].status, None);
     }
 
     #[test]

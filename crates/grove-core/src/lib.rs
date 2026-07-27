@@ -9,6 +9,7 @@
 pub mod atomic;
 pub mod config;
 pub mod config_write;
+pub mod desktop;
 pub mod error;
 pub mod git;
 pub mod ids;

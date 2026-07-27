@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::git::WorktreeEntry;
 use crate::git::status::StatusSummary;
 use crate::ids;
+use crate::status::SessionStatus;
 
 /// A registered Git repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +120,13 @@ pub struct Worktree {
     /// means "not read yet", which the UI shows as nothing rather than as
     /// "clean".
     pub git_status: Option<StatusSummary>,
+    /// Session status from the poller (Milestone 4). `None` means either that
+    /// there is no session or that no poll has landed yet; both show no pill
+    /// rather than a guessed one.
+    pub status: Option<SessionStatus>,
+    /// The message from the last `grove notify` for this worktree, shown while
+    /// its status is still the one that message reported.
+    pub status_message: Option<String>,
 }
 
 impl Worktree {
@@ -144,6 +152,8 @@ impl Worktree {
             prune_reason: entry.prune_reason.clone(),
             session: SessionPresence::None,
             git_status: None,
+            status: None,
+            status_message: None,
         }
     }
 
@@ -173,7 +183,15 @@ impl Worktree {
         if let Some(status) = &self.git_status {
             parts.push(status.summary());
         }
-        parts.push(self.session.label().to_string());
+        // The session status replaces the bare "session" label once a poll has
+        // landed: "working" already says the session exists.
+        match self.status.filter(|_| self.session.exists()) {
+            Some(status) => parts.push(match self.session {
+                SessionPresence::Attached => format!("{} · attached", status.label()),
+                _ => status.label().to_string(),
+            }),
+            None => parts.push(self.session.label().to_string()),
+        }
         if self.is_detached {
             parts.push("detached".to_string());
         }
@@ -344,6 +362,26 @@ mod tests {
             worktree.sublabel(),
             "session · attached · detached · locked: removable drive · prunable"
         );
+    }
+
+    #[test]
+    fn a_polled_status_replaces_the_bare_session_label() {
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        assert_eq!(worktree.sublabel(), "working");
+
+        worktree.session = SessionPresence::Attached;
+        worktree.status = Some(SessionStatus::Attention);
+        assert_eq!(worktree.sublabel(), "attention · attached");
+    }
+
+    #[test]
+    fn a_status_without_a_session_is_never_shown() {
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        worktree.session = SessionPresence::None;
+        worktree.status = Some(SessionStatus::Working);
+        assert_eq!(worktree.sublabel(), "no session");
     }
 
     #[test]
