@@ -240,6 +240,17 @@ pub fn warning(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.circle_filled(at(rect, 0.5, 0.75), stroke.width * 0.6, color);
 }
 
+/// The attention bang from DESIGN.md §6: a stroke over a dot, sized to sit in
+/// a row's session-dot slot.
+///
+/// Drawn rather than typed: egui's bundled fonts have no glyph for most of the
+/// marks the mockup uses, and a missing glyph renders as tofu.
+pub fn bang(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(line_width(rect).max(1.4), color);
+    path(painter, rect, &[(0.5, 0.06), (0.5, 0.58)], false, stroke);
+    painter.circle_filled(at(rect, 0.5, 0.87), stroke.width * 0.72, color);
+}
+
 // ---------------------------------------------------------------- widgets
 
 /// A square icon button with the mockup's chip background.

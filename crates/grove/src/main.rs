@@ -4,6 +4,7 @@
 
 mod app;
 mod notify;
+mod status_watch;
 mod ui;
 mod workers;
 

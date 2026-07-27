@@ -62,13 +62,12 @@ pub const DANGER_FILL: Color32 = Color32::from_rgb(0x2e, 0x14, 0x14);
 /// dirty marker on a row.
 pub const WARNING: Color32 = Color32::from_rgb(0xe0, 0xa4, 0x4a);
 
-/// Reserved for Milestone 4's `WORKING` state (mockup `#4bc07d`). Nothing may
-/// paint with it until a poller actually computes that state.
-#[allow(dead_code)]
+/// The `WORKING` state from the mockup (`#4bc07d`).
 pub const STATUS_WORKING: Color32 = Color32::from_rgb(0x4b, 0xc0, 0x7d);
-/// Reserved for Milestone 4's `ACTION` state — the same amber as [`WARNING`].
-#[allow(dead_code)]
+/// The `ACTION` state — the same amber as [`WARNING`].
 pub const STATUS_ATTENTION: Color32 = WARNING;
+// There is deliberately no STATUS_IDLE: idle is the resting state and keeps
+// the neutral DOT_IDLE, so the two states that matter can stand out.
 
 // ---------------------------------------------------------------- geometry
 

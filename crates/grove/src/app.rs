@@ -9,9 +9,11 @@ use grove_core::config::Config;
 use grove_core::git::StatusSummary;
 use grove_core::model::{Project, SessionPresence};
 use grove_core::state::{ProjectRecord, State};
+use grove_core::status::SessionStatus;
 use grove_core::workflow::Activation;
 use grove_core::{Paths, state};
 
+use crate::status_watch::{Control, StatusWatch, WorktreeLabel};
 use crate::ui::chrome::Detached;
 use crate::ui::dialogs::create_worktree::CreateForm;
 use crate::ui::dialogs::removal::{RemovalForm, Request};
@@ -22,7 +24,12 @@ pub struct GroveApp {
     paths: Paths,
     home: Option<PathBuf>,
     workers: Workers,
+    /// The status poller and the `grove notify` listener (Milestone 4).
+    watch: StatusWatch,
     messages: Receiver<Message>,
+    /// Last polled status per worktree id, kept so a refreshed worktree list
+    /// shows its status immediately instead of blank until the next poll.
+    statuses: HashMap<String, SessionStatus>,
 
     config: Option<Config>,
     state: State,
@@ -53,6 +60,7 @@ impl GroveApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> Self {
         theme::apply(&cc.egui_ctx);
         let (workers, messages) = Workers::start(paths.clone(), cc.egui_ctx.clone());
+        let watch = StatusWatch::start(&paths, workers.message_sender(), cc.egui_ctx.clone());
 
         // Reading two small TOML files on the UI thread is fine; running a
         // subprocess here would not be, which is why config loading (it may
@@ -90,7 +98,9 @@ impl GroveApp {
             home: std::env::var_os("HOME").map(PathBuf::from),
             paths,
             workers,
+            watch,
             messages,
+            statuses: HashMap::new(),
             config: None,
             state: loaded,
             projects,
@@ -119,6 +129,8 @@ impl GroveApp {
                     if let Some(form) = self.settings.get_mut() {
                         form.reloaded(&loaded.config);
                     }
+                    self.watch
+                        .send(Control::Reconfigure(Box::new(loaded.config.status.clone())));
                     self.config = Some(loaded.config);
                 }
                 Message::ConfigSaved { path } => {
@@ -172,12 +184,25 @@ impl GroveApp {
                             self.pending_selection = None;
                         }
                     }
+                    // A fresh list arrives with no statuses on it; re-stamp
+                    // the last poll rather than blanking every pill.
+                    self.apply_session_statuses();
+                    self.describe_worktrees();
                 }
                 Message::StatusesRefreshed {
                     project_id,
                     statuses,
                 } => self.apply_statuses(&project_id, &statuses),
                 Message::SessionsRefreshed(presence) => self.apply_presence(&presence),
+                Message::StatusPolled(statuses) => {
+                    self.statuses = statuses;
+                    self.apply_session_statuses();
+                }
+                Message::Notified {
+                    worktree_id,
+                    state,
+                    message,
+                } => self.apply_notification(&worktree_id, state, message),
                 Message::BaseRefsLoaded {
                     project_id,
                     refs,
@@ -221,6 +246,10 @@ impl GroveApp {
                     if let Some(form) = self.removal.get_mut()
                         && form.project_id == project_id
                     {
+                        // The session or the worktree is gone; its latch
+                        // would otherwise outlive it until the next poll.
+                        self.watch.forget(&form.worktree_id);
+                        self.statuses.remove(&form.worktree_id);
                         form.note_done(operation, detail);
                     }
                 }
@@ -308,6 +337,82 @@ impl GroveApp {
         for project in &mut self.projects {
             grove_core::workflow::apply_session_presence(&mut project.worktrees, presence);
         }
+        // Presence just changed, so a row that lost its session must lose its
+        // status with it rather than waiting for the next poll.
+        self.apply_session_statuses();
+    }
+
+    /// Stamp the last polled statuses onto every row.
+    fn apply_session_statuses(&mut self) {
+        for project in &mut self.projects {
+            grove_core::workflow::apply_session_status(&mut project.worktrees, &self.statuses);
+        }
+    }
+
+    /// An explicit `grove notify` report: show its message straight away.
+    ///
+    /// The status itself is left to the poller, which re-reads tmux a moment
+    /// later — except for attention, which is latched in the engine and would
+    /// otherwise not show until that poll lands.
+    fn apply_notification(
+        &mut self,
+        worktree_id: &str,
+        state: SessionStatus,
+        message: Option<String>,
+    ) {
+        if state == SessionStatus::Attention {
+            self.statuses
+                .insert(worktree_id.to_string(), SessionStatus::Attention);
+        }
+        for project in &mut self.projects {
+            if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
+                worktree.status_message = message.clone();
+                if state == SessionStatus::Attention && worktree.session.exists() {
+                    worktree.status = Some(SessionStatus::Attention);
+                }
+            }
+        }
+    }
+
+    /// Opening a session is what clears its attention: the in-memory latch
+    /// here, and the durable tmux option on the worker.
+    ///
+    /// Both halves must go, or the next poll would read the option back and
+    /// re-raise attention the user has just answered.
+    fn clear_attention(&mut self, worktree_id: &str, session: &str) {
+        if !self.watch.opened(worktree_id) {
+            return;
+        }
+        self.statuses.remove(worktree_id);
+        for project in &mut self.projects {
+            if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
+                worktree.status = None;
+                worktree.status_message = None;
+            }
+        }
+        self.workers.send(Task::ClearAttention {
+            session: session.to_string(),
+        });
+    }
+
+    /// Tell the poller what to call each worktree in a desktop notification.
+    fn describe_worktrees(&self) {
+        let labels: HashMap<String, WorktreeLabel> = self
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project.worktrees.iter().map(|worktree| {
+                    (
+                        worktree.id.clone(),
+                        WorktreeLabel {
+                            project: project.name.clone(),
+                            worktree: worktree.label(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        self.watch.send(Control::Describe(labels));
     }
 
     fn save_state(&self) {
@@ -359,12 +464,14 @@ impl GroveApp {
                 if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
                     && let Some(worktree) = project.worktree(&worktree_id)
                 {
-                    self.selected = Some(worktree_id);
+                    let session = worktree.session_name();
                     self.workers.send(Task::Activate {
                         project_name: project.name.clone(),
                         git_common_dir: project.git_common_dir.clone(),
                         worktree: Box::new(worktree.clone()),
                     });
+                    self.clear_attention(&worktree_id, &session);
+                    self.selected = Some(worktree_id);
                 }
             }
             Action::SelectWorktree { worktree_id, .. } => self.selected = Some(worktree_id),

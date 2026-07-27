@@ -4,6 +4,7 @@
 
 use egui::{Align, Layout, Sense, Stroke, StrokeKind, Ui, vec2};
 use grove_core::model::{SessionPresence, Worktree};
+use grove_core::status::SessionStatus;
 
 use super::{icons, theme};
 
@@ -107,27 +108,38 @@ pub fn show(
             painter.rect_filled(rect, radius, theme::FIELD.gamma_multiply(0.7));
         }
 
-        // The accent edge slot from direction 1c. Neutral for now: it carries
-        // selection only. Milestone 4 colours it by status.
-        if selected || hovered {
+        // The accent edge slot from direction 1c. It carries the status once
+        // there is one, and selection otherwise.
+        let edge_color = match (status_color(worktree), selected, hovered) {
+            (Some(status), _, _) => Some(status),
+            (None, true, _) => Some(theme::ACCENT),
+            (None, false, true) => Some(theme::HAIRLINE),
+            (None, false, false) => None,
+        };
+        if let Some(color) = edge_color {
             let edge = egui::Rect::from_min_size(rect.min, vec2(theme::ROW_EDGE, rect.height()));
-            let color = if selected {
-                theme::ACCENT
-            } else {
-                theme::HAIRLINE
-            };
             painter.rect_filled(edge, radius, color);
         }
 
         let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
-        match worktree.session {
-            SessionPresence::None => {
+        match (worktree.session, worktree.status) {
+            // Attention gets its own mark, not just a colour: it is the one
+            // state the user has to act on, and colour alone is not enough.
+            (session, Some(SessionStatus::Attention)) if session.exists() => icons::bang(
+                painter,
+                egui::Rect::from_center_size(dot_center, egui::Vec2::splat(11.0)),
+                theme::STATUS_ATTENTION,
+            ),
+            (session, Some(SessionStatus::Working)) if session.exists() => {
+                painter.circle_filled(dot_center, 4.0, theme::STATUS_WORKING);
+            }
+            (SessionPresence::None, _) => {
                 painter.circle_stroke(dot_center, 4.0, Stroke::new(1.4, theme::DOT_EMPTY));
             }
-            SessionPresence::Detached => {
+            (SessionPresence::Detached, _) => {
                 painter.circle_filled(dot_center, 4.0, theme::DOT_IDLE);
             }
-            SessionPresence::Attached => {
+            (SessionPresence::Attached, _) => {
                 painter.circle_filled(dot_center, 4.0, theme::TEXT_DIM);
             }
         }
@@ -240,6 +252,15 @@ pub fn show(
 /// Tooltip lines after the path: the git summary and what each marker means.
 fn hover_lines(worktree: &Worktree) -> Vec<String> {
     let mut lines = Vec::new();
+    // What an agent said about itself comes first: it is the only line here
+    // the user could not have worked out from the row.
+    if let Some(message) = worktree
+        .status_message
+        .as_deref()
+        .filter(|_| worktree.session.exists())
+    {
+        lines.push(message.to_string());
+    }
     if let Some(status) = &worktree.git_status {
         lines.push(status.summary());
     }
@@ -266,6 +287,21 @@ fn markers(worktree: &Worktree) -> Markers {
         markers.push(Marker::Dirty);
     }
     markers
+}
+
+/// The accent colour a row's status earns, if any.
+///
+/// Idle earns none: an idle session is the resting state, and colouring every
+/// resting row would leave nothing for the two that matter to stand out from.
+fn status_color(worktree: &Worktree) -> Option<egui::Color32> {
+    if !worktree.session.exists() {
+        return None;
+    }
+    match worktree.status? {
+        SessionStatus::Attention => Some(theme::STATUS_ATTENTION),
+        SessionStatus::Working => Some(theme::STATUS_WORKING),
+        SessionStatus::Idle => None,
+    }
 }
 
 fn sublabel_color(worktree: &Worktree) -> egui::Color32 {
@@ -299,6 +335,56 @@ mod tests {
             Path::new("/home/u/proj/.git"),
             false,
         )
+    }
+
+    #[test]
+    fn only_working_and_attention_colour_the_row() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+
+        worktree.status = Some(SessionStatus::Attention);
+        assert_eq!(status_color(&worktree), Some(theme::STATUS_ATTENTION));
+
+        worktree.status = Some(SessionStatus::Working);
+        assert_eq!(status_color(&worktree), Some(theme::STATUS_WORKING));
+
+        worktree.status = Some(SessionStatus::Idle);
+        assert_eq!(
+            status_color(&worktree),
+            None,
+            "idle is the resting state and earns no accent"
+        );
+
+        worktree.status = None;
+        assert_eq!(status_color(&worktree), None);
+    }
+
+    #[test]
+    fn a_worktree_with_no_session_is_never_coloured_by_status() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::None;
+        worktree.status = Some(SessionStatus::Attention);
+        assert_eq!(status_color(&worktree), None);
+    }
+
+    #[test]
+    fn an_agents_message_leads_the_tooltip() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status_message = Some("needs permission to run tests".into());
+        worktree.git_status = Some(StatusSummary::default());
+        assert_eq!(
+            hover_lines(&worktree).first().map(String::as_str),
+            Some("needs permission to run tests")
+        );
+    }
+
+    #[test]
+    fn a_message_without_a_session_is_not_shown() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::None;
+        worktree.status_message = Some("stale".into());
+        assert!(!hover_lines(&worktree).iter().any(|l| l == "stale"));
     }
 
     #[test]

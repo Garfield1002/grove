@@ -20,6 +20,7 @@ use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::process::Invocation;
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
+use grove_core::status::SessionStatus;
 use grove_core::workflow::{self, Activation};
 use grove_core::{Error, Paths, TmuxServer, config, git, state, terminal, tmux};
 
@@ -44,6 +45,12 @@ pub enum Task {
     },
     /// Re-read session presence only.
     RefreshSessions,
+    /// Unset `@grove_attention` on a session the user has just opened.
+    ///
+    /// The in-memory latch is cleared on the UI thread; this clears the
+    /// durable half, which is what would otherwise re-raise attention on the
+    /// next poll or after a restart.
+    ClearAttention { session: String },
     /// Open a worktree: ensure the session, then switch or launch.
     Activate {
         project_name: String,
@@ -175,6 +182,15 @@ pub enum Message {
         statuses: HashMap<String, StatusSummary>,
     },
     SessionsRefreshed(HashMap<String, SessionPresence>),
+    /// One poll of the status engine, keyed by worktree id. Sent by the
+    /// poller thread, not by the worker.
+    StatusPolled(HashMap<String, SessionStatus>),
+    /// An explicit `grove notify` report arrived over the socket.
+    Notified {
+        worktree_id: String,
+        state: SessionStatus,
+        message: Option<String>,
+    },
     Activated {
         worktree_id: String,
         activation: Activation,
@@ -233,6 +249,9 @@ pub enum Message {
 /// Handle used by the UI to queue work.
 pub struct Workers {
     tx: Sender<Task>,
+    /// A spare sender for the message channel, so the poller and the notify
+    /// listener can report into the same queue the UI already drains.
+    messages: Sender<Message>,
 }
 
 impl Workers {
@@ -245,14 +264,26 @@ impl Workers {
         // If the thread cannot be spawned the UI still runs; tasks then queue
         // up unanswered rather than crashing the app.
         let own_tx = task_tx.clone();
+        let worker_tx = msg_tx.clone();
         let spawned = std::thread::Builder::new()
             .name("grove-worker".into())
-            .spawn(move || run(paths, task_rx, own_tx, msg_tx.clone(), ctx.clone()));
+            .spawn(move || run(paths, task_rx, own_tx, worker_tx, ctx.clone()));
         if let Err(e) = spawned {
             eprintln!("grove: could not start the worker thread: {e}");
         }
 
-        (Self { tx: task_tx }, msg_rx)
+        (
+            Self {
+                tx: task_tx,
+                messages: msg_tx,
+            },
+            msg_rx,
+        )
+    }
+
+    /// A sender for the UI's message queue, for the status threads.
+    pub fn message_sender(&self) -> Sender<Message> {
+        self.messages.clone()
     }
 
     /// Queue a task. A closed channel means the worker died; the UI keeps
@@ -396,6 +427,18 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             project_id,
             statuses: workflow::worktree_statuses(&worktrees),
         }],
+
+        Task::ClearAttention { session } => {
+            match tmux::session::clear_attention(&worker.server, &session) {
+                // Nothing to report either way: the row already stopped
+                // showing attention when the latch was cleared.
+                Ok(_) => Vec::new(),
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    "could not clear the session's attention marker",
+                    &e,
+                ))],
+            }
+        }
 
         Task::RefreshSessions => match workflow::session_presence(&worker.server) {
             Ok(presence) => vec![Message::SessionsRefreshed(presence)],
