@@ -593,6 +593,12 @@ mod tests {
         assert!(document.contains("set -s exit-empty off"));
         // The wheel is dead without this: tmux holds the alternate screen.
         assert!(document.contains("set -g mouse on"));
+        // Grove is the session-and-window UI; tmux's own status bar is a
+        // second one saying the same thing.
+        assert!(document.contains("set -g status off"));
+        // Scrollbars are a window option, so `-wg` and not `-g`.
+        assert!(document.contains("set -wg pane-scrollbars on"));
+        assert!(document.contains("set -wg pane-scrollbars-style"));
         // Shift+Enter reaches the pane only as a CSI-u sequence, and only
         // when the outer terminal is declared able to carry extended keys.
         // `always` rather than `on`: tmux otherwise waits for the application
