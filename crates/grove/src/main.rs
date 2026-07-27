@@ -43,6 +43,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Grove")
             .with_app_id("grove")
+            // Grove draws its own header, so the compositor's (or winit's)
+            // title bar would be a second, redundant one. Dropping it means
+            // dropping the drag handle with it: `app::GroveApp::header` makes
+            // the header bar itself draggable, and Ctrl+Q / Ctrl+W close the
+            // window since there is no close button either.
+            .with_decorations(false)
             .with_inner_size(ui::theme::WINDOW_SIZE)
             .with_min_inner_size(ui::theme::MIN_WINDOW_SIZE),
         ..Default::default()
