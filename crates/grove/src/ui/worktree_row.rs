@@ -176,6 +176,10 @@ const MARKER_SIZE: f32 = 11.0;
 /// The processor glyph beside the resource figures. Small: it labels the
 /// numbers rather than competing with them.
 const CPU_ICON: f32 = 9.0;
+/// How far a window row sits inside its worktree's header. Small on purpose:
+/// enough to read as "under this", not so much that the names stop lining up
+/// down the list.
+const WINDOW_INDENT: f32 = 14.0;
 
 /// Draw a leaf row for a worktree, named after whatever it stands for.
 pub fn show(
@@ -188,7 +192,24 @@ pub fn show(
     let project = stands.as_project();
     let mut action = None;
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, theme::ROW_HEIGHT), Sense::click());
+    let (outer, _) = ui.allocate_exact_size(vec2(width, theme::ROW_HEIGHT), Sense::hover());
+    // Only a row under a worktree header is indented: a row that stands for
+    // the worktree (or the project) is the top level there is.
+    let rect = match stands.as_window() {
+        Some(_) => outer.with_min_x(outer.left() + WINDOW_INDENT),
+        None => outer,
+    };
+    // The row is interacted with at its drawn width, so the indent is a gutter
+    // and not a click target that looks like nothing.
+    let response = ui.interact(
+        rect,
+        ui.id().with((
+            "grove-leaf",
+            &worktree.id,
+            stands.as_window().map(|window| window.index),
+        )),
+        Sense::click(),
+    );
     let hovered = response.hovered();
 
     // Right edge of the text column, moved left by whatever markers exist.
