@@ -201,6 +201,63 @@ fn opening_a_new_window_adds_a_shell_beside_the_first() {
 }
 
 #[test]
+fn a_new_window_shows_up_in_the_worktree_s_window_list() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let git_common_dir = worktree.join(".git");
+
+    let test = TestServer::new();
+    let mut wt = worktree_at(&worktree, &git_common_dir, "main");
+
+    workflow::open_new_window(&test.server, "acme-web", &git_common_dir, &wt).expect("opens one");
+    workflow::open_new_window(&test.server, "acme-web", &git_common_dir, &wt).expect("opens two");
+
+    let windows = workflow::session_windows(&test.server).expect("lists windows");
+    workflow::apply_session_windows(std::slice::from_mut(&mut wt), &windows);
+    assert_eq!(
+        wt.windows.len(),
+        3,
+        "the session's own shell plus the two opened: {:?}",
+        wt.windows
+    );
+    assert_eq!(
+        wt.windows.iter().filter(|w| w.active).count(),
+        1,
+        "exactly one window is current"
+    );
+
+    // Selecting a window is what a click on its row does; the next poll must
+    // report it as the current one.
+    let first = wt.windows[0].target();
+    tmux::select_window(&test.server, &first).expect("selects the first window");
+    let windows = workflow::session_windows(&test.server).expect("lists windows again");
+    workflow::apply_session_windows(std::slice::from_mut(&mut wt), &windows);
+    assert!(
+        wt.windows[0].active,
+        "the selected window is the session's current one: {:?}",
+        wt.windows
+    );
+}
+
+#[test]
+fn selecting_a_window_that_has_gone_is_not_an_error() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let git_common_dir = worktree.join(".git");
+
+    let test = TestServer::new();
+    let wt = worktree_at(&worktree, &git_common_dir, "main");
+    workflow::open_new_window(&test.server, "acme-web", &git_common_dir, &wt).expect("opens one");
+
+    // A window index the poll reported a moment ago can be gone by the time
+    // the user clicks it. The session is still worth opening.
+    tmux::select_window(&test.server, &format!("{}:99", wt.session_name()))
+        .expect("a missing window is not an error");
+}
+
+#[test]
 fn ensure_session_is_idempotent() {
     require!("tmux");
     let dir = tempfile::tempdir().expect("tempdir");

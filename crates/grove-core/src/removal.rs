@@ -298,6 +298,17 @@ mod tests {
         }
     }
 
+    fn pane(session: &str, pid: u32, command: &str) -> PaneInfo {
+        PaneInfo {
+            session: session.into(),
+            pid,
+            command: command.into(),
+            window_index: 0,
+            window_name: "shell".into(),
+            window_active: true,
+        }
+    }
+
     fn texts(report: &RemovalReport) -> String {
         report
             .findings
@@ -457,16 +468,8 @@ mod tests {
         let report = assemble(&RemovalInputs {
             session: Some("wt-a1b2c3".into()),
             panes: vec![
-                PaneInfo {
-                    session: "wt-a1b2c3".into(),
-                    pid: 4242,
-                    command: "bash".into(),
-                },
-                PaneInfo {
-                    session: "wt-a1b2c3".into(),
-                    pid: 4343,
-                    command: "cargo".into(),
-                },
+                pane("wt-a1b2c3", 4242, "bash"),
+                pane("wt-a1b2c3", 4343, "cargo"),
             ],
             ..safe_inputs()
         });
@@ -484,11 +487,7 @@ mod tests {
     fn a_session_of_idle_shells_is_only_a_note() {
         let report = assemble(&RemovalInputs {
             session: Some("wt-a1b2c3".into()),
-            panes: vec![PaneInfo {
-                session: "wt-a1b2c3".into(),
-                pid: 1,
-                command: "-zsh".into(),
-            }],
+            panes: vec![pane("wt-a1b2c3", 1, "-zsh")],
             ..safe_inputs()
         });
         assert_eq!(report.warnings().count(), 0);
@@ -528,11 +527,7 @@ mod tests {
             }),
             unpushed: Unpushed::Count(2),
             session: Some("wt-a1b2c3".into()),
-            panes: vec![PaneInfo {
-                session: "wt-a1b2c3".into(),
-                pid: 9,
-                command: "claude".into(),
-            }],
+            panes: vec![pane("wt-a1b2c3", 9, "claude")],
             ..safe_inputs()
         });
         // main + locked + staged + untracked + unpushed + running session

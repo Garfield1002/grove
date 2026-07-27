@@ -251,6 +251,15 @@ impl Poller {
         for worktree_id in raised {
             self.announce(&worktree_id, None);
         }
+        // The poll already listed every pane, so the windows come free with
+        // it: this is what keeps the tree's child rows current when a window
+        // is created inside tmux rather than from Grove.
+        self.emit(Message::WindowsPolled(workflow::group_windows(
+            signals
+                .values()
+                .flat_map(|signal| signal.windows.iter().cloned())
+                .collect(),
+        )));
         self.emit(Message::StatusPolled(reports));
 
         if git_refresh_due(self.last_git_refresh, now) {

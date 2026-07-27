@@ -22,6 +22,7 @@ use grove_core::reconcile::{self, ProjectRef, Reconciliation};
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
 use grove_core::status::{SessionReport, SessionStatus};
+use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{self, Activation, NewWindow};
 use grove_core::{Error, Paths, TmuxServer, config, git, state, terminal, tmux};
 
@@ -87,6 +88,14 @@ pub enum Task {
         project_name: String,
         git_common_dir: PathBuf,
         worktree: Box<Worktree>,
+    },
+    /// Open one window of a worktree's session: ensure the session, select the
+    /// window, then switch or launch.
+    ActivateWindow {
+        project_name: String,
+        git_common_dir: PathBuf,
+        worktree: Box<Worktree>,
+        window_index: u32,
     },
     /// Attach an additional terminal without retargeting the primary client.
     OpenInNewTerminal {
@@ -224,7 +233,13 @@ pub enum Message {
         project_id: String,
         statuses: HashMap<String, StatusSummary>,
     },
-    SessionsRefreshed(HashMap<String, SessionPresence>),
+    /// Session presence and each session's windows, both keyed by tmux session
+    /// name. They travel together because a row's child rows must not lag its
+    /// "no session" line.
+    SessionsRefreshed {
+        presence: HashMap<String, SessionPresence>,
+        windows: HashMap<String, Vec<WindowInfo>>,
+    },
     /// One reconciliation pass: every project's rows, plus the orphaned
     /// sessions the user is being offered a choice about.
     Reconciled(Box<Reconciliation>),
@@ -250,6 +265,9 @@ pub enum Message {
     /// One poll of the status engine, keyed by worktree id. Sent by the
     /// poller thread, not by the worker.
     StatusPolled(HashMap<String, SessionReport>),
+    /// The windows every Grove session has, keyed by tmux session name. Comes
+    /// from the same poll, so a window opened inside tmux shows up too.
+    WindowsPolled(HashMap<String, Vec<WindowInfo>>),
     /// The git-status cadence elapsed. The poller cannot run git itself: it
     /// has no worktree lists, so the UI turns this into per-project refreshes.
     GitStatusDue,
@@ -610,13 +628,17 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             }
         }
 
-        Task::RefreshSessions => match workflow::session_presence(&worker.server) {
-            Ok(presence) => vec![Message::SessionsRefreshed(presence)],
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                "could not list tmux sessions",
-                &e,
-            ))],
-        },
+        Task::RefreshSessions => {
+            match workflow::session_presence(&worker.server)
+                .and_then(|presence| Ok((presence, workflow::session_windows(&worker.server)?)))
+            {
+                Ok((presence, windows)) => vec![Message::SessionsRefreshed { presence, windows }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    "could not list tmux sessions",
+                    &e,
+                ))],
+            }
+        }
 
         Task::Activate {
             project_name,
@@ -650,6 +672,39 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     messages
                 }
             }
+        }
+
+        Task::ActivateWindow {
+            project_name,
+            git_common_dir,
+            worktree,
+            window_index,
+        } => {
+            let worktree_id = worktree.id.clone();
+            let mut messages = match workflow::activate_window(
+                &worker.server,
+                &worker.config,
+                &project_name,
+                &git_common_dir,
+                &worktree,
+                window_index,
+            ) {
+                Ok(activation) => vec![Message::Activated {
+                    worktree_id,
+                    activation,
+                }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!(
+                        "could not open window {window_index} of {}",
+                        worktree.label()
+                    ),
+                    &e,
+                ))],
+            };
+            // The session may have been created, and the active window has
+            // moved: both are things the tree shows.
+            messages.extend(handle(worker, Task::RefreshSessions));
+            messages
         }
 
         Task::OpenInNewTerminal {

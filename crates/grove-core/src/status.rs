@@ -125,6 +125,9 @@ pub struct SessionSignals {
     /// is on and the scope could be read. `None` means "no figure", which the
     /// UI shows as nothing rather than as zero.
     pub usage: Option<crate::cgroup::Usage>,
+    /// The session's windows, carried along because the poll already lists
+    /// every pane. Not a status signal: the tree renders these as child rows.
+    pub windows: Vec<crate::tmux::WindowInfo>,
 }
 
 /// Age of an activity timestamp, in whole seconds since the epoch.
@@ -387,6 +390,7 @@ mod tests {
             attention_flag: true,
             bell: false,
             usage: None,
+            windows: Vec::new(),
         };
         assert_eq!(
             classify(&signals, &StatusPolicy::default()),

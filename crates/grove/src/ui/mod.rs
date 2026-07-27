@@ -10,6 +10,7 @@ pub mod project_list;
 pub mod settings;
 pub mod theme;
 pub mod window_edge;
+pub mod window_row;
 pub mod worktree_row;
 
 /// Was the binary built with the native directory picker (`rfd`, which goes
@@ -47,6 +48,12 @@ pub enum Action {
     OpenNewWindow {
         project_id: String,
         worktree_id: String,
+    },
+    /// Open one existing tmux window of a worktree's session.
+    ActivateWindow {
+        project_id: String,
+        worktree_id: String,
+        window_index: u32,
     },
     /// Start the configured agent in a worktree's session.
     StartAgent {

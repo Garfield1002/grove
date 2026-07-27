@@ -113,8 +113,9 @@ impl SessionInfo {
             pane_commands,
             attention_flag: self.attention,
             bell: self.bell,
-            // Filled in by the poller, which has the pane pids to resolve.
+            // Both filled in by the poller, which has the pane listing.
             usage: None,
+            windows: Vec::new(),
         }
     }
 }
@@ -246,6 +247,28 @@ pub fn new_window(server: &TmuxServer, session: &str, worktree: &Path) -> Result
         .run(new_window_args(session, worktree))?
         .trim()
         .to_string())
+}
+
+/// Build the `select-window` invocation making one window the session's
+/// current one.
+pub fn select_window_args(target: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("select-window"),
+        OsString::from("-t"),
+        OsString::from(target),
+    ]
+}
+
+/// Make a window current, so a client attaching or switching lands on it.
+///
+/// A window that has gone between the last poll and the click is not an
+/// error: the session is still worth opening, on whatever window it has.
+pub fn select_window(server: &TmuxServer, target: &str) -> Result<()> {
+    let out = server.run_allow_failure(select_window_args(target))?;
+    if out.success || TmuxServer::is_missing_target(&out.stderr) {
+        return Ok(());
+    }
+    Err(out.failure.into())
 }
 
 /// Build one `set-option -t <session> <name> <value>` invocation.
@@ -411,10 +434,58 @@ pub struct PaneInfo {
     pub pid: u32,
     /// `pane_current_command` as tmux reports it.
     pub command: String,
+    /// The window this pane belongs to.
+    pub window_index: u32,
+    pub window_name: String,
+    /// This is the session's current window.
+    pub window_active: bool,
+}
+
+/// A window of a session, as the tree lists it under a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub session: String,
+    pub index: u32,
+    pub name: String,
+    /// The session's current window — where an attaching client lands.
+    pub active: bool,
+}
+
+impl WindowInfo {
+    /// `session:index`, the target a tmux command takes.
+    pub fn target(&self) -> String {
+        format!("{}:{}", self.session, self.index)
+    }
+}
+
+/// Collapse a pane listing into the windows those panes live in.
+///
+/// Windows are derived from the pane listing rather than read with a separate
+/// `list-windows`: the status poll already runs `list-panes -a` every couple
+/// of seconds, and a window always has at least one pane, so this costs no
+/// extra subprocess. Windows come back ordered by session then index, which is
+/// the order the tree shows them in.
+pub fn windows_of(panes: &[PaneInfo]) -> Vec<WindowInfo> {
+    let mut windows: std::collections::BTreeMap<(&str, u32), WindowInfo> =
+        std::collections::BTreeMap::new();
+    for pane in panes {
+        windows
+            .entry((pane.session.as_str(), pane.window_index))
+            .or_insert_with(|| WindowInfo {
+                session: pane.session.clone(),
+                index: pane.window_index,
+                name: pane.window_name.clone(),
+                active: pane.window_active,
+            });
+    }
+    windows.into_values().collect()
 }
 
 const PANE_SOURCE: &str = "tmux list-panes";
-const PANE_FORMAT: &str = "#{session_name}\u{1}#{pane_pid}\u{1}#{pane_current_command}";
+const PANE_FORMAT: &str = concat!(
+    "#{session_name}\u{1}#{pane_pid}\u{1}#{pane_current_command}",
+    "\u{1}#{window_index}\u{1}#{window_name}\u{1}#{window_active}",
+);
 
 /// Parse the output of `list-panes -F` with [`PANE_FORMAT`].
 pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseError> {
@@ -425,22 +496,45 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             continue;
         }
         let mut fields = line.split(SEP);
-        let (Some(session), Some(pid), Some(command)) =
-            (fields.next(), fields.next(), fields.next())
+        let (
+            Some(session),
+            Some(pid),
+            Some(command),
+            Some(window_index),
+            Some(window_name),
+            Some(window_active),
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
         else {
             return Err(ParseError::new(
                 PANE_SOURCE,
                 index + 1,
-                "expected session, pid and command",
+                "expected session, pid, command and window fields",
             ));
         };
         let pid = pid.trim().parse::<u32>().map_err(|_| {
             ParseError::new(PANE_SOURCE, index + 1, format!("`{pid}` is not a pid"))
         })?;
+        let window_index = window_index.trim().parse::<u32>().map_err(|_| {
+            ParseError::new(
+                PANE_SOURCE,
+                index + 1,
+                format!("`{window_index}` is not a window index"),
+            )
+        })?;
         panes.push(PaneInfo {
             session: session.to_string(),
             pid,
             command: command.trim().to_string(),
+            window_index,
+            window_name: window_name.to_string(),
+            window_active: window_active.trim() == "1",
         });
     }
     Ok(panes)
@@ -772,13 +866,27 @@ mod tests {
 
     #[test]
     fn parses_a_pane_listing() {
-        let text = "wt-a1b2c3\u{1}4242\u{1}bash\nwt-a1b2c3\u{1}4343\u{1}cargo\n";
+        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\n\
+                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\n";
         let panes = parse_panes(text).expect("valid");
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].session, "wt-a1b2c3");
         assert_eq!(panes[0].pid, 4242);
         assert_eq!(panes[0].command, "bash");
+        assert_eq!(panes[0].window_index, 0);
+        assert_eq!(panes[0].window_name, "shell");
+        assert!(panes[0].window_active);
         assert_eq!(panes[1].command, "cargo");
+        assert_eq!(panes[1].window_index, 1);
+        assert_eq!(panes[1].window_name, "agent");
+        assert!(!panes[1].window_active);
+    }
+
+    #[test]
+    fn a_window_name_may_hold_spaces_and_colons() {
+        let panes =
+            parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\n").expect("valid");
+        assert_eq!(panes[0].window_name, "notes: draft");
     }
 
     #[test]
@@ -789,14 +897,52 @@ mod tests {
 
     #[test]
     fn rejects_a_truncated_pane_line() {
-        let err = parse_panes("wt-a1b2c3\u{1}4242\n").expect_err("truncated");
-        assert!(err.reason.contains("expected session, pid and command"));
+        let err = parse_panes("wt-a1b2c3\u{1}4242\u{1}bash\n").expect_err("truncated");
+        assert!(err.reason.contains("expected session, pid, command"));
     }
 
     #[test]
     fn rejects_a_non_numeric_pid() {
-        let err = parse_panes("wt-a1b2c3\u{1}none\u{1}bash\n").expect_err("bad pid");
+        let err = parse_panes("wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\n")
+            .expect_err("bad pid");
         assert!(err.reason.contains("is not a pid"));
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_window_index() {
+        let err = parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\n")
+            .expect_err("bad window index");
+        assert!(err.reason.contains("is not a window index"));
+    }
+
+    #[test]
+    fn panes_collapse_into_their_windows() {
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\n\
+                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\n\
+                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\n\
+                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\n";
+        let windows = windows_of(&parse_panes(text).expect("valid"));
+        assert_eq!(windows.len(), 3, "two panes of window 0 are one window");
+        assert_eq!(windows[0].target(), "wt-a1b2c3:0");
+        assert_eq!(windows[0].name, "shell");
+        assert!(windows[0].active);
+        assert_eq!(windows[1].target(), "wt-a1b2c3:1");
+        assert_eq!(windows[1].name, "agent");
+        assert!(!windows[1].active);
+        assert_eq!(windows[2].session, "wt-ddeeff");
+    }
+
+    #[test]
+    fn windows_of_no_panes_is_empty() {
+        assert!(windows_of(&[]).is_empty());
+    }
+
+    #[test]
+    fn select_window_targets_a_session_and_index() {
+        assert_eq!(
+            select_window_args("wt-a1b2c3:2"),
+            ["select-window", "-t", "wt-a1b2c3:2"]
+        );
     }
 
     #[test]

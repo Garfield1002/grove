@@ -175,6 +175,47 @@ pub fn apply_session_presence(
     }
 }
 
+/// Every Grove session's windows, keyed by tmux session name.
+///
+/// Derived from one `list-panes -a`, so this is a single subprocess for the
+/// whole server however many worktrees are open.
+///
+/// Runs subprocesses: worker thread only.
+pub fn session_windows(server: &TmuxServer) -> Result<HashMap<String, Vec<tmux::WindowInfo>>> {
+    Ok(group_windows(tmux::windows_of(
+        &tmux::session::list_all_panes(server)?,
+    )))
+}
+
+/// Group a flat window listing by session name.
+pub fn group_windows(windows: Vec<tmux::WindowInfo>) -> HashMap<String, Vec<tmux::WindowInfo>> {
+    let mut by_session: HashMap<String, Vec<tmux::WindowInfo>> = HashMap::new();
+    for window in windows {
+        by_session
+            .entry(window.session.clone())
+            .or_default()
+            .push(window);
+    }
+    by_session
+}
+
+/// Stamp each worktree's tmux windows onto a worktree list.
+///
+/// A worktree whose session is not in the map loses its windows: the session
+/// has gone, and leaving stale child rows in the tree would offer the user
+/// windows that are not there any more.
+pub fn apply_session_windows(
+    worktrees: &mut [Worktree],
+    windows: &HashMap<String, Vec<tmux::WindowInfo>>,
+) {
+    for worktree in worktrees {
+        worktree.windows = windows
+            .get(&worktree.session_name())
+            .cloned()
+            .unwrap_or_default();
+    }
+}
+
 /// Start the configured agent in a worktree's session (DESIGN.md §7).
 ///
 /// The session is ensured first: starting an agent is also a reasonable way to
@@ -279,9 +320,11 @@ pub fn poll_session_signals(
             Path::new(cgroup::CGROUP_ROOT),
             &session_panes,
         );
+        let windows = tmux::windows_of(&session_panes);
         let commands = session_panes.into_iter().map(|p| p.command).collect();
         let mut signal = session.signals(now_epoch, commands);
         signal.usage = usage;
+        signal.windows = windows;
         signals.insert(worktree_id, signal);
     }
     Ok(signals)
@@ -362,7 +405,42 @@ pub fn activate_worktree(
     }
     let spec = session_spec(project_name, git_common_dir, worktree);
     let (session, _created) = tmux::ensure_session(server, &spec)?;
+    attach_or_launch(server, config, project_name, worktree, session)
+}
 
+/// Open one tmux window of a worktree's session (DESIGN.md §5).
+///
+/// The same switch-or-launch as [`activate_worktree`], with the requested
+/// window made current first: both branches then land the user on that window,
+/// whether an attached client is retargeted or a terminal is launched.
+pub fn activate_window(
+    server: &TmuxServer,
+    config: &Config,
+    project_name: &str,
+    git_common_dir: &Path,
+    worktree: &Worktree,
+    window_index: u32,
+) -> Result<Activation> {
+    if !worktree.path.is_dir() {
+        return Err(Error::WorktreeMissing(worktree.path.clone()));
+    }
+    let spec = session_spec(project_name, git_common_dir, worktree);
+    let (session, _created) = tmux::ensure_session(server, &spec)?;
+    // A window that has gone since the last poll is not an error: opening the
+    // session on whatever window it still has beats refusing to open it.
+    tmux::select_window(server, &format!("{session}:{window_index}"))?;
+    attach_or_launch(server, config, project_name, worktree, session)
+}
+
+/// Switch the primary client to a session, or launch a terminal on it when no
+/// client is attached. The session must already exist.
+fn attach_or_launch(
+    server: &TmuxServer,
+    config: &Config,
+    project_name: &str,
+    worktree: &Worktree,
+    session: String,
+) -> Result<Activation> {
     let clients = tmux::list_clients(server)?;
     if let Some(client) = tmux::primary_client(&clients) {
         tmux::switch_client(server, client, &session)?;
@@ -537,6 +615,48 @@ mod tests {
         apply_session_presence(&mut worktrees, &presence);
         assert_eq!(worktrees[0].session, SessionPresence::Attached);
         assert_eq!(worktrees[1].session, SessionPresence::None);
+    }
+
+    fn window(session: &str, index: u32, name: &str) -> tmux::WindowInfo {
+        tmux::WindowInfo {
+            session: session.to_string(),
+            index,
+            name: name.to_string(),
+            active: index == 0,
+        }
+    }
+
+    #[test]
+    fn windows_are_matched_by_deterministic_session_name() {
+        let mut worktrees = vec![worktree("/home/u/proj"), worktree("/home/u/wt/feature")];
+        let session = worktrees[0].session_name();
+        let windows = group_windows(vec![
+            window(&session, 0, "shell"),
+            window(&session, 1, "agent"),
+            window("scratch", 0, "shell"),
+        ]);
+        apply_session_windows(&mut worktrees, &windows);
+        assert_eq!(worktrees[0].windows.len(), 2);
+        assert_eq!(worktrees[0].windows[1].name, "agent");
+        assert!(
+            worktrees[1].windows.is_empty(),
+            "a worktree with no session has no windows"
+        );
+    }
+
+    #[test]
+    fn windows_of_a_session_that_has_gone_are_dropped() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        let session = worktrees[0].session_name();
+        apply_session_windows(
+            &mut worktrees,
+            &group_windows(vec![window(&session, 0, "shell")]),
+        );
+        apply_session_windows(&mut worktrees, &HashMap::new());
+        assert!(
+            worktrees[0].windows.is_empty(),
+            "stale rows would offer windows that are not there"
+        );
     }
 
     #[test]

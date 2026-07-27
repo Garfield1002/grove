@@ -5,7 +5,7 @@ use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
 
 use super::worktree_row::RowAction;
-use super::{Action, icons, theme, worktree_row};
+use super::{Action, icons, theme, window_row, worktree_row};
 
 /// Draw every project, applying the filter. Returns the user's action.
 pub fn show(
@@ -81,6 +81,18 @@ pub fn show(
                             worktree_id,
                         },
                     });
+                }
+                // The worktree's tmux windows, as child rows. There are none
+                // until a poll has reported some, so a worktree with no
+                // session simply has no children.
+                for window in &worktree.windows {
+                    if window_row::show(ui, window).is_some() {
+                        inner = Some(Action::ActivateWindow {
+                            project_id: project.id.clone(),
+                            worktree_id: worktree.id.clone(),
+                            window_index: window.index,
+                        });
+                    }
                 }
             }
             if matches.is_empty() {

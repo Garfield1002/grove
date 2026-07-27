@@ -11,6 +11,7 @@ use grove_core::model::{Project, SessionPresence};
 use grove_core::reconcile::{OrphanSession, ProjectRef, Reconciliation};
 use grove_core::state::{ProjectRecord, SessionRecord, State};
 use grove_core::status::{SessionReport, SessionStatus};
+use grove_core::tmux::WindowInfo;
 use grove_core::workflow::Activation;
 use grove_core::{Paths, state};
 
@@ -31,6 +32,9 @@ pub struct GroveApp {
     /// Last polled status per worktree id, kept so a refreshed worktree list
     /// shows its status immediately instead of blank until the next poll.
     statuses: HashMap<String, SessionReport>,
+    /// Last known windows per tmux session name, kept for the same reason: a
+    /// refreshed worktree list keeps its child rows instead of blinking empty.
+    windows: HashMap<String, Vec<WindowInfo>>,
 
     config: Option<Config>,
     state: State,
@@ -115,6 +119,7 @@ impl GroveApp {
             watch,
             messages,
             statuses: HashMap::new(),
+            windows: HashMap::new(),
             config: None,
             state: loaded,
             projects,
@@ -209,13 +214,17 @@ impl GroveApp {
                     // row back into "no session".
                     self.mark_stopped_sessions();
                     self.apply_session_statuses();
+                    self.apply_session_windows();
                     self.describe_worktrees();
                 }
                 Message::StatusesRefreshed {
                     project_id,
                     statuses,
                 } => self.apply_statuses(&project_id, &statuses),
-                Message::SessionsRefreshed(presence) => self.apply_presence(&presence),
+                Message::SessionsRefreshed { presence, windows } => {
+                    self.windows = windows;
+                    self.apply_presence(&presence);
+                }
                 Message::Reconciled(result) => self.apply_reconciliation(*result),
                 Message::SessionOpened { activation } => {
                     self.status = Some(describe(&activation));
@@ -248,6 +257,10 @@ impl GroveApp {
                 Message::StatusPolled(statuses) => {
                     self.statuses = statuses;
                     self.apply_session_statuses();
+                }
+                Message::WindowsPolled(windows) => {
+                    self.windows = windows;
+                    self.apply_session_windows();
                 }
                 Message::Notified {
                     worktree_id,
@@ -414,8 +427,10 @@ impl GroveApp {
         }
         self.mark_stopped_sessions();
         // Presence just changed, so a row that lost its session must lose its
-        // status with it rather than waiting for the next poll.
+        // status — and its windows — with it rather than waiting for the next
+        // poll.
         self.apply_session_statuses();
+        self.apply_session_windows();
     }
 
     /// Re-read every project's working-tree status, on the poller's cadence.
@@ -438,6 +453,14 @@ impl GroveApp {
     fn apply_session_statuses(&mut self) {
         for project in &mut self.projects {
             grove_core::workflow::apply_session_status(&mut project.worktrees, &self.statuses);
+        }
+    }
+
+    /// Stamp the last known tmux windows onto every row, so each worktree
+    /// carries the child rows the tree draws under it.
+    fn apply_session_windows(&mut self) {
+        for project in &mut self.projects {
+            grove_core::workflow::apply_session_windows(&mut project.worktrees, &self.windows);
         }
     }
 
@@ -553,6 +576,7 @@ impl GroveApp {
         }
         self.record_live_sessions();
         self.apply_session_statuses();
+        self.apply_session_windows();
         self.describe_worktrees();
         self.status = Some(summary);
     }
@@ -702,6 +726,27 @@ impl GroveApp {
                         git_common_dir: project.git_common_dir.clone(),
                         worktree: Box::new(worktree.clone()),
                     });
+                }
+            }
+            // Opening a window is opening the session, so it clears attention
+            // exactly as opening the worktree row does.
+            Action::ActivateWindow {
+                project_id,
+                worktree_id,
+                window_index,
+            } => {
+                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
+                    && let Some(worktree) = project.worktree(&worktree_id)
+                {
+                    let session = worktree.session_name();
+                    self.workers.send(Task::ActivateWindow {
+                        project_name: project.name.clone(),
+                        git_common_dir: project.git_common_dir.clone(),
+                        worktree: Box::new(worktree.clone()),
+                        window_index,
+                    });
+                    self.clear_attention(&worktree_id, &session);
+                    self.selected = Some(worktree_id);
                 }
             }
             Action::RemoveWorktree {

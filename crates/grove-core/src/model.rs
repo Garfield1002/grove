@@ -6,6 +6,7 @@ use crate::git::WorktreeEntry;
 use crate::git::status::StatusSummary;
 use crate::ids;
 use crate::status::SessionStatus;
+use crate::tmux::WindowInfo;
 
 /// A registered Git repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +133,10 @@ pub struct Worktree {
     /// opening it starts a session again.
     pub session_stopped: bool,
     pub session: SessionPresence,
+    /// The session's tmux windows, newest poll first-hand. Empty when there is
+    /// no session, and also before the first poll lands — the tree shows no
+    /// child rows rather than inventing a shell that may not be there.
+    pub windows: Vec<WindowInfo>,
     /// Working-tree summary, filled in asynchronously by the worker. `None`
     /// means "not read yet", which the UI shows as nothing rather than as
     /// "clean".
@@ -173,6 +178,7 @@ impl Worktree {
             is_missing: false,
             session_stopped: false,
             session: SessionPresence::None,
+            windows: Vec::new(),
             git_status: None,
             status: None,
             status_message: None,
