@@ -29,40 +29,49 @@ pub fn open_project(ctx: &Context, path: &mut String) -> OpenProject {
         .open(&mut open)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(300.0);
+            ui.set_min_width(320.0);
             ui.label(theme::label(
                 "Path to a Git repository or any directory inside one.",
-                11.0,
+                theme::FONT_BODY,
                 theme::TEXT_MUTED,
             ));
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             let field = ui.add(
                 egui::TextEdit::singleline(path)
                     .hint_text("/home/you/projects/acme-web")
                     .desired_width(f32::INFINITY),
             );
             field.request_focus();
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.label(theme::label(
                 "Choosing a linked worktree registers its project.",
-                10.0,
+                theme::FONT_SMALL,
                 theme::TEXT_FAINT,
             ));
-            ui.add_space(10.0);
+            ui.add_space(12.0);
 
             let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    outcome = OpenProject::Cancelled;
-                }
                 let can_open = !path.trim().is_empty();
-                if (ui
-                    .add_enabled(can_open, egui::Button::new("Open"))
-                    .clicked()
-                    || submitted)
-                    && can_open
-                {
+                let open_button = egui::Button::new(theme::label(
+                    "Open",
+                    theme::FONT_BODY,
+                    if can_open {
+                        theme::TEXT_STRONG
+                    } else {
+                        theme::TEXT_FAINT
+                    },
+                ))
+                .fill(theme::ACCENT_FILL)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+                if (ui.add_enabled(can_open, open_button).clicked() || submitted) && can_open {
                     outcome = OpenProject::Confirmed(path.trim().to_string());
+                }
+                if ui
+                    .button(theme::label("Cancel", theme::FONT_BODY, theme::TEXT_DIM))
+                    .clicked()
+                {
+                    outcome = OpenProject::Cancelled;
                 }
             });
         });
@@ -80,47 +89,74 @@ pub fn errors(ui: &mut Ui, errors: &[ErrorReport]) -> bool {
     let mut dismissed = false;
     egui::Frame::new()
         .fill(theme::BG_SUNKEN)
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .inner_margin(egui::Margin::symmetric(theme::PANEL_MARGIN_X, 9))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                let (bullet, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+                super::icons::warning(ui.painter(), bullet, theme::DANGER);
                 ui.label(theme::label(
                     format!(
                         "{} problem{}",
                         errors.len(),
                         if errors.len() == 1 { "" } else { "s" }
                     ),
-                    11.0,
+                    theme::FONT_BODY,
                     theme::DANGER,
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Dismiss").clicked() {
+                    if ui
+                        .button(theme::label(
+                            "Dismiss",
+                            theme::FONT_SMALL,
+                            theme::TEXT_MUTED,
+                        ))
+                        .clicked()
+                    {
                         dismissed = true;
                     }
                 });
             });
+            ui.add_space(2.0);
             egui::ScrollArea::vertical()
-                .max_height(120.0)
+                .max_height(140.0)
                 .show(ui, |ui| {
                     for (index, error) in errors.iter().enumerate().rev() {
                         ui.add(
-                            egui::Label::new(theme::label(&error.summary, 11.0, theme::TEXT_DIM))
-                                .wrap(),
+                            egui::Label::new(theme::label(
+                                &error.summary,
+                                theme::FONT_BODY,
+                                theme::TEXT_DIM,
+                            ))
+                            .wrap(),
                         );
                         if let Some(detail) = &error.detail {
                             egui::CollapsingHeader::new(theme::label(
                                 "Show command output",
-                                10.0,
+                                theme::FONT_SMALL,
                                 theme::TEXT_FAINT,
                             ))
                             .id_salt(("grove-error", index))
                             .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(theme::mono(detail, 10.0, theme::TEXT_MUTED))
-                                        .wrap(),
-                                );
+                                // git's and tmux's own output, monospaced and
+                                // never abridged (ARCHITECTURE.md §8.5).
+                                egui::Frame::new()
+                                    .fill(theme::BG)
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(theme::mono(
+                                                detail,
+                                                theme::FONT_SMALL,
+                                                theme::TEXT_MUTED,
+                                            ))
+                                            .wrap(),
+                                        );
+                                    });
                             });
                         }
-                        ui.add_space(2.0);
+                        ui.add_space(4.0);
                     }
                 });
         });

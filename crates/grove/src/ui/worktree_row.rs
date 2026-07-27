@@ -1,10 +1,11 @@
-//! One worktree row: session dot, branch name, git-status sublabel, markers
-//! for a locked or detached worktree, selection accent, and the context menu.
+//! One worktree row, laid out as in direction 1c: a left accent edge, a
+//! session dot, the branch name over a muted sublabel, and quiet right-aligned
+//! markers for a locked or detached worktree and a dirty working tree.
 
 use egui::{Align, Layout, Sense, Stroke, StrokeKind, Ui, vec2};
 use grove_core::model::{SessionPresence, Worktree};
 
-use super::theme;
+use super::{icons, theme};
 
 /// What the user did on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,66 @@ pub enum RowAction {
     Remove,
 }
 
+/// A quiet right-edge marker. Only ever built from something git reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    Locked,
+    Detached,
+    Dirty,
+}
+
+impl Marker {
+    fn hint(self) -> &'static str {
+        match self {
+            Marker::Locked => "locked",
+            Marker::Detached => "detached HEAD",
+            Marker::Dirty => "uncommitted changes",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            Marker::Locked | Marker::Detached => theme::TEXT_MUTED,
+            Marker::Dirty => theme::WARNING,
+        }
+    }
+
+    fn draw(self, painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        match self {
+            Marker::Locked => icons::lock(painter, rect, color),
+            Marker::Detached => icons::unlink(painter, rect, color),
+            Marker::Dirty => {
+                painter.circle_filled(rect.center(), rect.width() * 0.26, color);
+            }
+        }
+    }
+}
+
+/// At most three markers, held inline so drawing a row allocates nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Markers {
+    items: [Option<Marker>; 3],
+}
+
+impl Markers {
+    fn push(&mut self, marker: Marker) {
+        if let Some(slot) = self.items.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(marker);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Marker> + '_ {
+        self.items.iter().flatten().copied()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.items.iter().all(Option::is_none)
+    }
+}
+
+const MARKER_SIZE: f32 = 11.0;
+
 /// Draw a worktree row.
 pub fn show(
     ui: &mut Ui,
@@ -24,71 +85,76 @@ pub fn show(
     home: Option<&std::path::Path>,
 ) -> Option<RowAction> {
     let mut action = None;
-    let height = 40.0;
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, theme::ROW_HEIGHT), Sense::click());
     let hovered = response.hovered();
+
+    // Right edge of the text column, moved left by whatever markers exist.
+    let mut marker_x = rect.right() - 10.0;
 
     if ui.is_rect_visible(rect) {
         let radius = egui::CornerRadius::same(theme::ROW_RADIUS);
+        let painter = ui.painter();
         if selected {
-            ui.painter().rect_filled(rect, radius, theme::ACCENT_FILL);
-            ui.painter().rect_stroke(
+            painter.rect_filled(rect, radius, theme::ACCENT_FILL);
+            painter.rect_stroke(
                 rect,
                 radius,
                 Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.5)),
                 StrokeKind::Inside,
             );
-            // Accent edge, as in direction 1c.
-            let edge = egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height()));
-            ui.painter().rect_filled(edge, radius, theme::ACCENT);
         } else if hovered {
-            ui.painter()
-                .rect_filled(rect, radius, theme::FIELD.gamma_multiply(0.7));
+            painter.rect_filled(rect, radius, theme::FIELD.gamma_multiply(0.7));
         }
 
-        let dot_center = egui::pos2(rect.left() + 17.0, rect.center().y);
+        // The accent edge slot from direction 1c. Neutral for now: it carries
+        // selection only. Milestone 4 colours it by status.
+        if selected || hovered {
+            let edge = egui::Rect::from_min_size(rect.min, vec2(theme::ROW_EDGE, rect.height()));
+            let color = if selected {
+                theme::ACCENT
+            } else {
+                theme::HAIRLINE
+            };
+            painter.rect_filled(edge, radius, color);
+        }
+
+        let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
         match worktree.session {
             SessionPresence::None => {
-                ui.painter()
-                    .circle_stroke(dot_center, 4.0, Stroke::new(1.4, theme::DOT_EMPTY));
+                painter.circle_stroke(dot_center, 4.0, Stroke::new(1.4, theme::DOT_EMPTY));
             }
             SessionPresence::Detached => {
-                ui.painter().circle_filled(dot_center, 4.0, theme::DOT_IDLE);
+                painter.circle_filled(dot_center, 4.0, theme::DOT_IDLE);
             }
             SessionPresence::Attached => {
-                ui.painter().circle_filled(dot_center, 4.0, theme::TEXT_DIM);
+                painter.circle_filled(dot_center, 4.0, theme::TEXT_DIM);
             }
         }
 
-        // Markers on the right edge: a lock, a detached HEAD, and a dirty
-        // working tree. Only ever drawn from something git actually reported.
-        let mut marker_x = rect.right() - 8.0;
-        for (glyph, color, _) in markers(worktree) {
-            let galley = ui.painter().layout_no_wrap(
-                glyph.to_string(),
-                egui::FontId::proportional(10.0),
-                color,
+        for marker in markers(worktree).iter() {
+            marker_x -= MARKER_SIZE;
+            marker.draw(
+                painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(marker_x + MARKER_SIZE / 2.0, rect.center().y),
+                    egui::Vec2::splat(MARKER_SIZE),
+                ),
+                marker.color(),
             );
-            marker_x -= galley.size().x;
-            ui.painter().galley(
-                egui::pos2(marker_x, rect.center().y - galley.size().y / 2.0),
-                galley,
-                color,
-            );
-            marker_x -= 5.0;
+            marker_x -= 4.0;
         }
 
         let text_rect = rect
-            .with_min_x(rect.left() + 29.0)
+            .with_min_x(rect.left() + 31.0)
             .with_max_x(marker_x.max(rect.left() + 60.0))
-            .shrink2(vec2(0.0, 5.0));
+            .shrink2(vec2(0.0, 6.0));
         let mut content = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(text_rect)
                 .layout(Layout::top_down(Align::LEFT)),
         );
-        content.spacing_mut().item_spacing.y = 1.0;
+        content.spacing_mut().item_spacing.y = 2.0;
 
         let name_color = if selected {
             theme::TEXT_STRONG
@@ -98,14 +164,18 @@ pub fn show(
             theme::TEXT_MUTED
         };
         content.add(
-            egui::Label::new(theme::mono(worktree.label(), 12.5, name_color))
-                .truncate()
-                .selectable(false),
+            egui::Label::new(theme::mono(
+                worktree.label(),
+                theme::FONT_BRANCH,
+                name_color,
+            ))
+            .truncate()
+            .selectable(false),
         );
         content.add(
             egui::Label::new(theme::label(
                 sublabel(worktree, home),
-                9.5,
+                theme::FONT_SUB,
                 sublabel_color(worktree),
             ))
             .truncate()
@@ -136,48 +206,64 @@ pub fn show(
             ui.close();
         }
         ui.separator();
-        if ui.button("Remove…").clicked() {
+        if ui
+            .button(theme::label("Remove…", theme::FONT_BODY, theme::DANGER))
+            .clicked()
+        {
             action = Some(RowAction::Remove);
             ui.close();
         }
         ui.label(theme::label(
             "Removal asks separately about the session, the worktree and the branch.",
-            9.5,
+            theme::FONT_SUB,
             theme::TEXT_FAINT,
         ));
     });
 
-    response.on_hover_text(hover_text(worktree));
+    // Built lazily: the tooltip allocates, and most rows are never hovered.
+    response.on_hover_ui(|ui| {
+        ui.add(
+            egui::Label::new(theme::mono(
+                worktree.path.display().to_string(),
+                theme::FONT_SMALL,
+                theme::TEXT_DIM,
+            ))
+            .wrap(),
+        );
+        for line in hover_lines(worktree) {
+            ui.label(theme::label(line, theme::FONT_SMALL, theme::TEXT_MUTED));
+        }
+    });
     action
 }
 
-/// Tooltip: the full path, the git summary, and what each marker means.
-fn hover_text(worktree: &Worktree) -> String {
-    let mut lines = vec![worktree.path.display().to_string()];
+/// Tooltip lines after the path: the git summary and what each marker means.
+fn hover_lines(worktree: &Worktree) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(status) = &worktree.git_status {
         lines.push(status.summary());
     }
-    for (_, _, hint) in markers(worktree) {
-        lines.push(hint.to_string());
+    for marker in markers(worktree).iter() {
+        lines.push(marker.hint().to_string());
     }
-    lines.join("\n")
+    lines
 }
 
 /// Right-edge markers, worst first.
-fn markers(worktree: &Worktree) -> Vec<(&'static str, egui::Color32, &'static str)> {
-    let mut markers = Vec::new();
+fn markers(worktree: &Worktree) -> Markers {
+    let mut markers = Markers::default();
     if worktree.is_locked {
-        markers.push(("🔒", theme::TEXT_MUTED, "locked"));
+        markers.push(Marker::Locked);
     }
     if worktree.is_detached {
-        markers.push(("⚯", theme::TEXT_MUTED, "detached HEAD"));
+        markers.push(Marker::Detached);
     }
     if worktree
         .git_status
         .as_ref()
         .is_some_and(|status| !status.is_clean())
     {
-        markers.push(("●", theme::WARNING, "uncommitted changes"));
+        markers.push(Marker::Dirty);
     }
     markers
 }
@@ -239,7 +325,7 @@ mod tests {
             modified: 1,
             ..StatusSummary::default()
         });
-        let hints: Vec<&str> = markers(&worktree).iter().map(|m| m.2).collect();
+        let hints: Vec<&str> = markers(&worktree).iter().map(Marker::hint).collect();
         assert_eq!(
             hints,
             vec!["locked", "detached HEAD", "uncommitted changes"]
@@ -269,5 +355,19 @@ mod tests {
             sublabel(&worktree, Some(Path::new("/home/u"))),
             "3 mod · 1 untracked · no session · ~/wt/auth"
         );
+    }
+
+    /// Markers are drawn as vector shapes, never as font glyphs: the ones the
+    /// design called for (`⚯`, `●`) are not in egui's proportional font chain.
+    #[test]
+    fn markers_fit_inline_and_stay_ordered() {
+        let mut worktree = worktree();
+        worktree.is_locked = true;
+        worktree.git_status = Some(StatusSummary {
+            modified: 1,
+            ..StatusSummary::default()
+        });
+        let list: Vec<Marker> = markers(&worktree).iter().collect();
+        assert_eq!(list, vec![Marker::Locked, Marker::Dirty]);
     }
 }

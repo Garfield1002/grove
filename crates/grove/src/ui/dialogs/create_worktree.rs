@@ -11,7 +11,7 @@ use egui::{Context, Ui};
 use grove_core::git::{RefEntry, WorktreeAdd};
 use grove_core::model::{Project, suggest_worktree_path};
 
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 
 /// Everything the dialog holds between frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,8 +155,8 @@ pub fn show(ctx: &Context, form: &mut CreateForm) -> Outcome {
                 .changed();
 
             if form.create_branch {
-                ui.add_space(4.0);
-                ui.label(theme::label("Branch name", 11.0, theme::TEXT_MUTED));
+                ui.add_space(8.0);
+                ui.label(theme::caption("Branch name"));
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut form.branch)
@@ -166,20 +166,16 @@ pub fn show(ctx: &Context, form: &mut CreateForm) -> Outcome {
                     .changed();
             }
 
-            ui.add_space(6.0);
-            ui.label(theme::label(
-                if form.create_branch {
-                    "Base branch or commit"
-                } else {
-                    "Branch or commit to check out"
-                },
-                11.0,
-                theme::TEXT_MUTED,
-            ));
+            ui.add_space(10.0);
+            ui.label(theme::caption(if form.create_branch {
+                "Base branch or commit"
+            } else {
+                "Branch or commit to check out"
+            }));
             changed |= base_ref_field(ui, form);
 
-            ui.add_space(6.0);
-            ui.label(theme::label("Worktree directory", 11.0, theme::TEXT_MUTED));
+            ui.add_space(10.0);
+            ui.label(theme::caption("Worktree directory"));
             let path_field = ui.add(
                 egui::TextEdit::singleline(&mut form.path)
                     .hint_text("/home/you/worktrees/feature-auth")
@@ -192,31 +188,44 @@ pub fn show(ctx: &Context, form: &mut CreateForm) -> Outcome {
                 form.sync_path();
             }
 
-            ui.add_space(6.0);
+            ui.add_space(10.0);
             ui.checkbox(&mut form.open_after, "Open the session after creating");
 
-            ui.add_space(8.0);
-            if let Some(problem) = form.problem() {
-                ui.label(theme::label(problem, 10.0, theme::TEXT_FAINT));
-            } else {
-                ui.label(theme::label(
-                    "Grove runs `git worktree add` and shows git's own output if it refuses.",
-                    10.0,
+            ui.add_space(10.0);
+            ui.add(
+                egui::Label::new(theme::label(
+                    form.problem().unwrap_or(
+                        "Grove runs `git worktree add` and shows git's own output if it refuses.",
+                    ),
+                    theme::FONT_SMALL,
                     theme::TEXT_FAINT,
-                ));
-            }
+                ))
+                .wrap(),
+            );
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    outcome = Outcome::Cancelled;
-                }
-                if ui
-                    .add_enabled(form.is_valid(), egui::Button::new("Create"))
-                    .clicked()
+                let create = egui::Button::new(theme::label(
+                    "Create",
+                    theme::FONT_BODY,
+                    if form.is_valid() {
+                        theme::TEXT_STRONG
+                    } else {
+                        theme::TEXT_FAINT
+                    },
+                ))
+                .fill(theme::ACCENT_FILL)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+                if ui.add_enabled(form.is_valid(), create).clicked()
                     && let Some(add) = form.to_add()
                 {
                     outcome = Outcome::Create(Box::new(add));
+                }
+                if ui
+                    .button(theme::label("Cancel", theme::FONT_BODY, theme::TEXT_DIM))
+                    .clicked()
+                {
+                    outcome = Outcome::Cancelled;
                 }
             });
         });
@@ -232,7 +241,7 @@ pub fn show(ctx: &Context, form: &mut CreateForm) -> Outcome {
 fn base_ref_field(ui: &mut Ui, form: &mut CreateForm) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 40.0).max(80.0);
+        let width = (ui.available_width() - theme::ICON_BUTTON - 8.0).max(80.0);
         changed = ui
             .add(
                 egui::TextEdit::singleline(&mut form.base_ref)
@@ -240,7 +249,12 @@ fn base_ref_field(ui: &mut Ui, form: &mut CreateForm) -> bool {
                     .desired_width(width),
             )
             .changed();
-        ui.menu_button("▾", |ui| {
+        // A painted caret: `▾` (U+25BE) exists only in Hack, which is not in
+        // egui's proportional font chain, so it rendered as a tofu box.
+        let open = icons::button(ui, true, icons::caret_down)
+            .on_hover_text("Local and remote-tracking branches");
+        egui::Popup::menu(&open).show(|ui| {
+            ui.set_min_width(200.0);
             if form.refs.is_empty() {
                 ui.label(theme::label(
                     if form.refs_loaded {
@@ -248,7 +262,7 @@ fn base_ref_field(ui: &mut Ui, form: &mut CreateForm) -> bool {
                     } else {
                         "loading…"
                     },
-                    10.0,
+                    theme::FONT_SMALL,
                     theme::TEXT_FAINT,
                 ));
             }
@@ -256,16 +270,25 @@ fn base_ref_field(ui: &mut Ui, form: &mut CreateForm) -> bool {
                 .max_height(260.0)
                 .show(ui, |ui| {
                     for entry in &form.refs {
-                        if ui.button(&entry.name).clicked() {
+                        if ui
+                            .button(theme::mono(
+                                &entry.name,
+                                theme::FONT_BODY,
+                                if entry.is_remote {
+                                    theme::TEXT_MUTED
+                                } else {
+                                    theme::TEXT_DIM
+                                },
+                            ))
+                            .clicked()
+                        {
                             form.base_ref = entry.name.clone();
                             changed = true;
                             ui.close();
                         }
                     }
                 });
-        })
-        .response
-        .on_hover_text("Local and remote-tracking branches");
+        });
     });
     changed
 }

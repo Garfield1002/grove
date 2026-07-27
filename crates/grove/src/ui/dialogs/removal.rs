@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use egui::{Context, Ui};
 use grove_core::removal::{RemovalReport, Severity};
 
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 use crate::workers::RemovalOp;
 
 /// One of the four operations, as the app will execute it.
@@ -51,6 +51,13 @@ impl Request {
                 "Confirm: force-delete, discarding those commits".to_string()
             }
         }
+    }
+
+    /// Whether this operation changes anything outside Grove's own index.
+    /// Only these get danger styling; removing a project from Grove is not
+    /// destructive and must not be dressed up as though it were.
+    pub fn is_destructive(&self) -> bool {
+        !matches!(self, Request::RemoveProject)
     }
 }
 
@@ -134,7 +141,7 @@ pub fn show(ctx: &Context, form: &mut RemovalForm, open: &mut bool) -> Option<Re
             ui.add(
                 egui::Label::new(theme::mono(
                     form.worktree_path.display().to_string(),
-                    10.5,
+                    theme::FONT_SMALL,
                     theme::TEXT_DIM,
                 ))
                 .wrap(),
@@ -144,45 +151,67 @@ pub fn show(ctx: &Context, form: &mut RemovalForm, open: &mut bool) -> Option<Re
                     Some(branch) => format!("branch {branch}"),
                     None => "no branch (detached HEAD)".to_string(),
                 },
-                10.0,
+                theme::FONT_SMALL,
                 theme::TEXT_FAINT,
             ));
 
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             match &form.report {
                 Some(report) => findings(ui, report),
                 None => {
                     ui.label(theme::label(
                         "Checking for uncommitted changes, unpushed commits and running processes…",
-                        11.0,
+                        theme::FONT_BODY,
                         theme::TEXT_MUTED,
                     ));
                 }
             }
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.separator();
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.label(theme::label(
                 "Four separate operations. Each one asks again.",
-                10.0,
+                theme::FONT_SMALL,
                 theme::TEXT_FAINT,
             ));
-            ui.add_space(6.0);
 
             request = operations(ui, form);
 
             for detail in &form.done {
-                ui.add_space(4.0);
-                ui.add(egui::Label::new(theme::label(detail, 10.0, theme::TEXT_MUTED)).wrap());
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(theme::label(detail, theme::FONT_SMALL, theme::TEXT_MUTED))
+                        .wrap(),
+                );
             }
-            for refusal in &form.refusals {
-                ui.add_space(4.0);
-                ui.add(egui::Label::new(theme::label(refusal, 10.0, theme::DANGER)).wrap());
+            if !form.refusals.is_empty() {
+                ui.add_space(8.0);
+                // git's own words, verbatim and monospaced (ARCHITECTURE.md §8.5).
+                egui::Frame::new()
+                    .fill(theme::BG_SUNKEN)
+                    .stroke(egui::Stroke::new(1.0, theme::DANGER.gamma_multiply(0.3)))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        for refusal in &form.refusals {
+                            ui.add(
+                                egui::Label::new(theme::mono(
+                                    refusal,
+                                    theme::FONT_SMALL,
+                                    theme::DANGER,
+                                ))
+                                .wrap(),
+                            );
+                        }
+                    });
             }
 
-            ui.add_space(10.0);
-            if ui.button("Close").clicked() {
+            ui.add_space(12.0);
+            if ui
+                .button(theme::label("Close", theme::FONT_BODY, theme::TEXT_DIM))
+                .clicked()
+            {
                 request = None;
                 closed = true;
             }
@@ -201,20 +230,22 @@ fn findings(ui: &mut Ui, report: &RemovalReport) {
             Severity::Warning => theme::WARNING,
             Severity::Note => theme::TEXT_MUTED,
         };
-        let bullet = match finding.severity {
-            Severity::Blocker => "✕",
-            Severity::Warning => "!",
-            Severity::Note => "·",
-        };
-        ui.add(
-            egui::Label::new(theme::label(
-                format!("{bullet}  {}", finding.text),
-                11.0,
-                color,
-            ))
-            .wrap(),
-        );
-        ui.add_space(2.0);
+        ui.horizontal_top(|ui| {
+            // The bullets are painted, not typed: `✕` (U+2715) is in none of
+            // egui's bundled fonts and rendered as a tofu box.
+            let (bullet, _) = ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+            let bullet = bullet.translate(egui::vec2(0.0, 2.0));
+            match finding.severity {
+                Severity::Blocker => icons::cross(ui.painter(), bullet.shrink(1.0), color),
+                Severity::Warning => icons::warning(ui.painter(), bullet.shrink(1.0), color),
+                Severity::Note => {
+                    ui.painter().circle_filled(bullet.center(), 1.5, color);
+                }
+            }
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(theme::label(&finding.text, theme::FONT_BODY, color)).wrap());
+        });
+        ui.add_space(3.0);
     }
 }
 
@@ -343,26 +374,58 @@ fn step(
     enabled: bool,
 ) {
     let is_armed = armed.as_ref() == Some(&operation);
-    ui.add_space(6.0);
+    let destructive = operation.is_destructive();
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
         if is_armed {
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new(operation.confirm_label()).color(theme::DANGER),
-                ))
-                .clicked()
-            {
+            let confirm = egui::Button::new(theme::label(
+                operation.confirm_label(),
+                theme::FONT_BODY,
+                theme::DANGER,
+            ))
+            .fill(theme::DANGER_FILL)
+            .stroke(egui::Stroke::new(1.0, theme::DANGER.gamma_multiply(0.6)));
+            if ui.add(confirm).clicked() {
                 *click = Some(Click::Confirm(operation.clone()));
             }
-            if ui.button("Cancel").clicked() {
+            if ui
+                .button(theme::label("Cancel", theme::FONT_BODY, theme::TEXT_DIM))
+                .clicked()
+            {
                 *click = Some(Click::Disarm);
             }
-        } else if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-            *click = Some(Click::Arm(operation));
+        } else {
+            let color = if !enabled {
+                theme::TEXT_FAINT
+            } else if destructive {
+                theme::DANGER
+            } else {
+                theme::TEXT_DIM
+            };
+            let button = egui::Button::new(theme::label(label, theme::FONT_BODY, color)).stroke(
+                egui::Stroke::new(
+                    1.0,
+                    if destructive && enabled {
+                        theme::DANGER.gamma_multiply(0.35)
+                    } else {
+                        theme::HAIRLINE
+                    },
+                ),
+            );
+            if ui.add_enabled(enabled, button).clicked() {
+                *click = Some(Click::Arm(operation));
+            }
         }
     });
     if let Some(explanation) = explanation {
-        ui.add(egui::Label::new(theme::label(explanation, 9.5, theme::TEXT_FAINT)).wrap());
+        ui.add(
+            egui::Label::new(theme::label(
+                explanation,
+                theme::FONT_SUB,
+                theme::TEXT_FAINT,
+            ))
+            .wrap(),
+        );
     }
 }
 

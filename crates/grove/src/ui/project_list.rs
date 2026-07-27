@@ -5,7 +5,7 @@ use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
 
 use super::worktree_row::RowAction;
-use super::{Action, theme, worktree_row};
+use super::{Action, icons, theme, worktree_row};
 
 /// Draw every project, applying the filter. Returns the user's action.
 pub fn show(
@@ -31,17 +31,30 @@ pub fn show(
             continue;
         }
 
-        if let Some(header_action) = header(ui, project, matches.len()) {
+        // `CollapsingState` owns the openness animation; Grove owns the
+        // persisted flag, so the state is told what the flag says every frame
+        // and the animation follows.
+        let id = ui.make_persistent_id(("grove-project", &project.id));
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            id,
+            project.is_expanded,
+        );
+        state.set_open(project.is_expanded);
+        let openness = state.openness(ui.ctx());
+
+        if let Some(header_action) = header(ui, project, matches.len(), openness) {
             action = Some(header_action);
         }
 
-        if project.is_expanded {
+        let body = state.show_body_unindented(ui, |ui| {
+            let mut inner = None;
             for worktree in &matches {
                 let is_selected = selected == Some(worktree.id.as_str());
                 if let Some(row_action) = worktree_row::show(ui, worktree, is_selected, home) {
                     let project_id = project.id.clone();
                     let worktree_id = worktree.id.clone();
-                    action = Some(match row_action {
+                    inner = Some(match row_action {
                         RowAction::Activate => Action::ActivateWorktree {
                             project_id,
                             worktree_id,
@@ -64,20 +77,33 @@ pub fn show(
             }
             if matches.is_empty() {
                 ui.add_space(2.0);
-                ui.label(theme::label("no worktrees match", 10.0, theme::TEXT_FAINT));
+                ui.label(theme::label(
+                    "no worktrees match",
+                    theme::FONT_SMALL,
+                    theme::TEXT_FAINT,
+                ));
             }
+            inner
+        });
+        state.store(ui.ctx());
+        if let Some(inner) = body.and_then(|body| body.inner) {
+            action = Some(inner);
         }
         ui.add_space(8.0);
     }
 
     if projects.is_empty() {
-        ui.add_space(24.0);
+        ui.add_space(28.0);
         ui.vertical_centered(|ui| {
-            ui.label(theme::label("No projects yet.", 12.0, theme::TEXT_MUTED));
-            ui.add_space(4.0);
+            ui.label(theme::label(
+                "No projects yet.",
+                theme::FONT_BODY,
+                theme::TEXT_MUTED,
+            ));
+            ui.add_space(6.0);
             ui.label(theme::label(
                 "Use Open Project to register a Git repository.",
-                10.5,
+                theme::FONT_SMALL,
                 theme::TEXT_FAINT,
             ));
         });
@@ -103,67 +129,109 @@ pub fn matches_filter(
             .contains(needle)
 }
 
-fn header(ui: &mut Ui, project: &Project, count: usize) -> Option<Action> {
+/// One project header: disclosure triangle, name, worktree-count badge and a
+/// "more actions" ellipsis, laid out as in the mockup.
+fn header(ui: &mut Ui, project: &Project, count: usize, openness: f32) -> Option<Action> {
     let mut action = None;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::PROJECT_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let hovered = response.hovered();
+
+    // The ellipsis is a target inside the header, so it is interacted with
+    // after (and therefore above) the header itself.
+    let more_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 11.0, rect.center().y),
+        egui::Vec2::splat(18.0),
+    );
+    let more = ui.interact(
+        more_rect,
+        ui.id().with(("grove-project-more", &project.id)),
+        Sense::click(),
+    );
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let triangle_center = egui::pos2(rect.left() + 9.0, rect.center().y);
-        let points = if project.is_expanded {
-            vec![
-                triangle_center + vec2(-4.0, -2.0),
-                triangle_center + vec2(4.0, -2.0),
-                triangle_center + vec2(0.0, 3.0),
-            ]
-        } else {
-            vec![
-                triangle_center + vec2(-2.0, -4.0),
-                triangle_center + vec2(3.0, 0.0),
-                triangle_center + vec2(-2.0, 4.0),
-            ]
-        };
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            theme::TEXT_MUTED,
-            egui::Stroke::NONE,
-        ));
+        if hovered {
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(theme::ROW_RADIUS),
+                theme::BADGE.gamma_multiply(0.6),
+            );
+        }
 
-        painter.text(
-            egui::pos2(rect.left() + 20.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            &project.name,
-            egui::FontId::proportional(12.0),
+        icons::disclosure(
+            painter,
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 10.0, rect.center().y),
+                egui::Vec2::splat(9.0),
+            ),
+            openness,
+            theme::TEXT_MUTED,
+        );
+
+        let name = painter.layout_no_wrap(
+            project.name.clone(),
+            egui::FontId::proportional(theme::FONT_PROJECT),
+            theme::TEXT_STRONG,
+        );
+        let name_left = rect.left() + 21.0;
+        painter.galley(
+            egui::pos2(name_left, rect.center().y - name.size().y / 2.0),
+            name.clone(),
             theme::TEXT_STRONG,
         );
 
-        let badge = format!("{count}");
-        let badge_width = 10.0 + badge.len() as f32 * 6.0;
-        let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - badge_width - 4.0, rect.center().y - 8.0),
-            vec2(badge_width, 16.0),
+        // Count badge, immediately after the name as in the mockup.
+        let badge = painter.layout_no_wrap(
+            count.to_string(),
+            egui::FontId::monospace(theme::FONT_SUB),
+            theme::TEXT_GHOST,
         );
-        painter.rect_filled(badge_rect, egui::CornerRadius::same(8), theme::BADGE);
-        painter.text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
+        let badge_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                name_left + name.size().x + 8.0 + (badge.size().x + 12.0) / 2.0,
+                rect.center().y,
+            ),
+            vec2(badge.size().x + 12.0, 15.0),
+        );
+        painter.rect_filled(
+            badge_rect,
+            egui::CornerRadius::same(theme::BADGE_RADIUS),
+            theme::BADGE,
+        );
+        let badge_size = badge.size();
+        painter.galley(
+            badge_rect.center() - badge_size / 2.0,
             badge,
-            egui::FontId::monospace(9.5),
-            theme::TEXT_MUTED,
+            theme::TEXT_GHOST,
         );
+
+        if hovered || more.hovered() {
+            icons::ellipsis(
+                painter,
+                more_rect.shrink(4.0),
+                if more.hovered() {
+                    theme::TEXT_DIM
+                } else {
+                    theme::TEXT_FAINT
+                },
+            );
+        }
     }
 
     if response.clicked() {
         action = Some(Action::ToggleProject(project.id.clone()));
     }
 
-    response.context_menu(|ui| {
+    let menu = |ui: &mut Ui, action: &mut Option<Action>| {
         if ui.button("Refresh").clicked() {
-            action = Some(Action::RefreshProject(project.id.clone()));
+            *action = Some(Action::RefreshProject(project.id.clone()));
             ui.close();
         }
         if ui.button("Create worktree…").clicked() {
-            action = Some(Action::CreateWorktree(project.id.clone()));
+            *action = Some(Action::CreateWorktree(project.id.clone()));
             ui.close();
         }
         if ui.button("Copy repository path").clicked() {
@@ -174,14 +242,25 @@ fn header(ui: &mut Ui, project: &Project, count: usize) -> Option<Action> {
         ui.separator();
         ui.label(theme::label(
             "Removing a project only removes it from Grove.",
-            10.0,
+            theme::FONT_SMALL,
             theme::TEXT_FAINT,
         ));
-        if ui.button("Remove project from Grove").clicked() {
-            action = Some(Action::RemoveProject(project.id.clone()));
+        if ui
+            .button(theme::label(
+                "Remove project from Grove",
+                theme::FONT_BODY,
+                theme::DANGER,
+            ))
+            .clicked()
+        {
+            *action = Some(Action::RemoveProject(project.id.clone()));
             ui.close();
         }
-    });
+    };
+
+    response.context_menu(|ui| menu(ui, &mut action));
+    let more = more.on_hover_cursor(egui::CursorIcon::PointingHand);
+    egui::Popup::menu(&more).show(|ui| menu(ui, &mut action));
 
     action
 }

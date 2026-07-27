@@ -36,30 +36,42 @@ pub fn show(ctx: &Context, open: &mut bool, paths: &Paths, config: Option<&Confi
                 &paths.tmux_socket().display().to_string(),
             );
 
-            ui.add_space(8.0);
-            ui.label(theme::label("Terminal command", 11.0, theme::TEXT_DIM));
+            ui.add_space(10.0);
+            ui.label(theme::caption("Terminal command"));
             let command = config
                 .map(|c| c.terminal.command.clone())
                 .filter(|c| !c.trim().is_empty())
                 .unwrap_or_else(|| "(none configured)".to_string());
-            ui.add(egui::Label::new(theme::mono(command, 10.0, theme::TEXT_MUTED)).wrap());
+            ui.add(
+                egui::Label::new(theme::mono(command, theme::FONT_SMALL, theme::TEXT_MUTED)).wrap(),
+            );
 
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.add(
                 egui::Label::new(theme::label(
                     "Placeholders: {socket} {session} {worktree} {project} {branch}. \
                      Edit config.toml to change it; Grove only ever wrote it once, \
                      when it auto-detected your terminal.",
-                    10.0,
+                    theme::FONT_SMALL,
                     theme::TEXT_FAINT,
                 ))
                 .wrap(),
             );
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(theme::label(
+                "Ctrl+N new worktree · Ctrl+R refresh · Enter open · Delete remove · \
+                 Ctrl+Q close Grove",
+                theme::FONT_SMALL,
+                theme::TEXT_FAINT,
+            ));
         });
 }
 
 fn row(ui: &mut egui::Ui, name: &str, value: &str) {
-    ui.add_space(4.0);
-    ui.label(theme::label(name, 11.0, theme::TEXT_DIM));
-    ui.add(egui::Label::new(theme::mono(value, 10.0, theme::TEXT_MUTED)).wrap());
+    ui.add_space(6.0);
+    ui.label(theme::caption(name));
+    ui.add(egui::Label::new(theme::mono(value, theme::FONT_SMALL, theme::TEXT_MUTED)).wrap());
 }

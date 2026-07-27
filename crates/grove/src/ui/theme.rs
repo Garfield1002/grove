@@ -1,43 +1,105 @@
 //! The dark, color-forward theme from direction 1c in `grove.dc.html`.
 //!
+//! Every colour here is lifted from the mockup's inline CSS, so the app and
+//! the design document cannot drift apart. Nothing outside this module should
+//! contain a `Color32::from_rgb` literal.
+//!
 //! Status colours (green `WORKING`, amber `ACTION`) are deliberately *not*
-//! used yet: Milestone 1 has no status detection, and showing a status colour
-//! that nothing computes would be a lie. They are named here so Milestone 4
-//! can light them up without re-picking the palette.
+//! used for live state yet: Milestone 1–2 have no status detection, and
+//! showing a status colour that nothing computes would be a lie. They are
+//! named here so Milestone 4 can light them up without re-picking the palette.
 
 use egui::{Color32, CornerRadius, Margin, Stroke, Visuals};
 
+// ---------------------------------------------------------------- surfaces
+
+/// Window body — mockup `#101217`.
 pub const BG: Color32 = Color32::from_rgb(0x10, 0x12, 0x17);
+/// Header strip — mockup `#0b0d11`.
 pub const BG_SUNKEN: Color32 = Color32::from_rgb(0x0b, 0x0d, 0x11);
+/// Footer strip — mockup `#0d0f13`.
 pub const BG_FOOTER: Color32 = Color32::from_rgb(0x0d, 0x0f, 0x13);
+/// Filter field and other sunken inputs — mockup `#171a20`.
 pub const FIELD: Color32 = Color32::from_rgb(0x17, 0x1a, 0x20);
+/// Header chips and icon buttons — mockup `#1c2129`.
 pub const CHIP: Color32 = Color32::from_rgb(0x1c, 0x21, 0x29);
+/// Worktree-count pill on a project row — mockup `#1a1e25`.
 pub const BADGE: Color32 = Color32::from_rgb(0x1a, 0x1e, 0x25);
+/// Dialog surface: one step above [`BG`] so a window reads as floating.
+pub const BG_RAISED: Color32 = Color32::from_rgb(0x14, 0x16, 0x1c);
+
+/// The mockup's `rgba(255,255,255,.06)` divider over [`BG`].
+pub const HAIRLINE: Color32 = Color32::from_rgb(0x22, 0x26, 0x2d);
+/// The subtler `rgba(255,255,255,.05)` border used on the filter field.
+pub const BORDER: Color32 = Color32::from_rgb(0x1e, 0x21, 0x27);
+
+// -------------------------------------------------------------------- text
 
 pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe8, 0xec);
 pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xee, 0xf1, 0xf4);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0xc7, 0xcd, 0xd4);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x8b, 0x92, 0x9c);
+/// Quiet right-hand metadata — mockup `#6b7078`.
+pub const TEXT_GHOST: Color32 = Color32::from_rgb(0x6b, 0x70, 0x78);
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x5c, 0x62, 0x6b);
 
-pub const HAIRLINE: Color32 = Color32::from_rgb(0x22, 0x26, 0x2d);
+// ----------------------------------------------------------------- accents
+
 pub const DOT_IDLE: Color32 = Color32::from_rgb(0x79, 0x81, 0x8c);
 pub const DOT_EMPTY: Color32 = Color32::from_rgb(0x4a, 0x4f, 0x57);
 
-/// Selection accent. Distinct from the reserved status hues below.
+/// Selection accent. Direction 1c tints the selected row with the *status*
+/// colour, which Grove cannot know before Milestone 4, so selection borrows
+/// direction 1a's blue `#4a90d9` (lightened slightly for contrast on `#101217`).
 pub const ACCENT: Color32 = Color32::from_rgb(0x5f, 0xa8, 0xd6);
 pub const ACCENT_FILL: Color32 = Color32::from_rgb(0x18, 0x26, 0x31);
 
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x5f, 0x57);
-/// Direction 1c's amber, used for the risks listed in the removal dialog and
-/// for the dirty marker on a row.
+/// A destructive button's fill: dark enough to read white-on-red badly, so
+/// the label is drawn in [`DANGER`] over it.
+pub const DANGER_FILL: Color32 = Color32::from_rgb(0x2e, 0x14, 0x14);
+/// Direction 1c's amber. Used for the risks in the removal dialog and the
+/// dirty marker on a row.
 pub const WARNING: Color32 = Color32::from_rgb(0xe0, 0xa4, 0x4a);
 
-// Direction 1c's working green `#4bc07d` stays undefined until Milestone 4
-// computes a working state; showing it now would be a lie.
+/// Reserved for Milestone 4's `WORKING` state (mockup `#4bc07d`). Nothing may
+/// paint with it until a poller actually computes that state.
+#[allow(dead_code)]
+pub const STATUS_WORKING: Color32 = Color32::from_rgb(0x4b, 0xc0, 0x7d);
+/// Reserved for Milestone 4's `ACTION` state — the same amber as [`WARNING`].
+#[allow(dead_code)]
+pub const STATUS_ATTENTION: Color32 = WARNING;
+
+// ---------------------------------------------------------------- geometry
 
 pub const ROW_RADIUS: u8 = 9;
 pub const CHIP_RADIUS: u8 = 8;
+pub const BADGE_RADIUS: u8 = 10;
+
+/// Height of a worktree row: mockup `10px` padding around a 12.5/9.5 pair.
+pub const ROW_HEIGHT: f32 = 42.0;
+/// Height of a project header row.
+pub const PROJECT_ROW_HEIGHT: f32 = 28.0;
+/// Width of the left accent edge on a row (mockup `width:3px`).
+pub const ROW_EDGE: f32 = 3.0;
+/// Square side of a header/footer icon button (mockup `26px`).
+pub const ICON_BUTTON: f32 = 26.0;
+/// Height of the filter field (mockup `30px`).
+pub const FIELD_HEIGHT: f32 = 30.0;
+
+/// Panel insets, matching the mockup's `padding` on each region.
+pub const PANEL_MARGIN_X: i8 = 12;
+pub const LIST_MARGIN_X: i8 = 10;
+
+// ------------------------------------------------------------- typography
+
+pub const FONT_TITLE: f32 = 14.0;
+pub const FONT_PROJECT: f32 = 12.0;
+pub const FONT_BRANCH: f32 = 12.5;
+pub const FONT_BODY: f32 = 11.5;
+pub const FONT_CHIP: f32 = 11.0;
+pub const FONT_SMALL: f32 = 10.0;
+pub const FONT_SUB: f32 = 9.5;
 
 /// Recommended window size: a narrow vertical panel (DESIGN.md §5).
 pub const WINDOW_SIZE: [f32; 2] = [360.0, 720.0];
@@ -46,13 +108,27 @@ pub const MIN_WINDOW_SIZE: [f32; 2] = [280.0, 320.0];
 pub fn apply(ctx: &egui::Context) {
     let mut visuals = Visuals::dark();
     visuals.panel_fill = BG;
-    visuals.window_fill = BG;
+    visuals.window_fill = BG_RAISED;
     visuals.extreme_bg_color = FIELD;
     visuals.faint_bg_color = BADGE;
     visuals.override_text_color = Some(TEXT);
     visuals.window_stroke = Stroke::new(1.0, HAIRLINE);
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 12],
+        blur: 32,
+        spread: 0,
+        color: Color32::from_black_alpha(160),
+    };
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 6],
+        blur: 16,
+        spread: 0,
+        color: Color32::from_black_alpha(140),
+    };
     visuals.selection.bg_fill = ACCENT_FILL;
     visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
 
     let radius = CornerRadius::same(CHIP_RADIUS);
     for widget in [
@@ -63,21 +139,32 @@ pub fn apply(ctx: &egui::Context) {
         &mut visuals.widgets.open,
     ] {
         widget.corner_radius = radius;
+        widget.expansion = 0.0;
     }
     visuals.widgets.noninteractive.bg_fill = BG;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
     visuals.widgets.inactive.bg_fill = CHIP;
     visuals.widgets.inactive.weak_bg_fill = CHIP;
-    visuals.widgets.hovered.bg_fill = FIELD;
-    visuals.widgets.hovered.weak_bg_fill = FIELD;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+    visuals.widgets.hovered.bg_fill = HAIRLINE;
+    visuals.widgets.hovered.weak_bg_fill = HAIRLINE;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_STRONG);
     visuals.widgets.active.bg_fill = ACCENT_FILL;
     visuals.widgets.active.weak_bg_fill = ACCENT_FILL;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals.widgets.open.bg_fill = FIELD;
+    visuals.widgets.open.weak_bg_fill = FIELD;
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.window_margin = Margin::same(10);
+    style.spacing.button_padding = egui::vec2(9.0, 5.0);
+    style.spacing.window_margin = Margin::same(14);
+    style.spacing.menu_margin = Margin::same(6);
+    style.spacing.interact_size.y = 22.0;
+    style.visuals.menu_corner_radius = CornerRadius::same(10);
     ctx.set_style(style);
 }
 
@@ -91,4 +178,9 @@ pub fn mono(text: impl Into<String>, size: f32, color: Color32) -> egui::RichTex
 
 pub fn label(text: impl Into<String>, size: f32, color: Color32) -> egui::RichText {
     egui::RichText::new(text).size(size).color(color)
+}
+
+/// A section caption: small, uppercase-weight, muted.
+pub fn caption(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).size(FONT_CHIP).color(TEXT_MUTED)
 }

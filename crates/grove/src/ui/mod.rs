@@ -2,6 +2,7 @@
 //! turns clicks into [`Action`]s, and it never runs a subprocess.
 
 pub mod dialogs;
+pub mod icons;
 pub mod project_list;
 pub mod settings;
 pub mod theme;

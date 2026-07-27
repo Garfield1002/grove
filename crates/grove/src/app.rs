@@ -464,6 +464,17 @@ impl GroveApp {
     /// Keyboard navigation (DESIGN.md §16). Ignored while a dialog is open so
     /// Delete cannot fire behind a confirmation.
     fn keyboard(&mut self, ctx: &egui::Context) {
+        // The window has no decorations and therefore no close button, so
+        // Grove has to offer the shortcut itself. This is the one behaviour
+        // addition of the visual pass, and it works with a dialog open.
+        let close = ctx.input(|i| {
+            i.modifiers.command && (i.key_pressed(egui::Key::Q) || i.key_pressed(egui::Key::W))
+        });
+        if close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         if self.create.is_some() || self.removal.is_some() || self.open_project_path.is_some() {
             return;
         }
@@ -504,52 +515,95 @@ impl GroveApp {
         }
     }
 
+    /// The header bar: the app title, the Restore placeholder, the open-project
+    /// action, and the filter field — the mockup's top region.
+    ///
+    /// The bar doubles as the window's drag handle. The window is undecorated
+    /// (see `main`), so without this there would be no way to move it. The
+    /// drag region is interacted with *first*, which in egui puts it below the
+    /// buttons and the text field: a click on a control is never a drag.
     fn header(&mut self, ui: &mut egui::Ui) {
+        let bar = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), theme::ICON_BUTTON),
+        );
+        let drag = ui.interact(
+            bar,
+            ui.id().with("grove-titlebar"),
+            egui::Sense::click_and_drag(),
+        );
+        if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
+            ui.set_min_height(theme::ICON_BUTTON);
             ui.label(
-                egui::RichText::new("Worktrees")
-                    .size(14.0)
+                egui::RichText::new("Grove")
+                    .size(theme::FONT_TITLE)
                     .strong()
                     .color(theme::TEXT_STRONG),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(theme::label("＋", 13.0, theme::TEXT_DIM))
-                    .on_hover_text("Open project")
+                if ui::icons::button(ui, true, ui::icons::plus)
+                    .on_hover_text("Open a project")
                     .clicked()
                 {
                     self.open_project_path = Some(String::new());
                 }
-                if ui
-                    .button(theme::label("Refresh", 11.0, theme::TEXT_DIM))
-                    .on_hover_text("Re-read worktrees from git and sessions from tmux")
-                    .clicked()
-                {
-                    self.refresh_all();
-                }
+                ui::icons::chip(ui, "Restore", false, ui::icons::refresh).on_hover_text(
+                    "Milestone 3 — restore and reconcile saved state.\n\
+                     Ctrl+R re-reads git and tmux in the meantime.",
+                );
             });
         });
-        ui.add_space(4.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("Filter worktrees…")
-                .desired_width(f32::INFINITY),
-        );
+
+        ui.add_space(8.0);
+        self.filter_field(ui);
     }
 
+    /// The mockup's filter field: a rounded, subtly bordered pill with a
+    /// magnifier and a placeholder.
+    fn filter_field(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(theme::FIELD)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .corner_radius(egui::CornerRadius::same(theme::CHIP_RADIUS))
+            .inner_margin(egui::Margin::symmetric(10, 0))
+            .show(ui, |ui| {
+                ui.set_height(theme::FIELD_HEIGHT);
+                ui.horizontal_centered(|ui| {
+                    let (glass, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(13.0), egui::Sense::hover());
+                    ui::icons::magnifier(ui.painter(), glass, theme::TEXT_FAINT);
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .frame(false)
+                            .font(egui::FontId::proportional(theme::FONT_BODY))
+                            .hint_text(theme::label(
+                                "Filter worktrees…",
+                                theme::FONT_BODY,
+                                theme::TEXT_FAINT,
+                            ))
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            });
+    }
+
+    /// The footer: "Open Project" on the left, the settings affordance on the
+    /// right, and the most recent status line underneath. Refresh stays on
+    /// Ctrl+R and the context menus — a second circular arrow down here just
+    /// read as a duplicate of the header's Restore.
     fn footer(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            if ui
-                .button(theme::label("Open Project", 12.0, theme::TEXT_DIM))
-                .clicked()
-            {
+            ui.set_min_height(theme::ICON_BUTTON);
+            if open_project_entry(ui).clicked() {
                 self.open_project_path = Some(String::new());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(theme::label("⚙", 13.0, theme::TEXT_MUTED))
+                if ui::icons::button(ui, true, ui::icons::gear)
                     .on_hover_text("Settings")
                     .clicked()
                 {
@@ -558,10 +612,46 @@ impl GroveApp {
             });
         });
         if let Some(status) = &self.status {
-            ui.add_space(2.0);
-            ui.add(egui::Label::new(theme::label(status, 10.0, theme::TEXT_FAINT)).truncate());
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(theme::label(status, theme::FONT_SMALL, theme::TEXT_FAINT))
+                    .truncate(),
+            );
         }
     }
+}
+
+/// The footer's "Open Project" entry: a folder icon and a label that hover
+/// together, as one target.
+fn open_project_entry(ui: &mut egui::Ui) -> egui::Response {
+    let font = egui::FontId::proportional(theme::FONT_BODY);
+    let galley = ui
+        .painter()
+        .layout_no_wrap("Open Project".to_owned(), font, theme::TEXT_DIM);
+    let width = 13.0 + 7.0 + galley.size().x;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, theme::ICON_BUTTON), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if ui.is_rect_visible(rect) {
+        let tint = if response.hovered() {
+            theme::TEXT_STRONG
+        } else {
+            theme::TEXT_DIM
+        };
+        let painter = ui.painter();
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 6.5, rect.center().y),
+            egui::Vec2::splat(13.0),
+        );
+        ui::icons::folder(painter, icon, tint);
+        painter.galley(
+            egui::pos2(icon.right() + 7.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            tint,
+        );
+    }
+    response
 }
 
 impl eframe::App for GroveApp {
@@ -616,21 +706,31 @@ impl eframe::App for GroveApp {
             self.show_settings = open;
         }
 
-        egui::TopBottomPanel::top("grove-header")
+        let header = egui::TopBottomPanel::top("grove-header")
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_SUNKEN)
-                    .inner_margin(egui::Margin::symmetric(10, 9)),
+                    .inner_margin(egui::Margin::symmetric(theme::PANEL_MARGIN_X, 11)),
             )
             .show(ctx, |ui| self.header(ui));
+        hairline(
+            ctx,
+            header.response.rect.left_bottom(),
+            ctx.screen_rect().width(),
+        );
 
-        egui::TopBottomPanel::bottom("grove-footer")
+        let footer = egui::TopBottomPanel::bottom("grove-footer")
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_FOOTER)
-                    .inner_margin(egui::Margin::symmetric(10, 9)),
+                    .inner_margin(egui::Margin::symmetric(theme::PANEL_MARGIN_X, 10)),
             )
             .show(ctx, |ui| self.footer(ui));
+        hairline(
+            ctx,
+            footer.response.rect.left_top(),
+            ctx.screen_rect().width(),
+        );
 
         if !self.errors.is_empty() {
             let mut dismissed = false;
@@ -649,7 +749,7 @@ impl eframe::App for GroveApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
+                    .inner_margin(egui::Margin::symmetric(theme::LIST_MARGIN_X, 6)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -667,6 +767,23 @@ impl eframe::App for GroveApp {
         }
         self.keyboard(ctx);
     }
+}
+
+/// The mockup's `rgba(255,255,255,.06)` divider between two regions.
+///
+/// It goes in its own `Background`-order layer: registered after the panels,
+/// so it paints over their fills, but still under any window, so a dialog is
+/// never crossed by a stray line.
+fn hairline(ctx: &egui::Context, at: egui::Pos2, width: f32) {
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new("grove-hairlines"),
+    ))
+    .hline(
+        at.x..=(at.x + width),
+        at.y - 0.5,
+        egui::Stroke::new(1.0, theme::HAIRLINE),
+    );
 }
 
 /// The worktree rows the user can see, as (project id, worktree id) pairs, in
