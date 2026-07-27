@@ -595,12 +595,11 @@ mod tests {
         assert!(document.contains("set -g mouse on"));
         // Shift+Enter reaches the pane only as a CSI-u sequence, and only
         // when the outer terminal is declared able to carry extended keys.
-        assert!(document.contains("set -s extended-keys on"));
-        assert!(document.contains("set -s extended-keys-format csi-u"));
+        // `always` rather than `on`: tmux otherwise waits for the application
+        // to ask, and folds Shift+Enter into Enter until it does.
+        assert!(document.contains("set -g extended-keys always"));
+        assert!(document.contains("set -g extended-keys-format csi-u"));
         assert!(document.contains("extkeys"));
-        // tmux ignores an application's kitty-protocol request and folds
-        // Shift+Enter into Enter, so the sequence is injected by hand.
-        assert!(document.contains("bind -n S-Enter send-keys -H 1b 5b 31 33 3b 32 75"));
         // Agents signal attention with OSC sequences; tmux must pass them on.
         assert!(document.contains("set -g allow-passthrough on"));
     }
