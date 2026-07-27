@@ -63,6 +63,12 @@ pub enum Task {
         git_common_dir: PathBuf,
         worktree: Box<Worktree>,
     },
+    /// Start the configured agent in a worktree's `agent` window.
+    StartAgent {
+        project_name: String,
+        git_common_dir: PathBuf,
+        worktree: Box<Worktree>,
+    },
     /// Local and remote-tracking branches for the create-worktree dialog.
     LoadBaseRefs {
         project_id: String,
@@ -182,6 +188,12 @@ pub enum Message {
         statuses: HashMap<String, StatusSummary>,
     },
     SessionsRefreshed(HashMap<String, SessionPresence>),
+    /// An agent was started in a session's `agent` window.
+    AgentStarted {
+        worktree_id: String,
+        /// The systemd scope it runs in, when resource accounting is on.
+        unit: Option<String>,
+    },
     /// One poll of the status engine, keyed by worktree id. Sent by the
     /// poller thread, not by the worker.
     StatusPolled(HashMap<String, SessionStatus>),
@@ -427,6 +439,36 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             project_id,
             statuses: workflow::worktree_statuses(&worktrees),
         }],
+
+        Task::StartAgent {
+            project_name,
+            git_common_dir,
+            worktree,
+        } => {
+            let worktree_id = worktree.id.clone();
+            match workflow::start_agent(
+                &worker.server,
+                &worker.config,
+                &worker.paths.runtime_dir,
+                &project_name,
+                &git_common_dir,
+                &worktree,
+            ) {
+                Ok(launch) => {
+                    // The new window is activity tmux reports at once; a poll
+                    // now is what makes the row react immediately.
+                    worker.enqueue(Task::RefreshSessions);
+                    vec![Message::AgentStarted {
+                        worktree_id,
+                        unit: launch.unit,
+                    }]
+                }
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    "could not start the agent",
+                    &e,
+                ))],
+            }
+        }
 
         Task::ClearAttention { session } => {
             match tmux::session::clear_attention(&worker.server, &session) {

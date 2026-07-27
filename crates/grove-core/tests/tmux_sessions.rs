@@ -670,6 +670,85 @@ fn polling_reports_signals_for_grove_sessions_only() {
 }
 
 #[test]
+fn starting_an_agent_opens_its_own_window_beside_the_shell() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree_path = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let test = TestServer::new();
+    let worktree = worktree_at(&worktree_path, Path::new("/repo/.git"), "feature/auth");
+
+    let mut config = Config::default();
+    // `sleep` rather than a real agent: this asserts the plumbing, and the
+    // process must outlive the assertions without needing a terminal.
+    config.agents.command = "sleep 30".into();
+    config.agents.resource_accounting = "never".into();
+
+    let launch = workflow::start_agent(
+        &test.server,
+        &config,
+        dir.path(),
+        "acme-web",
+        Path::new("/repo/.git"),
+        &worktree,
+    )
+    .expect("starts the agent");
+    assert_eq!(launch.unit, None, "accounting is off in this test");
+
+    let windows = test
+        .server
+        .run([
+            "list-windows".to_string(),
+            "-t".to_string(),
+            worktree.session_name(),
+            "-F".to_string(),
+            "#{window_name}".to_string(),
+        ])
+        .expect("lists windows");
+    let names: Vec<&str> = windows.lines().map(str::trim).collect();
+    assert!(
+        names.contains(&"shell") && names.contains(&"agent"),
+        "the agent gets its own window beside the shell: {names:?}"
+    );
+
+    // And the running agent makes the session read as working.
+    let signals =
+        workflow::poll_session_signals(&test.server, workflow::now_epoch()).expect("polls");
+    let mine = &signals[&worktree.id];
+    assert!(
+        mine.pane_commands.iter().any(|c| c == "sleep"),
+        "the agent's process is visible to the poller: {:?}",
+        mine.pane_commands
+    );
+}
+
+#[test]
+fn starting_an_agent_without_a_configured_command_is_refused() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree_path = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let test = TestServer::new();
+    let worktree = worktree_at(&worktree_path, Path::new("/repo/.git"), "main");
+
+    let err = workflow::start_agent(
+        &test.server,
+        &Config::default(),
+        dir.path(),
+        "acme-web",
+        Path::new("/repo/.git"),
+        &worktree,
+    )
+    .expect_err("nothing is configured");
+    assert!(err.to_string().contains("no agent command"));
+
+    // And nothing was created as a side effect of the refusal.
+    assert!(
+        tmux::session::list_sessions(&test.server)
+            .expect("lists")
+            .is_empty()
+    );
+}
+
+#[test]
 fn polling_an_empty_server_is_an_empty_map_not_an_error() {
     require!("tmux");
     let test = TestServer::new();

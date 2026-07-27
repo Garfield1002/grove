@@ -194,6 +194,14 @@ impl GroveApp {
                     statuses,
                 } => self.apply_statuses(&project_id, &statuses),
                 Message::SessionsRefreshed(presence) => self.apply_presence(&presence),
+                Message::AgentStarted { worktree_id, unit } => {
+                    self.selected = Some(worktree_id);
+                    self.status = Some(match unit {
+                        Some(unit) => format!("Started the agent in {unit}"),
+                        None => "Started the agent".to_string(),
+                    });
+                    self.watch.send(Control::PollNow);
+                }
                 Message::StatusPolled(statuses) => {
                     self.statuses = statuses;
                     self.apply_session_statuses();
@@ -471,6 +479,21 @@ impl GroveApp {
                         worktree: Box::new(worktree.clone()),
                     });
                     self.clear_attention(&worktree_id, &session);
+                    self.selected = Some(worktree_id);
+                }
+            }
+            Action::StartAgent {
+                project_id,
+                worktree_id,
+            } => {
+                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
+                    && let Some(worktree) = project.worktree(&worktree_id)
+                {
+                    self.workers.send(Task::StartAgent {
+                        project_name: project.name.clone(),
+                        git_common_dir: project.git_common_dir.clone(),
+                        worktree: Box::new(worktree.clone()),
+                    });
                     self.selected = Some(worktree_id);
                 }
             }

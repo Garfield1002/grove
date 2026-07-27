@@ -14,6 +14,7 @@ pub enum RowAction {
     Activate,
     Select,
     OpenInNewTerminal,
+    StartAgent,
     Refresh,
     Remove,
 }
@@ -211,6 +212,10 @@ pub fn show(
         if ui.button("Copy worktree path").clicked() {
             ui.ctx().copy_text(worktree.path.display().to_string());
             action = Some(RowAction::Select);
+            ui.close();
+        }
+        if ui.button("Start agent").clicked() {
+            action = Some(RowAction::StartAgent);
             ui.close();
         }
         if ui.button("Refresh").clicked() {

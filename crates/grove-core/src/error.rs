@@ -172,6 +172,9 @@ pub enum Error {
     #[error("could not serialize state: {0}")]
     StateWrite(#[from] toml::ser::Error),
 
+    #[error("no agent command is configured — set `command` under [agents] in config.toml")]
+    NoAgentCommand,
+
     #[error("the terminal command template is empty")]
     EmptyTerminalTemplate,
 

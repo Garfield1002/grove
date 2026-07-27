@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::Accounting;
 use crate::error::{Error, Result};
 use crate::status::StatusPolicy;
 use crate::terminal;
@@ -22,6 +23,39 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub worktrees: WorktreeConfig,
     pub status: StatusConfig,
+    pub agents: AgentConfig,
+}
+
+/// The `[agents]` section: the command Grove starts in a session's agent
+/// window, and whether to account for its resources (DESIGN.md §15).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    /// Shell-style command template, expanded like the terminal one. Empty
+    /// means Grove offers no "start agent" action at all.
+    pub command: String,
+    /// Per-project overrides, keyed by project name.
+    pub per_project: std::collections::BTreeMap<String, String>,
+    /// `auto` (wrap when a systemd user manager is present), `always` or
+    /// `never`. An unrecognised value falls back to `auto` rather than
+    /// refusing to load the file.
+    pub resource_accounting: String,
+}
+
+impl AgentConfig {
+    /// The template for a project: its own if it has one, else the default.
+    pub fn command_for(&self, project: &str) -> Option<&str> {
+        self.per_project
+            .get(project)
+            .map(String::as_str)
+            .or(Some(self.command.as_str()))
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
+
+    pub fn accounting(&self) -> Accounting {
+        Accounting::parse(&self.resource_accounting).unwrap_or_default()
+    }
 }
 
 /// The `[status]` section: how sessions are judged working, idle or needing
@@ -134,7 +168,17 @@ pub fn first_run_document(terminal_command: &str) -> String {
          # working_window_secs = 10\n\
          # agent_commands = [\"claude\", \"aider\", \"codex\", \"goose\"]\n\
          # bell_is_attention = false\n\
-         # desktop_notifications = true\n",
+         # desktop_notifications = true\n\
+         \n\
+         # [agents]\n\
+         # Command started in a session's `agent` window. Split with shell\n\
+         # quoting rules first, then the placeholders above are substituted\n\
+         # into the resulting arguments — never the other way round.\n\
+         # command = \"claude\"\n\
+         # resource_accounting = \"auto\"   # auto | always | never\n\
+         #\n\
+         # [agents.per_project]\n\
+         # acme-web = \"claude --resume\"\n",
         toml_string(terminal_command)
     )
 }
@@ -245,6 +289,47 @@ mod tests {
     use super::*;
 
     const DETECTED: &str = "foot tmux -S {socket} attach-session -t {session}";
+
+    #[test]
+    fn no_agent_command_means_no_agent_action() {
+        let config = Config::default();
+        assert_eq!(config.agents.command_for("acme-web"), None);
+        assert_eq!(config.agents.accounting(), Accounting::Auto);
+    }
+
+    #[test]
+    fn a_per_project_agent_command_beats_the_default() {
+        let text = "[agents]\n\
+                    command = \"claude\"\n\
+                    resource_accounting = \"never\"\n\
+                    \n\
+                    [agents.per_project]\n\
+                    acme-web = \"claude --resume\"\n\
+                    quiet-repo = \"  \"\n";
+        let config = Config::from_toml(text, Path::new("c.toml")).expect("valid");
+        assert_eq!(
+            config.agents.command_for("acme-web"),
+            Some("claude --resume")
+        );
+        assert_eq!(config.agents.command_for("other"), Some("claude"));
+        assert_eq!(
+            config.agents.command_for("quiet-repo"),
+            None,
+            "a project can opt out by blanking its command"
+        );
+        assert_eq!(config.agents.accounting(), Accounting::Never);
+    }
+
+    #[test]
+    fn an_unrecognised_accounting_value_falls_back_rather_than_failing() {
+        // The file is the user's; a typo must not stop Grove from loading it.
+        let config = Config::from_toml(
+            "[agents]\nresource_accounting = \"sometimes\"\n",
+            Path::new("c.toml"),
+        )
+        .expect("still loads");
+        assert_eq!(config.agents.accounting(), Accounting::Auto);
+    }
 
     #[test]
     fn an_absent_status_section_is_the_default_policy() {

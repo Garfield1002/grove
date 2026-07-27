@@ -38,6 +38,11 @@ pub enum Action {
         project_id: String,
         worktree_id: String,
     },
+    /// Start the configured agent in a worktree's session.
+    StartAgent {
+        project_id: String,
+        worktree_id: String,
+    },
     /// Open the safe-removal dialog for a worktree.
     RemoveWorktree {
         project_id: String,

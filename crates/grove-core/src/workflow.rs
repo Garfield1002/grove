@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::agent;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git::{self, StatusSummary, WorktreeAdd};
@@ -164,6 +165,51 @@ pub fn apply_session_presence(
             .copied()
             .unwrap_or(SessionPresence::None);
     }
+}
+
+/// Start the configured agent in a worktree's session (DESIGN.md §7).
+///
+/// The session is ensured first: starting an agent is also a reasonable way to
+/// open a worktree, and a `new-window` against a session that does not exist
+/// would simply fail. The agent gets its own window, so closing it leaves the
+/// shell — and the session — alone.
+///
+/// Runs subprocesses: worker thread only.
+pub fn start_agent(
+    server: &TmuxServer,
+    config: &Config,
+    runtime_dir: &Path,
+    project_name: &str,
+    git_common_dir: &Path,
+    worktree: &Worktree,
+) -> Result<agent::AgentLaunch> {
+    let Some(template) = config.agents.command_for(project_name) else {
+        return Err(Error::NoAgentCommand);
+    };
+    if !worktree.path.is_dir() {
+        return Err(Error::WorktreeMissing(worktree.path.clone()));
+    }
+    let spec = session_spec(project_name, git_common_dir, worktree);
+    let (session, _) = tmux::ensure_session(server, &spec)?;
+
+    let vars = TemplateVars::new(
+        server.socket(),
+        &session,
+        &worktree.path,
+        project_name,
+        worktree.branch.as_deref().unwrap_or_default(),
+    );
+    let launch = agent::launch(
+        template,
+        &vars,
+        &session,
+        &worktree.path,
+        &worktree.id,
+        config.agents.accounting(),
+        agent::systemd_available(runtime_dir),
+    )?;
+    server.run(launch.args.clone())?;
+    Ok(launch)
 }
 
 /// Stamp polled session statuses onto a worktree list.
