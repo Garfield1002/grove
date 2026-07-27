@@ -363,6 +363,7 @@ pub fn body(
                 ("config.toml", paths.config_file()),
                 ("state.toml", paths.state_file()),
                 ("tmux.conf", paths.tmux_config_file()),
+                ("grove.tmux.conf", paths.managed_tmux_config_file()),
                 ("tmux socket", paths.tmux_socket()),
             ] {
                 ui.label(theme::caption(name));
