@@ -41,6 +41,17 @@ This document records the *resolved* architecture. The full product design
 
 - **Private tmux server** at `$XDG_RUNTIME_DIR/grove/tmux.sock`. Every tmux
   invocation passes `-S` explicitly. Never touch the user's default server.
+- **Grove-owned tmux config.** The server is started with
+  `-f $XDG_CONFIG_HOME/grove/tmux.conf` (a bare `-S` server would still read
+  `~/.tmux.conf`). The file is generated on first run and user-editable;
+  the default sources `~/.tmux.conf` when present, then applies the
+  settings Grove depends on (`monitor-bell on`, `monitor-activity on`,
+  `exit-empty off`).
+- **Session metadata as tmux user options.** At creation, each session gets
+  `@grove_id`, `@grove_project`, `@grove_worktree` (canonical path), and
+  `@grove_repo` (git-common-dir) set via `set-option`. The tmux server thus
+  carries the worktree ↔ session mapping itself, queryable with
+  `list-sessions -F '#{@grove_worktree}'`.
 - **Sessions outlive Grove.** Closing the GUI or the terminal never kills
   tmux sessions (FR-7).
 - **One primary client** in v1: selecting a worktree runs
@@ -150,8 +161,10 @@ On startup and on "Refresh"/"Restore project":
 1. Load `state.toml` (tolerate missing/partial file).
 2. `git -C <project> worktree list --porcelain` → actual worktrees; match by
    canonical path + repository identity (not by branch name).
-3. `tmux -S $SOCKET list-sessions` → actual sessions; match by `wt-<id>` name
-   (deterministic IDs make this exact even after state loss).
+3. `tmux -S $SOCKET list-sessions` → actual sessions; match primarily by the
+   `@grove_*` user options each session carries (id, project, worktree path,
+   repo), falling back to the `wt-<id>` name — deterministic IDs and
+   session-embedded metadata both survive `state.toml` loss.
 4. Diff: mark missing worktree paths *unavailable*, missing sessions
    *stopped*, sessions with no worktree *orphaned* (offer open / associate /
    close / ignore). **Never delete anything automatically.**
