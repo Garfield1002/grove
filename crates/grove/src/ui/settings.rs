@@ -27,6 +27,11 @@ pub fn show(ctx: &Context, open: &mut bool, paths: &Paths, config: Option<&Confi
             row(ui, "state.toml", &paths.state_file().display().to_string());
             row(
                 ui,
+                "tmux.conf",
+                &paths.tmux_config_file().display().to_string(),
+            );
+            row(
+                ui,
                 "tmux socket",
                 &paths.tmux_socket().display().to_string(),
             );

@@ -110,6 +110,12 @@ impl Paths {
     pub fn tmux_socket(&self) -> PathBuf {
         self.runtime_dir.join(SOCKET_FILE)
     }
+
+    /// Grove's own tmux configuration, passed as `-f`. Without it a private
+    /// server would still read `~/.tmux.conf`.
+    pub fn tmux_config_file(&self) -> PathBuf {
+        self.config_dir.join("tmux.conf")
+    }
 }
 
 fn home(env: &Env, wanted: &'static str) -> Result<PathBuf> {
@@ -174,6 +180,23 @@ mod tests {
         assert_eq!(
             paths.tmux_socket(),
             PathBuf::from("/run/user/1000/grove/tmux.sock")
+        );
+        assert_eq!(
+            paths.tmux_config_file(),
+            PathBuf::from("/x/config/grove/tmux.conf")
+        );
+    }
+
+    #[test]
+    fn the_tmux_config_lives_beside_config_toml() {
+        let paths = Paths::resolve(&env()).expect("resolves");
+        assert_eq!(
+            paths.tmux_config_file(),
+            PathBuf::from("/home/u/.config/grove/tmux.conf")
+        );
+        assert_eq!(
+            paths.tmux_config_file().parent(),
+            paths.config_file().parent()
         );
     }
 

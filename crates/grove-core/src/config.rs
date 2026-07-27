@@ -110,6 +110,52 @@ pub fn detect_terminal_template() -> Result<&'static str> {
     terminal::detect()
 }
 
+/// Grove's own `tmux.conf`, written on first run.
+///
+/// A private server started with `-S` alone still reads `~/.tmux.conf`, so
+/// Grove passes `-f` and owns the file (ARCHITECTURE.md §2). The default
+/// sources the user's own configuration when it exists and then applies the
+/// settings Grove's status detection depends on. Like `config.toml`, this is
+/// written once and never rewritten.
+pub const TMUX_CONFIG_DOCUMENT: &str = "\
+# Grove's private tmux server configuration.
+#
+# Grove starts its server with `-f` pointing here, so ~/.tmux.conf is not
+# read automatically. This file was generated once, on first run; it is
+# yours to edit and Grove will never rewrite it.
+
+# Your own configuration first (silently skipped when absent). If you keep
+# yours at ~/.config/tmux/tmux.conf, add a second source-file line for it.
+source-file -q ~/.tmux.conf
+
+# Settings Grove depends on. Removing these degrades status detection.
+set -g monitor-bell on
+set -g monitor-activity on
+set -s exit-empty off
+";
+
+/// Create `tmux.conf` if it does not exist. Returns true when it was created.
+pub fn ensure_tmux_config(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::io(format!("could not create {}", parent.display()), e))?;
+    }
+    match std::fs::File::create_new(path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(TMUX_CONFIG_DOCUMENT.as_bytes())
+                .map_err(|e| Error::io(format!("could not write {}", path.display()), e))?;
+            Ok(true)
+        }
+        // Another Grove process won the race; its file is just as good.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(Error::io(format!("could not create {}", path.display()), e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +257,32 @@ mod tests {
         let config =
             Config::from_toml("[terminal]\ncommand = \"   \"\n", Path::new("c.toml")).expect("ok");
         assert!(!config.has_terminal());
+    }
+
+    #[test]
+    fn the_tmux_config_is_written_once_and_never_rewritten() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("grove").join("tmux.conf");
+
+        assert!(ensure_tmux_config(&path).expect("creates"));
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(written, TMUX_CONFIG_DOCUMENT);
+
+        // A user edit must survive every later run.
+        std::fs::write(&path, "set -g mouse on\n").expect("user edit");
+        assert!(!ensure_tmux_config(&path).expect("keeps the file"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "set -g mouse on\n"
+        );
+    }
+
+    #[test]
+    fn the_tmux_config_sources_the_users_own_and_sets_what_grove_needs() {
+        // source-file -q so a missing ~/.tmux.conf is not an error.
+        assert!(TMUX_CONFIG_DOCUMENT.contains("source-file -q ~/.tmux.conf"));
+        assert!(TMUX_CONFIG_DOCUMENT.contains("set -g monitor-bell on"));
+        assert!(TMUX_CONFIG_DOCUMENT.contains("set -g monitor-activity on"));
+        assert!(TMUX_CONFIG_DOCUMENT.contains("set -s exit-empty off"));
     }
 }

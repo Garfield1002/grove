@@ -217,6 +217,7 @@ impl GroveApp {
                     self.selected = Some(worktree_id);
                     self.workers.send(Task::Activate {
                         project_name: project.name.clone(),
+                        git_common_dir: project.git_common_dir.clone(),
                         worktree: Box::new(worktree.clone()),
                     });
                 }

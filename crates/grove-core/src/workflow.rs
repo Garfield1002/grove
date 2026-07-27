@@ -13,7 +13,7 @@ use crate::git;
 use crate::ids;
 use crate::model::{Project, SessionPresence, Worktree, worktrees_from_entries};
 use crate::terminal::{self, TemplateVars};
-use crate::tmux::{self, TmuxServer};
+use crate::tmux::{self, SessionSpec, TmuxServer};
 
 /// Register the project containing `path`, with its worktrees and current
 /// session presence.
@@ -92,6 +92,16 @@ impl Activation {
     }
 }
 
+/// The session Grove would create for a worktree of a project.
+pub fn session_spec(project_name: &str, git_common_dir: &Path, worktree: &Worktree) -> SessionSpec {
+    SessionSpec {
+        worktree_id: worktree.id.clone(),
+        worktree_path: worktree.path.clone(),
+        project_name: project_name.to_string(),
+        git_common_dir: git_common_dir.to_path_buf(),
+    }
+}
+
 /// Open a worktree (DESIGN.md §5): verify the worktree still exists, ensure
 /// its session exists, then switch the primary client if one is attached or
 /// launch the configured terminal if not.
@@ -99,12 +109,14 @@ pub fn activate_worktree(
     server: &TmuxServer,
     config: &Config,
     project_name: &str,
+    git_common_dir: &Path,
     worktree: &Worktree,
 ) -> Result<Activation> {
     if !worktree.path.is_dir() {
         return Err(Error::WorktreeMissing(worktree.path.clone()));
     }
-    let (session, _created) = tmux::ensure_session(server, &worktree.id, &worktree.path)?;
+    let spec = session_spec(project_name, git_common_dir, worktree);
+    let (session, _created) = tmux::ensure_session(server, &spec)?;
 
     let clients = tmux::list_clients(server)?;
     if let Some(client) = tmux::primary_client(&clients) {
@@ -178,10 +190,21 @@ mod tests {
             &server,
             &Config::default(),
             "proj",
+            Path::new("/home/u/proj/.git"),
             &worktree("/nonexistent-grove/wt"),
         )
         .expect_err("worktree is gone");
         assert!(matches!(err, Error::WorktreeMissing(_)));
+    }
+
+    #[test]
+    fn a_session_spec_carries_the_whole_mapping() {
+        let worktree = worktree("/home/u/wt/feature");
+        let spec = session_spec("acme-web", Path::new("/home/u/proj/.git"), &worktree);
+        assert_eq!(spec.session_name(), worktree.session_name());
+        assert_eq!(spec.worktree_path, worktree.path);
+        assert_eq!(spec.project_name, "acme-web");
+        assert_eq!(spec.git_common_dir, Path::new("/home/u/proj/.git"));
     }
 
     #[test]

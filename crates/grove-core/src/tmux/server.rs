@@ -3,7 +3,8 @@
 //! Grove keeps its sessions on its own socket (`$XDG_RUNTIME_DIR/grove/
 //! tmux.sock`). Every invocation goes through [`TmuxServer::command`], which
 //! always prepends `-S <socket>`, so no code path can reach the user's
-//! default server.
+//! default server, and `-f <config>` when Grove owns a `tmux.conf` — a `-S`
+//! server would otherwise still read `~/.tmux.conf` (ARCHITECTURE.md §2).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,17 +20,35 @@ pub const TMUX: &str = "tmux";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxServer {
     socket: PathBuf,
+    config: Option<PathBuf>,
 }
 
 impl TmuxServer {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            config: None,
         }
+    }
+
+    /// Point the server at Grove's own `tmux.conf`.
+    ///
+    /// Without `-f`, a private `-S` server still reads `~/.tmux.conf`, so the
+    /// server Grove starts would inherit whatever the user configured for
+    /// their own sessions (ARCHITECTURE.md §2). `-f` only takes effect on the
+    /// command that starts the server, but passing it on every invocation is
+    /// harmless and means no call site has to know which one that was.
+    pub fn with_config(mut self, config: impl Into<PathBuf>) -> Self {
+        self.config = Some(config.into());
+        self
     }
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    pub fn config_file(&self) -> Option<&Path> {
+        self.config.as_deref()
     }
 
     /// Create the socket's parent directory with 0700 permissions. tmux
@@ -41,16 +60,27 @@ impl TmuxServer {
         }
     }
 
-    /// Build `tmux -S <socket> <args…>`.
+    /// Generate `tmux.conf` if it is missing. `tmux -f <missing file>` is an
+    /// error, so this runs before every invocation; it is a single `stat` once
+    /// the file exists.
+    pub fn ensure_config_file(&self) -> Result<()> {
+        match &self.config {
+            Some(path) => crate::config::ensure_tmux_config(path).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    /// Build `tmux [-f <config>] -S <socket> <args…>`.
     pub fn command<I, S>(&self, args: I) -> Invocation
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        Invocation::new(TMUX)
-            .arg("-S")
-            .arg(self.socket.as_os_str())
-            .args(args)
+        let mut invocation = Invocation::new(TMUX);
+        if let Some(config) = &self.config {
+            invocation = invocation.arg("-f").arg(config.as_os_str());
+        }
+        invocation.arg("-S").arg(self.socket.as_os_str()).args(args)
     }
 
     /// Run a tmux command, treating a non-zero exit as an error.
@@ -59,6 +89,7 @@ impl TmuxServer {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        self.ensure_config_file()?;
         self.command(args).output()
     }
 
@@ -68,6 +99,7 @@ impl TmuxServer {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        self.ensure_config_file()?;
         self.command(args).output_allow_failure()
     }
 
@@ -110,6 +142,64 @@ mod tests {
                 OsString::from("/run/user/1000/grove/tmux.sock"),
                 OsString::from("list-sessions"),
             ]
+        );
+    }
+
+    #[test]
+    fn a_configured_server_passes_dash_f_before_dash_s() {
+        let server = TmuxServer::new("/run/user/1000/grove/tmux.sock")
+            .with_config("/home/u/.config/grove/tmux.conf");
+        let inv = server.command(["list-sessions"]);
+        assert_eq!(
+            inv.args,
+            vec![
+                OsString::from("-f"),
+                OsString::from("/home/u/.config/grove/tmux.conf"),
+                OsString::from("-S"),
+                OsString::from("/run/user/1000/grove/tmux.sock"),
+                OsString::from("list-sessions"),
+            ]
+        );
+        assert_eq!(
+            server.config_file(),
+            Some(Path::new("/home/u/.config/grove/tmux.conf"))
+        );
+    }
+
+    #[test]
+    fn config_paths_with_spaces_stay_one_argument() {
+        let server = TmuxServer::new("/tmp/s.sock").with_config("/home/u/my config/tmux.conf");
+        let inv = server.command(["kill-server"]);
+        assert_eq!(inv.args[1], OsString::from("/home/u/my config/tmux.conf"));
+        assert_eq!(inv.args.len(), 5);
+    }
+
+    #[test]
+    fn an_unconfigured_server_passes_no_dash_f() {
+        let server = TmuxServer::new("/tmp/s.sock");
+        assert_eq!(server.config_file(), None);
+        assert!(
+            !server
+                .command(["list-sessions"])
+                .args
+                .contains(&OsString::from("-f"))
+        );
+        server.ensure_config_file().expect("nothing to do");
+    }
+
+    #[test]
+    fn ensure_config_file_generates_it_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join("grove").join("tmux.conf");
+        let server = TmuxServer::new(tmp.path().join("tmux.sock")).with_config(&config);
+
+        server.ensure_config_file().expect("creates");
+        assert!(config.exists());
+        std::fs::write(&config, "set -g mouse on\n").expect("user edit");
+        server.ensure_config_file().expect("keeps");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            "set -g mouse on\n"
         );
     }
 

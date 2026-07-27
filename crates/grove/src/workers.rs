@@ -37,6 +37,7 @@ pub enum Task {
     /// Open a worktree: ensure the session, then switch or launch.
     Activate {
         project_name: String,
+        git_common_dir: PathBuf,
         worktree: Box<Worktree>,
     },
     /// Persist the project index.
@@ -118,7 +119,9 @@ struct WorkerState {
 }
 
 fn run(paths: Paths, tasks: Receiver<Task>, out: Sender<Message>, ctx: egui::Context) {
-    let server = TmuxServer::new(paths.tmux_socket());
+    // `-f` as well as `-S`: a private server started with `-S` alone would
+    // still read the user's ~/.tmux.conf (ARCHITECTURE.md §2).
+    let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
     let mut worker = WorkerState {
         paths,
         server,
@@ -140,18 +143,30 @@ fn run(paths: Paths, tasks: Receiver<Task>, out: Sender<Message>, ctx: egui::Con
 fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
     match task {
         Task::LoadConfig => {
-            match config::load_or_init(&worker.paths.config_file(), terminal::detect) {
-                Ok(loaded) => {
-                    worker.config = loaded.config.clone();
-                    vec![Message::ConfigLoaded {
-                        loaded: Box::new(loaded),
-                    }]
-                }
+            // Generate tmux.conf on first run rather than waiting for the
+            // first tmux command, so it is there to be edited straight away.
+            let mut messages = match worker.server.ensure_config_file() {
+                Ok(()) => Vec::new(),
                 Err(e) => vec![Message::Failed(ErrorReport::new(
-                    "could not load config.toml",
+                    "could not create tmux.conf",
                     &e,
                 ))],
-            }
+            };
+            messages.extend(
+                match config::load_or_init(&worker.paths.config_file(), terminal::detect) {
+                    Ok(loaded) => {
+                        worker.config = loaded.config.clone();
+                        vec![Message::ConfigLoaded {
+                            loaded: Box::new(loaded),
+                        }]
+                    }
+                    Err(e) => vec![Message::Failed(ErrorReport::new(
+                        "could not load config.toml",
+                        &e,
+                    ))],
+                },
+            );
+            messages
         }
 
         Task::OpenProject(path) => match workflow::open_project(&worker.server, &path) {
@@ -192,6 +207,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
 
         Task::Activate {
             project_name,
+            git_common_dir,
             worktree,
         } => {
             let worktree_id = worktree.id.clone();
@@ -199,6 +215,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 &worker.server,
                 &worker.config,
                 &project_name,
+                &git_common_dir,
                 &worktree,
             ) {
                 Ok(activation) => {

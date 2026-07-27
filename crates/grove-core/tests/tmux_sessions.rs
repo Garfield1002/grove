@@ -12,7 +12,7 @@ use common::{have, init_repo, skip};
 use grove_core::config::Config;
 use grove_core::ids;
 use grove_core::model::{SessionPresence, Worktree};
-use grove_core::tmux::{self, TmuxServer};
+use grove_core::tmux::{self, SessionSpec, TmuxServer};
 use grove_core::workflow::{self, Activation};
 
 macro_rules! require {
@@ -35,9 +35,20 @@ struct TestServer {
 impl TestServer {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let server = TmuxServer::new(dir.path().join("run").join("tmux.sock"));
+        let server = TmuxServer::new(dir.path().join("run").join("tmux.sock"))
+            .with_config(dir.path().join("config").join("tmux.conf"));
         server.ensure_socket_dir().expect("socket dir");
         Self { server, _dir: dir }
+    }
+}
+
+/// Session spec for a worktree, with the repository identity tmux will carry.
+fn spec_for(path: &Path, project: &str) -> SessionSpec {
+    SessionSpec {
+        worktree_id: ids::worktree_id(Path::new("/repo/.git"), path),
+        worktree_path: path.to_path_buf(),
+        project_name: project.to_string(),
+        git_common_dir: PathBuf::from("/repo/.git"),
     }
 }
 
@@ -85,9 +96,9 @@ fn creates_a_detached_session_rooted_in_the_worktree() {
     let worktree_canonical = std::fs::canonicalize(&worktree).expect("canonicalize");
 
     let test = TestServer::new();
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree_canonical);
-    let (name, created) =
-        tmux::ensure_session(&test.server, &id, &worktree_canonical).expect("creates");
+    let spec = spec_for(&worktree_canonical, "acme-web");
+    let id = spec.worktree_id.clone();
+    let (name, created) = tmux::ensure_session(&test.server, &spec).expect("creates");
 
     assert!(created);
     assert_eq!(name, format!("wt-{id}"));
@@ -110,8 +121,9 @@ fn the_session_exports_grove_session() {
     let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
 
     let test = TestServer::new();
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree);
-    let (name, _) = tmux::ensure_session(&test.server, &id, &worktree).expect("creates");
+    let spec = spec_for(&worktree, "acme-web");
+    let id = spec.worktree_id.clone();
+    let (name, _) = tmux::ensure_session(&test.server, &spec).expect("creates");
 
     let value = tmux::session::session_env(&test.server, &name, "GROVE_SESSION")
         .expect("reads the session environment");
@@ -125,8 +137,8 @@ fn window_zero_is_named_shell() {
     let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
 
     let test = TestServer::new();
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree);
-    let (name, _) = tmux::ensure_session(&test.server, &id, &worktree).expect("creates");
+    let (name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
 
     let windows = test
         .server
@@ -148,11 +160,9 @@ fn ensure_session_is_idempotent() {
     let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
 
     let test = TestServer::new();
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree);
-    let (first, created_first) =
-        tmux::ensure_session(&test.server, &id, &worktree).expect("creates");
-    let (second, created_second) =
-        tmux::ensure_session(&test.server, &id, &worktree).expect("reuses");
+    let spec = spec_for(&worktree, "acme-web");
+    let (first, created_first) = tmux::ensure_session(&test.server, &spec).expect("creates");
+    let (second, created_second) = tmux::ensure_session(&test.server, &spec).expect("reuses");
 
     assert!(created_first);
     assert!(!created_second, "the second call must reuse the session");
@@ -174,13 +184,13 @@ fn distinct_worktrees_get_distinct_sessions() {
     );
 
     let test = TestServer::new();
-    let common = Path::new("/repo/.git");
-    let id_a = ids::worktree_id(common, &a);
-    let id_b = ids::worktree_id(common, &b);
+    let spec_a = spec_for(&a, "acme-web");
+    let spec_b = spec_for(&b, "acme-web");
+    let (id_a, id_b) = (spec_a.worktree_id.clone(), spec_b.worktree_id.clone());
     assert_ne!(id_a, id_b);
 
-    tmux::ensure_session(&test.server, &id_a, &a).expect("creates a");
-    tmux::ensure_session(&test.server, &id_b, &b).expect("creates b");
+    tmux::ensure_session(&test.server, &spec_a).expect("creates a");
+    tmux::ensure_session(&test.server, &spec_b).expect("creates b");
 
     let mut names: Vec<_> = tmux::list_sessions(&test.server)
         .expect("lists")
@@ -202,12 +212,18 @@ fn sessions_survive_in_worktrees_with_spaces_in_their_path() {
     let worktree = std::fs::canonicalize(&worktree).expect("canonicalize");
 
     let test = TestServer::new();
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree);
-    tmux::ensure_session(&test.server, &id, &worktree).expect("creates");
+    let spec = spec_for(&worktree, "my project");
+    tmux::ensure_session(&test.server, &spec).expect("creates");
 
     let sessions = tmux::list_sessions(&test.server).expect("lists");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].path, worktree);
+    // The spaced path must survive the round trip through a tmux user option.
+    assert_eq!(
+        sessions[0].metadata.worktree.as_deref(),
+        Some(worktree.as_path())
+    );
+    assert_eq!(sessions[0].metadata.project.as_deref(), Some("my project"));
 }
 
 #[test]
@@ -219,8 +235,7 @@ fn no_client_is_attached_to_a_fresh_server() {
     let test = TestServer::new();
     assert!(tmux::list_clients(&test.server).expect("lists").is_empty());
 
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree);
-    tmux::ensure_session(&test.server, &id, &worktree).expect("creates");
+    tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
     let clients = tmux::list_clients(&test.server).expect("lists");
     assert!(
         clients.is_empty(),
@@ -243,11 +258,10 @@ fn killing_a_session_leaves_the_others_alone() {
     );
 
     let test = TestServer::new();
-    let common = Path::new("/repo/.git");
     let (name_a, _) =
-        tmux::ensure_session(&test.server, &ids::worktree_id(common, &a), &a).expect("creates a");
+        tmux::ensure_session(&test.server, &spec_for(&a, "acme-web")).expect("creates a");
     let (name_b, _) =
-        tmux::ensure_session(&test.server, &ids::worktree_id(common, &b), &b).expect("creates b");
+        tmux::ensure_session(&test.server, &spec_for(&b, "acme-web")).expect("creates b");
 
     tmux::session::kill_session(&test.server, &name_a).expect("kills a");
     let names: Vec<_> = tmux::list_sessions(&test.server)
@@ -270,8 +284,7 @@ fn sessions_are_invisible_on_another_socket() {
     let other = TestServer::new();
     assert_ne!(test.server.socket(), other.server.socket());
 
-    let id = ids::worktree_id(Path::new("/repo/.git"), &worktree);
-    tmux::ensure_session(&test.server, &id, &worktree).expect("creates");
+    tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
 
     assert_eq!(tmux::list_sessions(&test.server).expect("lists").len(), 1);
     assert!(
@@ -326,8 +339,14 @@ fn activating_a_worktree_creates_the_session_and_launches_the_terminal() {
         },
     };
 
-    let activation = workflow::activate_worktree(&test.server, &config, "acme-web", &worktree)
-        .expect("activates");
+    let activation = workflow::activate_worktree(
+        &test.server,
+        &config,
+        "acme-web",
+        &discovery.git_common_dir,
+        &worktree,
+    )
+    .expect("activates");
     let session = match &activation {
         Activation::LaunchedTerminal { session, .. } => session.clone(),
         other => panic!("expected a terminal launch with no client attached, got {other:?}"),
@@ -371,14 +390,25 @@ fn activation_reuses_an_existing_session() {
     let worktree = worktree_at(&worktree_path, Path::new("/repo/.git"), "main");
 
     let test = TestServer::new();
-    tmux::ensure_session(&test.server, &worktree.id, &worktree.path).expect("creates");
+    tmux::ensure_session(
+        &test.server,
+        &workflow::session_spec("proj", Path::new("/repo/.git"), &worktree),
+    )
+    .expect("creates");
 
     let config = Config {
         terminal: grove_core::config::TerminalConfig {
             command: "/bin/true {session}".into(),
         },
     };
-    workflow::activate_worktree(&test.server, &config, "proj", &worktree).expect("activates");
+    workflow::activate_worktree(
+        &test.server,
+        &config,
+        "proj",
+        Path::new("/repo/.git"),
+        &worktree,
+    )
+    .expect("activates");
     assert_eq!(
         tmux::list_sessions(&test.server).expect("lists").len(),
         1,
@@ -394,8 +424,14 @@ fn activation_refuses_a_worktree_that_has_disappeared() {
     let worktree = worktree_at(&gone, Path::new("/repo/.git"), "main");
 
     let test = TestServer::new();
-    let err = workflow::activate_worktree(&test.server, &Config::default(), "proj", &worktree)
-        .expect_err("worktree is missing");
+    let err = workflow::activate_worktree(
+        &test.server,
+        &Config::default(),
+        "proj",
+        Path::new("/repo/.git"),
+        &worktree,
+    )
+    .expect_err("worktree is missing");
     assert!(err.to_string().contains("no longer exists"));
     assert!(
         tmux::list_sessions(&test.server).expect("lists").is_empty(),
@@ -411,8 +447,14 @@ fn activation_without_a_terminal_template_reports_it_after_creating_the_session(
     let worktree = worktree_at(&worktree_path, Path::new("/repo/.git"), "main");
 
     let test = TestServer::new();
-    let err = workflow::activate_worktree(&test.server, &Config::default(), "proj", &worktree)
-        .expect_err("no terminal configured");
+    let err = workflow::activate_worktree(
+        &test.server,
+        &Config::default(),
+        "proj",
+        Path::new("/repo/.git"),
+        &worktree,
+    )
+    .expect_err("no terminal configured");
     assert!(err.to_string().contains("terminal command template"));
     // The session is still there: the user can retry after fixing config.toml.
     assert_eq!(tmux::list_sessions(&test.server).expect("lists").len(), 1);
@@ -432,5 +474,152 @@ fn wait_for_file(path: &PathBuf) -> String {
     panic!(
         "the terminal was never launched: {} is empty",
         path.display()
+    );
+}
+
+/// The `@grove_*` user options must round-trip through the real tmux server:
+/// this is the mapping restore and orphan association will read back.
+#[test]
+fn session_metadata_round_trips_through_tmux_user_options() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = dir.path().join("my projects").join("a work tree");
+    std::fs::create_dir_all(&worktree).expect("mkdir");
+    let worktree = std::fs::canonicalize(&worktree).expect("canonicalize");
+
+    let test = TestServer::new();
+    let spec = SessionSpec {
+        worktree_id: ids::worktree_id(Path::new("/home/u/my repo/.git"), &worktree),
+        worktree_path: worktree.clone(),
+        project_name: "my repo".into(),
+        git_common_dir: PathBuf::from("/home/u/my repo/.git"),
+    };
+    let (name, _) = tmux::ensure_session(&test.server, &spec).expect("creates");
+
+    // Read back through the documented format string.
+    let raw = test
+        .server
+        .run([
+            "list-sessions".to_string(),
+            "-F".to_string(),
+            "#{@grove_id}\u{1}#{@grove_project}\u{1}#{@grove_worktree}\u{1}#{@grove_repo}"
+                .to_string(),
+        ])
+        .expect("lists with a user-option format");
+    let fields: Vec<&str> = raw.trim_end().split('\u{1}').collect();
+    assert_eq!(
+        fields,
+        vec![
+            spec.worktree_id.as_str(),
+            "my repo",
+            &worktree.to_string_lossy(),
+            "/home/u/my repo/.git",
+        ],
+        "spaces in the project name and worktree path must survive"
+    );
+
+    // And through the typed accessor.
+    let metadata = tmux::session::session_metadata(&test.server, &name).expect("reads metadata");
+    assert!(metadata.is_complete());
+    assert_eq!(metadata.id.as_deref(), Some(spec.worktree_id.as_str()));
+    assert_eq!(metadata.project.as_deref(), Some("my repo"));
+    assert_eq!(metadata.worktree.as_deref(), Some(worktree.as_path()));
+    assert_eq!(
+        metadata.repo.as_deref(),
+        Some(Path::new("/home/u/my repo/.git"))
+    );
+}
+
+#[test]
+fn a_session_grove_did_not_create_carries_no_metadata() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    test.server
+        .run([
+            "new-session".to_string(),
+            "-d".to_string(),
+            "-s".to_string(),
+            "someone-elses".to_string(),
+            "-c".to_string(),
+            cwd.to_string_lossy().into_owned(),
+        ])
+        .expect("creates a foreign session");
+
+    let sessions = tmux::list_sessions(&test.server).expect("lists");
+    assert_eq!(sessions.len(), 1);
+    assert!(!sessions[0].metadata.is_complete());
+    assert_eq!(sessions[0].metadata.id, None);
+    assert_eq!(sessions[0].worktree_id(), None);
+}
+
+/// Grove starts its server with `-f`, so the file must exist and be used.
+#[test]
+fn the_server_uses_groves_own_tmux_config() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    let config = test
+        .server
+        .config_file()
+        .expect("the test server is configured")
+        .to_path_buf();
+    assert!(
+        !config.exists(),
+        "the config is generated lazily, not by the constructor"
+    );
+
+    tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+    assert!(config.exists(), "starting the server generated tmux.conf");
+
+    // The options Grove depends on came from that file, not from ~/.tmux.conf.
+    for (option, expected) in [
+        ("monitor-bell", "on"),
+        ("monitor-activity", "on"),
+        ("exit-empty", "off"),
+    ] {
+        let value = test
+            .server
+            .run([
+                "show-options".to_string(),
+                "-gqv".to_string(),
+                option.to_string(),
+            ])
+            .expect("reads the option");
+        assert_eq!(value.trim(), expected, "{option} should be {expected}");
+    }
+}
+
+/// A user edit to tmux.conf must be honoured and never overwritten.
+#[test]
+fn a_user_edited_tmux_config_is_used_as_is() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    let config = test.server.config_file().expect("configured").to_path_buf();
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, "set -g base-index 7\nset -s exit-empty off\n").expect("user config");
+
+    tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+
+    let base_index = test
+        .server
+        .run([
+            "show-options".to_string(),
+            "-gqv".to_string(),
+            "base-index".to_string(),
+        ])
+        .expect("reads base-index");
+    assert_eq!(base_index.trim(), "7", "the user's own setting must win");
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read"),
+        "set -g base-index 7\nset -s exit-empty off\n",
+        "Grove must not rewrite a file the user owns"
     );
 }

@@ -4,8 +4,8 @@
 //! and carrying `GROVE_SESSION=<id>` in its session environment so agent
 //! wrappers can call `grove notify` without configuration.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 
 use crate::error::{Error, ParseError, Result};
 use crate::ids;
@@ -15,12 +15,56 @@ const SOURCE: &str = "tmux list-sessions";
 /// Field separator for `-F` formats. Chosen because it cannot appear in a
 /// session name or a path.
 const SEP: char = '\u{1}';
-const SESSION_FORMAT: &str = "#{session_name}\u{1}#{session_path}\u{1}#{session_attached}";
+const SESSION_FORMAT: &str = concat!(
+    "#{session_name}\u{1}#{session_path}\u{1}#{session_attached}",
+    "\u{1}#{@grove_id}\u{1}#{@grove_project}\u{1}#{@grove_worktree}\u{1}#{@grove_repo}",
+);
 
 /// Name of window 0 in a Grove session.
 pub const SHELL_WINDOW: &str = "shell";
 /// Environment variable exported into every Grove session.
 pub const SESSION_ENV_VAR: &str = "GROVE_SESSION";
+
+/// tmux session user options carrying Grove's mapping.
+pub const OPT_ID: &str = "@grove_id";
+pub const OPT_PROJECT: &str = "@grove_project";
+pub const OPT_WORKTREE: &str = "@grove_worktree";
+pub const OPT_REPO: &str = "@grove_repo";
+
+/// Everything needed to create a session for a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSpec {
+    /// Deterministic worktree id; the session is named `wt-<id>`.
+    pub worktree_id: String,
+    /// Canonical worktree path; the session's working directory.
+    pub worktree_path: PathBuf,
+    pub project_name: String,
+    /// Canonical git-common-dir: the repository's identity.
+    pub git_common_dir: PathBuf,
+}
+
+impl SessionSpec {
+    pub fn session_name(&self) -> String {
+        ids::session_name(&self.worktree_id)
+    }
+}
+
+/// The `@grove_*` user options read back from a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionMetadata {
+    pub id: Option<String>,
+    pub project: Option<String>,
+    pub worktree: Option<PathBuf>,
+    pub repo: Option<PathBuf>,
+}
+
+impl SessionMetadata {
+    /// True when tmux carries the full mapping for this session, which is what
+    /// restore and orphan association will rely on.
+    pub fn is_complete(&self) -> bool {
+        self.id.is_some() && self.worktree.is_some() && self.repo.is_some()
+    }
+}
 
 /// A session as reported by tmux.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,12 +73,18 @@ pub struct SessionInfo {
     pub path: PathBuf,
     /// Number of clients attached to this session.
     pub attached: u32,
+    /// The `@grove_*` user options, absent for sessions Grove did not create.
+    pub metadata: SessionMetadata,
 }
 
 impl SessionInfo {
-    /// The Grove worktree id, when this is one of Grove's sessions.
+    /// The Grove worktree id: the `@grove_id` user option when the server
+    /// carries one, else the id encoded in the session name.
     pub fn worktree_id(&self) -> Option<&str> {
-        ids::id_from_session_name(&self.name)
+        self.metadata
+            .id
+            .as_deref()
+            .or_else(|| ids::id_from_session_name(&self.name))
     }
 }
 
@@ -66,10 +116,18 @@ pub fn parse_sessions(output: &str) -> std::result::Result<Vec<SessionInfo>, Par
                 format!("`{attached}` is not an attached-client count"),
             )
         })?;
+        let mut next = || fields.next().map(str::to_string).filter(|v| !v.is_empty());
+        let metadata = SessionMetadata {
+            id: next(),
+            project: next(),
+            worktree: next().map(PathBuf::from),
+            repo: next().map(PathBuf::from),
+        };
         sessions.push(SessionInfo {
             name: name.to_string(),
             path: PathBuf::from(path),
             attached,
+            metadata,
         });
     }
     Ok(sessions)
@@ -94,44 +152,80 @@ pub fn has_session(server: &TmuxServer, name: &str) -> Result<bool> {
 }
 
 /// Build the `new-session` invocation for a worktree, without running it.
-pub fn new_session_args(name: &str, worktree: &Path, worktree_id: &str) -> Vec<OsString> {
+pub fn new_session_args(spec: &SessionSpec) -> Vec<OsString> {
     vec![
         OsString::from("new-session"),
         OsString::from("-d"),
         OsString::from("-s"),
-        OsString::from(name),
+        OsString::from(spec.session_name()),
         OsString::from("-c"),
-        worktree.as_os_str().to_os_string(),
+        spec.worktree_path.as_os_str().to_os_string(),
         OsString::from("-n"),
         OsString::from(SHELL_WINDOW),
         OsString::from("-e"),
-        OsString::from(format!("{SESSION_ENV_VAR}={worktree_id}")),
+        OsString::from(format!("{SESSION_ENV_VAR}={}", spec.worktree_id)),
     ]
 }
 
-/// Create the detached session for a worktree.
-pub fn create_session(server: &TmuxServer, worktree_id: &str, worktree: &Path) -> Result<String> {
-    if !worktree.is_dir() {
-        return Err(Error::WorktreeMissing(worktree.to_path_buf()));
+/// Build one `set-option -t <session> <name> <value>` invocation.
+pub fn set_option_args(session: &str, name: &str, value: &OsStr) -> Vec<OsString> {
+    vec![
+        OsString::from("set-option"),
+        OsString::from("-t"),
+        OsString::from(session),
+        OsString::from(name),
+        value.to_os_string(),
+    ]
+}
+
+/// The `@grove_*` user options to stamp on a new session, in order.
+pub fn metadata_options(spec: &SessionSpec) -> Vec<(&'static str, OsString)> {
+    vec![
+        (OPT_ID, OsString::from(&spec.worktree_id)),
+        (OPT_PROJECT, OsString::from(&spec.project_name)),
+        (OPT_WORKTREE, spec.worktree_path.as_os_str().to_os_string()),
+        (OPT_REPO, spec.git_common_dir.as_os_str().to_os_string()),
+    ]
+}
+
+/// Write the `@grove_*` user options onto an existing session, so the tmux
+/// server itself carries the worktree ↔ session mapping (ARCHITECTURE.md §2).
+pub fn set_session_metadata(server: &TmuxServer, session: &str, spec: &SessionSpec) -> Result<()> {
+    for (name, value) in metadata_options(spec) {
+        server.run(set_option_args(session, name, &value))?;
+    }
+    Ok(())
+}
+
+/// Read the `@grove_*` user options back from a session.
+pub fn session_metadata(server: &TmuxServer, session: &str) -> Result<SessionMetadata> {
+    Ok(list_sessions(server)?
+        .into_iter()
+        .find(|s| s.name == session)
+        .map(|s| s.metadata)
+        .unwrap_or_default())
+}
+
+/// Create the detached session for a worktree and stamp its metadata.
+pub fn create_session(server: &TmuxServer, spec: &SessionSpec) -> Result<String> {
+    if !spec.worktree_path.is_dir() {
+        return Err(Error::WorktreeMissing(spec.worktree_path.clone()));
     }
     server.ensure_socket_dir()?;
-    let name = ids::session_name(worktree_id);
-    server.run(new_session_args(&name, worktree, worktree_id))?;
+    let name = spec.session_name();
+    server.run(new_session_args(spec))?;
+    set_session_metadata(server, &name, spec)?;
     Ok(name)
 }
 
 /// Ensure the worktree's session exists, creating it if necessary. Returns the
 /// session name and whether it had to be created.
-pub fn ensure_session(
-    server: &TmuxServer,
-    worktree_id: &str,
-    worktree: &Path,
-) -> Result<(String, bool)> {
-    let name = ids::session_name(worktree_id);
+pub fn ensure_session(server: &TmuxServer, spec: &SessionSpec) -> Result<(String, bool)> {
+    let name = spec.session_name();
     if has_session(server, &name)? {
         return Ok((name, false));
     }
-    let name = create_session(server, worktree_id, worktree)?;
+    let name = create_session(server, spec)?;
     Ok((name, true))
 }
 
@@ -218,9 +312,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_grove_user_options() {
+        let text = "wt-a1b2c3\u{1}/home/u/wt/auth\u{1}0\u{1}a1b2c3\u{1}acme-web\u{1}/home/u/wt/auth\u{1}/home/u/proj/.git\n";
+        let sessions = parse_sessions(text).expect("valid");
+        let metadata = &sessions[0].metadata;
+        assert_eq!(metadata.id.as_deref(), Some("a1b2c3"));
+        assert_eq!(metadata.project.as_deref(), Some("acme-web"));
+        assert_eq!(metadata.worktree, Some(PathBuf::from("/home/u/wt/auth")));
+        assert_eq!(metadata.repo, Some(PathBuf::from("/home/u/proj/.git")));
+        assert!(metadata.is_complete());
+    }
+
+    #[test]
+    fn unset_user_options_expand_to_nothing_and_stay_absent() {
+        // tmux expands an unset user option to the empty string.
+        let sessions =
+            parse_sessions("scratch\u{1}/home/u\u{1}0\u{1}\u{1}\u{1}\u{1}\n").expect("valid");
+        assert_eq!(sessions[0].metadata, SessionMetadata::default());
+        assert!(!sessions[0].metadata.is_complete());
+        assert_eq!(sessions[0].worktree_id(), None);
+    }
+
+    #[test]
+    fn the_user_option_id_wins_over_the_session_name() {
+        let sessions = parse_sessions("renamed\u{1}/home/u\u{1}0\u{1}a1b2c3\u{1}p\u{1}/w\u{1}/g\n")
+            .expect("valid");
+        assert_eq!(sessions[0].worktree_id(), Some("a1b2c3"));
+    }
+
+    fn spec() -> SessionSpec {
+        SessionSpec {
+            worktree_id: "a1b2c3".into(),
+            worktree_path: PathBuf::from("/home/u/my wt"),
+            project_name: "acme web".into(),
+            git_common_dir: PathBuf::from("/home/u/my proj/.git"),
+        }
+    }
+
+    #[test]
     fn new_session_is_detached_rooted_named_and_carries_the_env_var() {
-        let args = new_session_args("wt-a1b2c3", Path::new("/home/u/my wt"), "a1b2c3");
-        let args: Vec<String> = args
+        let args: Vec<String> = new_session_args(&spec())
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
@@ -242,10 +373,52 @@ mod tests {
     }
 
     #[test]
+    fn metadata_options_cover_the_whole_mapping() {
+        let options: Vec<(&str, String)> = metadata_options(&spec())
+            .into_iter()
+            .map(|(name, value)| (name, value.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                ("@grove_id", "a1b2c3".to_string()),
+                ("@grove_project", "acme web".to_string()),
+                ("@grove_worktree", "/home/u/my wt".to_string()),
+                ("@grove_repo", "/home/u/my proj/.git".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_option_keeps_values_with_spaces_in_one_argument() {
+        let args: Vec<String> = set_option_args(
+            "wt-a1b2c3",
+            "@grove_worktree",
+            std::ffi::OsStr::new("/home/u/my wt"),
+        )
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(
+            args,
+            vec![
+                "set-option",
+                "-t",
+                "wt-a1b2c3",
+                "@grove_worktree",
+                "/home/u/my wt",
+            ]
+        );
+    }
+
+    #[test]
     fn create_session_refuses_a_missing_worktree() {
         let server = TmuxServer::new("/tmp/grove-test-never-used.sock");
-        let err = create_session(&server, "a1b2c3", Path::new("/nonexistent-grove/wt"))
-            .expect_err("worktree is gone");
+        let spec = SessionSpec {
+            worktree_path: PathBuf::from("/nonexistent-grove/wt"),
+            ..spec()
+        };
+        let err = create_session(&server, &spec).expect_err("worktree is gone");
         assert!(matches!(err, Error::WorktreeMissing(_)));
     }
 }
