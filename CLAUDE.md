@@ -37,9 +37,16 @@ All four of build/test/clippy/fmt must pass before any commit.
   error enums in grove-core; surface errors to the UI, never panic.
 - No async runtime. Concurrency is `std::thread` workers + mpsc channels
   into the egui loop (`ctx.request_repaint()` after sending).
-- Every parser of git/tmux output (`worktree list --porcelain`, status,
-  `list-sessions` formats) gets unit tests with captured real-world samples,
-  including malformed input.
+- This project is **heavily tested** — tests are not optional polish:
+  - Every parser of git/tmux output (`worktree list --porcelain`, status,
+    `list-sessions` formats) gets unit tests with captured real-world
+    samples, including malformed input.
+  - All grove-core logic (id hashing, template expansion, reconciliation,
+    status state machine, atomic state writes) gets unit tests.
+  - Integration tests exercise real `git` against temp repos (`tempfile` crate)
+    and real `tmux` against a throwaway test socket; skip gracefully with a
+    message if the binary is absent, never silently pass.
+  - New functionality lands with its tests in the same commit.
 - Subprocesses: `std::process::Command` with argument arrays. Never build
   shell strings from paths or branch names. The only shell-interpreted
   strings are the user's configured terminal/agent templates.
