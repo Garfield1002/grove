@@ -10,8 +10,20 @@
 
 use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
+use grove_core::state::SlotRecord;
 
 use super::{Action, icons, theme, worktree_row};
+
+/// The number a worktree carries, if any.
+///
+/// A linear scan over at most nine entries, so drawing the list still
+/// allocates nothing per frame.
+fn slot_of(slots: &[SlotRecord], worktree_id: &str) -> Option<u8> {
+    slots
+        .iter()
+        .find(|slot| slot.worktree_id == worktree_id)
+        .map(|slot| slot.number)
+}
 
 /// Draw every project, applying the filter. Returns the user's action.
 pub fn show(
@@ -22,6 +34,7 @@ pub fn show(
     selected_window: Option<(&str, u32)>,
     filter: &str,
     home: Option<&std::path::Path>,
+    slots: &[SlotRecord],
 ) -> Option<Action> {
     let mut action = None;
     let needle = filter.trim().to_ascii_lowercase();
@@ -32,6 +45,7 @@ pub fn show(
             selected,
             selected_window,
             home,
+            slots,
         };
         let matches: Vec<&grove_core::model::Worktree> = project
             .worktrees
@@ -127,13 +141,15 @@ pub fn show(
 }
 
 /// Everything a level of the tree needs beyond the worktree it is drawing:
-/// which project it belongs to, what is selected, and where home is.
+/// which project it belongs to, what is selected, where home is, and the
+/// numbers the user put on worktrees.
 #[derive(Clone, Copy)]
 struct Level<'a> {
     project: &'a Project,
     selected: Option<&'a str>,
     selected_window: Option<(&'a str, u32)>,
     home: Option<&'a std::path::Path>,
+    slots: &'a [SlotRecord],
 }
 
 /// One worktree of a project: either a single leaf row, or a dropdown header
@@ -157,10 +173,14 @@ fn worktree_level(
         selected,
         selected_window,
         home,
+        slots,
     } = level;
     let is_selected = selected == Some(worktree.id.as_str());
+    // The number names the *worktree*, so it goes on whichever row stands for
+    // one — the leaf row here, the header below — and never on a window row.
+    let slot = slot_of(slots, &worktree.id);
     if !has_window_rows(worktree) {
-        let row_action = worktree_row::show(ui, worktree, is_selected, home, stands, depth)?;
+        let row_action = worktree_row::show(ui, worktree, is_selected, home, stands, depth, slot)?;
         return row_action.into_action(&project.id, &worktree.id);
     }
 
@@ -179,6 +199,7 @@ fn worktree_level(
         worktree.windows.len(),
         openness,
         depth,
+        slot,
     ) {
         if row_action == worktree_row::RowAction::Fold {
             state.toggle(ui);
@@ -197,6 +218,7 @@ fn worktree_level(
                 home,
                 worktree_row::Stands::Window(window),
                 depth + 1,
+                None,
             ) else {
                 continue;
             };

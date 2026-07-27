@@ -5,6 +5,7 @@
 mod app;
 mod notify;
 mod status_watch;
+mod toggle;
 mod ui;
 mod workers;
 
@@ -15,6 +16,8 @@ grove — Git worktree and tmux session manager
 
 Usage:
   grove            launch the GUI
+  grove toggle     start or close Grove, or open a numbered worktree
+                   (see `grove toggle --help`)
   grove notify     report a session's status (see `grove notify --help`)
   grove --help     show this message
   grove --version  show the version
@@ -22,12 +25,21 @@ Usage:
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // What a `grove toggle` that found no running GUI asks this process to
+    // open once the GUI is up. `None` for a plain `grove`.
+    let mut pending_toggle = None;
     match args.first().map(String::as_str) {
         None => {}
         Some("notify") => {
             notify::run(&args[1..])?;
             return Ok(());
         }
+        // Falls through to the GUI when nothing was listening: starting Grove
+        // is the other half of the toggle.
+        Some("toggle") => match toggle::run(&args[1..])? {
+            toggle::Next::Done => return Ok(()),
+            toggle::Next::LaunchGui { slot } => pending_toggle = slot,
+        },
         Some("-h" | "--help") => {
             print!("{USAGE}");
             return Ok(());
@@ -66,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "Grove",
         options,
-        Box::new(move |cc| Ok(Box::new(app::GroveApp::new(cc, paths)))),
+        Box::new(move |cc| Ok(Box::new(app::GroveApp::new(cc, paths, pending_toggle)))),
     )?;
     Ok(())
 }

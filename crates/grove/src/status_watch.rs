@@ -7,7 +7,9 @@
 //!   into the engine;
 //! - the **listener** accepts connections on the notify socket and folds
 //!   explicit reports in as they arrive, so attention appears immediately
-//!   rather than up to one poll later.
+//!   rather than up to one poll later. The same socket carries `grove toggle`,
+//!   which touches neither the engine nor tmux and is passed straight to the
+//!   UI.
 //!
 //! The engine is shared behind a mutex because three parties touch it: the two
 //! threads here and the UI, which clears a worktree's attention latch when the
@@ -22,7 +24,7 @@ use std::time::{Duration, Instant};
 use grove_core::cgroup::Usage;
 use grove_core::config::StatusConfig;
 use grove_core::desktop::{self, Attention};
-use grove_core::ipc::{self, Notification};
+use grove_core::ipc::{self, Command, Notification};
 use grove_core::status::{SessionReport, SessionStatus, StatusEngine};
 use grove_core::{Error, Paths, TmuxServer, workflow};
 
@@ -350,33 +352,38 @@ fn listen(
                 continue;
             }
         };
-        let notification = match ipc::read_notification(stream) {
-            Ok(notification) => notification,
+        let command = match ipc::read_command(stream) {
+            Ok(command) => command,
             Err(e) => {
-                eprintln!("grove: ignoring a notification: {e}");
+                eprintln!("grove: ignoring a message: {e}");
                 continue;
             }
         };
-        fold(&engine, &notification);
-        let Notification {
-            worktree_id,
-            state,
-            message,
-        } = notification;
-        if out
-            .send(Message::Notified {
-                worktree_id,
-                state,
-                message,
-            })
-            .is_err()
-        {
+        let message = match command {
+            // A toggle is pure UI: nothing to fold, and no reason to make
+            // tmux answer a question before the window reacts.
+            Command::Toggle { slot } => Message::Toggled { slot },
+            Command::Notify(notification) => {
+                fold(&engine, &notification);
+                let Notification {
+                    worktree_id,
+                    state,
+                    message,
+                } = notification;
+                // The poller owns the labels and the desktop notification, and
+                // it re-reads tmux anyway; asking it to poll now is what turns
+                // an immediate report into an immediate row update.
+                let _ = control.send(Control::PollNow);
+                Message::Notified {
+                    worktree_id,
+                    state,
+                    message,
+                }
+            }
+        };
+        if out.send(message).is_err() {
             return;
         }
-        // The poller owns the labels and the desktop notification, and it
-        // re-reads tmux anyway; asking it to poll now is what turns an
-        // immediate report into an immediate row update.
-        let _ = control.send(Control::PollNow);
         ctx.request_repaint();
     }
 }

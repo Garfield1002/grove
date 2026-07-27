@@ -68,6 +68,9 @@ pub enum RowAction {
     /// place those two have no header of their own to hang off.
     CreateWorktree,
     RemoveProject,
+    /// Put a number on this worktree, so `grove toggle <n>` opens it, or take
+    /// the one it has off (`None`).
+    SetSlot(Option<u8>),
     /// Fold or unfold a worktree's window list. Handled in the list itself:
     /// egui owns that state, and nothing outside the tree cares.
     Fold,
@@ -109,6 +112,7 @@ impl RowAction {
             },
             RowAction::CreateWorktree => Action::CreateWorktree(project_id),
             RowAction::RemoveProject => Action::RemoveProject(project_id),
+            RowAction::SetSlot(slot) => Action::SetWorktreeSlot { worktree_id, slot },
             RowAction::Fold => return None,
         })
     }
@@ -188,6 +192,9 @@ pub fn indent(depth: u8) -> f32 {
 }
 
 /// Draw a leaf row for a worktree, named after whatever it stands for.
+///
+/// `slot` is the number the user put on the worktree, if any — passed as
+/// `None` for a window row, which stands for a window and not a worktree.
 pub fn show(
     ui: &mut Ui,
     worktree: &Worktree,
@@ -195,6 +202,7 @@ pub fn show(
     home: Option<&std::path::Path>,
     stands: Stands,
     depth: u8,
+    slot: Option<u8>,
 ) -> Option<RowAction> {
     let project = stands.as_project();
     let mut action = None;
@@ -271,6 +279,12 @@ pub fn show(
             (SessionPresence::Attached, _) => {
                 painter.circle_filled(dot_center, 4.0, theme::TEXT_DIM);
             }
+        }
+
+        // The number the user put on this worktree, rightmost so the numbered
+        // rows line up in a column of their own and the markers keep theirs.
+        if let Some(number) = slot {
+            marker_x = slot_badge(painter, number, marker_x, rect.center().y) - 5.0;
         }
 
         for marker in markers(worktree).iter() {
@@ -356,7 +370,7 @@ pub fn show(
         action = Some(RowAction::Activate);
     }
 
-    response.context_menu(|ui| menu(ui, worktree, stands, &mut action));
+    response.context_menu(|ui| menu(ui, worktree, stands, slot, &mut action));
 
     // Built lazily: the tooltip allocates, and most rows are never hovered.
     response.on_hover_ui(|ui| {
@@ -368,7 +382,7 @@ pub fn show(
             ))
             .wrap(),
         );
-        for line in hover_lines(worktree) {
+        for line in hover_lines(worktree, slot) {
             ui.label(theme::label(line, theme::FONT_SMALL, theme::TEXT_MUTED));
         }
     });
@@ -388,6 +402,7 @@ pub fn header(
     count: usize,
     openness: f32,
     depth: u8,
+    slot: Option<u8>,
 ) -> Option<RowAction> {
     let mut action = None;
     let (outer, _) = ui.allocate_exact_size(
@@ -483,6 +498,12 @@ pub fn header(
             theme::TEXT_GHOST,
         );
 
+        // Left of the ellipsis, where a leaf row's would be: folding a
+        // worktree away must not hide what `grove toggle <n>` opens.
+        if let Some(number) = slot {
+            slot_badge(painter, number, more_rect.left() - 4.0, rect.center().y);
+        }
+
         if hovered || more.hovered() {
             icons::ellipsis(
                 painter,
@@ -502,15 +523,21 @@ pub fn header(
         action = Some(RowAction::Activate);
     }
 
-    response.context_menu(|ui| menu(ui, worktree, stands, &mut action));
+    response.context_menu(|ui| menu(ui, worktree, stands, slot, &mut action));
     let more = more.on_hover_cursor(egui::CursorIcon::PointingHand);
-    egui::Popup::menu(&more).show(|ui| menu(ui, worktree, stands, &mut action));
+    egui::Popup::menu(&more).show(|ui| menu(ui, worktree, stands, slot, &mut action));
 
     action
 }
 
 /// The menu a worktree row or header offers, wherever it was opened from.
-fn menu(ui: &mut Ui, worktree: &Worktree, stands: Stands, action: &mut Option<RowAction>) {
+fn menu(
+    ui: &mut Ui,
+    worktree: &Worktree,
+    stands: Stands,
+    slot: Option<u8>,
+    action: &mut Option<RowAction>,
+) {
     let open = match stands {
         Stands::Window(_) => "Open or switch to this window",
         _ => "Open or switch to session",
@@ -540,6 +567,37 @@ fn menu(ui: &mut Ui, worktree: &Worktree, stands: Stands, action: &mut Option<Ro
         *action = Some(RowAction::Refresh);
         ui.close();
     }
+    // The keyboard is the fast path (Alt+<digit> on the selected row); this is
+    // where the feature is discoverable at all. A window row is offered it too:
+    // the number it would set is its worktree's, which is what the user means.
+    ui.menu_button("Number for `grove toggle`", |ui| {
+        ui.label(theme::label(
+            "`grove toggle <n>` opens this worktree.",
+            theme::FONT_SMALL,
+            theme::TEXT_FAINT,
+        ));
+        for number in 1..=grove_core::state::MAX_SLOT {
+            let held = slot == Some(number);
+            let label = if held {
+                format!("{number} ✓")
+            } else {
+                number.to_string()
+            };
+            if ui.button(label).clicked() {
+                // Choosing the number it already carries takes it off, which
+                // is what Alt+<digit> does too.
+                *action = Some(RowAction::SetSlot((!held).then_some(number)));
+                ui.close();
+            }
+        }
+        if slot.is_some() {
+            ui.separator();
+            if ui.button("No number").clicked() {
+                *action = Some(RowAction::SetSlot(None));
+                ui.close();
+            }
+        }
+    });
     // With no project header above it, this row is the only way to reach the
     // project's own actions.
     if let Some(project) = stands.as_project() {
@@ -586,6 +644,32 @@ fn menu(ui: &mut Ui, worktree: &Worktree, stands: Stands, action: &mut Option<Ro
     ));
 }
 
+/// Draw the number a worktree carries as a small badge whose right edge is at
+/// `right`, and return its left edge so the caller can keep laying out
+/// leftwards.
+///
+/// Shared by the leaf row and the header: a folded worktree must still show
+/// what `grove toggle <n>` opens.
+fn slot_badge(painter: &egui::Painter, number: u8, right: f32, center_y: f32) -> f32 {
+    let digit = painter.layout_no_wrap(
+        number.to_string(),
+        egui::FontId::monospace(theme::FONT_SUB),
+        theme::TEXT_GHOST,
+    );
+    let width = digit.size().x + 10.0;
+    let left = right - width;
+    let badge =
+        egui::Rect::from_center_size(egui::pos2(left + width / 2.0, center_y), vec2(width, 15.0));
+    painter.rect_filled(
+        badge,
+        egui::CornerRadius::same(theme::BADGE_RADIUS),
+        theme::BADGE,
+    );
+    let size = digit.size();
+    painter.galley(badge.center() - size / 2.0, digit, theme::TEXT_GHOST);
+    left
+}
+
 /// What the dot on a row reports.
 ///
 /// A window row's dot says whether that window is the session's current one —
@@ -600,8 +684,9 @@ fn dot_presence(worktree: &Worktree, stands: Stands) -> SessionPresence {
     }
 }
 
-/// Tooltip lines after the path: the git summary and what each marker means.
-fn hover_lines(worktree: &Worktree) -> Vec<String> {
+/// Tooltip lines after the path: the git summary, the row's number, and what
+/// each marker means.
+fn hover_lines(worktree: &Worktree, slot: Option<u8>) -> Vec<String> {
     let mut lines = Vec::new();
     // What an agent said about itself comes first: it is the only line here
     // the user could not have worked out from the row.
@@ -618,6 +703,9 @@ fn hover_lines(worktree: &Worktree) -> Vec<String> {
     }
     if let Some(status) = &worktree.git_status {
         lines.push(status.summary());
+    }
+    if let Some(number) = slot {
+        lines.push(format!("`grove toggle {number}` opens this worktree"));
     }
     for marker in markers(worktree).iter() {
         lines.push(marker.hint().to_string());
@@ -777,7 +865,7 @@ mod tests {
         worktree.status_message = Some("needs permission to run tests".into());
         worktree.git_status = Some(StatusSummary::default());
         assert_eq!(
-            hover_lines(&worktree).first().map(String::as_str),
+            hover_lines(&worktree, None).first().map(String::as_str),
             Some("needs permission to run tests")
         );
     }
@@ -787,7 +875,25 @@ mod tests {
         let mut worktree = worktree();
         worktree.session = SessionPresence::None;
         worktree.status_message = Some("stale".into());
-        assert!(!hover_lines(&worktree).iter().any(|l| l == "stale"));
+        assert!(!hover_lines(&worktree, None).iter().any(|l| l == "stale"));
+    }
+
+    /// The row shows the number as a badge; the tooltip is where the badge is
+    /// explained, since a bare digit says nothing about what it is for.
+    #[test]
+    fn a_numbered_row_says_what_the_number_does() {
+        let worktree = worktree();
+        assert!(
+            hover_lines(&worktree, Some(3))
+                .iter()
+                .any(|line| line == "`grove toggle 3` opens this worktree")
+        );
+        assert!(
+            !hover_lines(&worktree, None)
+                .iter()
+                .any(|line| line.contains("grove toggle")),
+            "an unnumbered row says nothing about numbers"
+        );
     }
 
     #[test]
@@ -824,7 +930,7 @@ mod tests {
         let hints: Vec<&str> = markers(&worktree).iter().map(Marker::hint).collect();
         assert_eq!(hints, vec!["the worktree directory is missing", "locked"]);
         assert!(
-            hover_lines(&worktree)
+            hover_lines(&worktree, None)
                 .iter()
                 .any(|line| line == "the worktree directory is missing")
         );
@@ -960,7 +1066,7 @@ mod tests {
         });
         assert!(markers(&worktree).is_empty());
         assert!(
-            !hover_lines(&worktree)
+            !hover_lines(&worktree, None)
                 .iter()
                 .any(|line| line == "uncommitted changes")
         );

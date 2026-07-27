@@ -34,6 +34,7 @@ This document records the *resolved* architecture. The full product design
 │  ├─ worker: tmux commands   │──▶ tmux -S $SOCKET … (private server)
 │  ├─ poller thread (2s/10s)  │
 │  └─ IPC listener thread     │◀── grove notify (from agent hooks)
+│                             │◀── grove toggle (from a WM shortcut)
 └─────────────────────────────┘
          │ launches (detached)
          ▼
@@ -191,7 +192,12 @@ when the GUI is running, and *always* also stamps the session with a
 `@grove_attention` tmux user option — so attention raised while the GUI is
 closed is held durably by tmux and picked up by the first poll after the
 next launch. The socket is a latency optimization, not the source of truth.
-Clearing attention (on session open) clears the user option too. Process-name sniffing alone is explicitly *not* trusted
+Clearing attention (on session open) clears the user option too. The same
+socket carries `grove toggle` in the other direction (DESIGN.md §16): a
+keyboard shortcut asking the running GUI to open a numbered worktree, or —
+with no number — to close, since a Wayland client cannot hide and re-show
+itself. Nothing listening is not an error there either: the CLI starts the
+GUI instead and hands it the number to open after the first reconciliation. Process-name sniffing alone is explicitly *not* trusted
 to infer attention; terminal-output parsing is out of scope.
 
 ## 7. Reconciliation & restore

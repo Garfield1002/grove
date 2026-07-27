@@ -6,10 +6,14 @@
 //! the GUI being closed (ARCHITECTURE.md §1). The socket is the fast path, the
 //! tmux option is the source of truth — neither alone is enough.
 //!
-//! The wire format is one newline-terminated line per notification:
+//! The same socket carries `grove toggle`, which is the other direction of the
+//! same idea: a shell command that reaches the running GUI (DESIGN.md §16).
+//!
+//! The wire format is one newline-terminated line per message:
 //!
 //! ```text
 //! grove1<SEP>notify<SEP><worktree-id><SEP><state><SEP><message>
+//! grove1<SEP>toggle<SEP><slot>
 //! ```
 //!
 //! `<SEP>` is `\u{1}`, which cannot appear in a worktree id and is stripped
@@ -32,6 +36,7 @@ pub const VERSION: &str = "grove1";
 
 const SEP: char = '\u{1}';
 const KIND_NOTIFY: &str = "notify";
+const KIND_TOGGLE: &str = "toggle";
 
 /// How long `grove notify` waits on a GUI that has stopped reading. Short on
 /// purpose: the notification is best-effort and must not stall an agent.
@@ -41,6 +46,74 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// summary line, short enough that a hostile writer cannot make the GUI
 /// allocate without bound.
 pub const MAX_MESSAGE_LEN: usize = 200;
+
+/// One message on the socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// An agent wrapper reporting a session's status.
+    Notify(Notification),
+    /// `grove toggle`: with a number, select the worktree carrying it and open
+    /// its session; without one, the window itself is the subject.
+    Toggle { slot: Option<u8> },
+}
+
+impl Command {
+    /// Render the wire line, without its trailing newline.
+    pub fn encode(&self) -> String {
+        match self {
+            Command::Notify(notification) => notification.encode(),
+            Command::Toggle { slot } => {
+                let slot = slot.map(|n| n.to_string()).unwrap_or_default();
+                format!("{VERSION}{SEP}{KIND_TOGGLE}{SEP}{slot}")
+            }
+        }
+    }
+
+    /// Parse one wire line.
+    pub fn decode(line: &str) -> std::result::Result<Self, ProtocolError> {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let mut fields = line.split(SEP);
+        let (Some(version), Some(kind)) = (fields.next(), fields.next()) else {
+            return Err(ProtocolError::Malformed);
+        };
+        if version != VERSION {
+            return Err(ProtocolError::Version(version.to_string()));
+        }
+        match kind {
+            KIND_NOTIFY => {
+                let (Some(id), Some(state)) = (fields.next(), fields.next()) else {
+                    return Err(ProtocolError::Malformed);
+                };
+                if id.is_empty() {
+                    return Err(ProtocolError::Malformed);
+                }
+                let state = SessionStatus::parse(state)
+                    .ok_or_else(|| ProtocolError::State(state.to_string()))?;
+                let message = fields
+                    .next()
+                    .map(sanitize_message)
+                    .filter(|m| !m.is_empty());
+                Ok(Command::Notify(Notification {
+                    worktree_id: id.to_string(),
+                    state,
+                    message,
+                }))
+            }
+            KIND_TOGGLE => {
+                let raw = fields.next().unwrap_or("");
+                let slot = if raw.trim().is_empty() {
+                    None
+                } else {
+                    Some(crate::state::parse_slot(raw).ok_or_else(|| {
+                        ProtocolError::Slot(raw.chars().filter(|c| !c.is_control()).collect())
+                    })?)
+                };
+                Ok(Command::Toggle { slot })
+            }
+            other => Err(ProtocolError::Kind(other.to_string())),
+        }
+    }
+}
 
 /// A status report from an agent wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,35 +151,12 @@ impl Notification {
         )
     }
 
-    /// Parse one wire line.
+    /// Parse one wire line, which must be a notification.
     pub fn decode(line: &str) -> std::result::Result<Self, ProtocolError> {
-        let line = line.trim_end_matches(['\n', '\r']);
-        let mut fields = line.split(SEP);
-        let (Some(version), Some(kind), Some(id), Some(state)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(ProtocolError::Malformed);
-        };
-        if version != VERSION {
-            return Err(ProtocolError::Version(version.to_string()));
+        match Command::decode(line)? {
+            Command::Notify(notification) => Ok(notification),
+            Command::Toggle { .. } => Err(ProtocolError::Kind(KIND_TOGGLE.to_string())),
         }
-        if kind != KIND_NOTIFY {
-            return Err(ProtocolError::Kind(kind.to_string()));
-        }
-        if id.is_empty() {
-            return Err(ProtocolError::Malformed);
-        }
-        let state =
-            SessionStatus::parse(state).ok_or_else(|| ProtocolError::State(state.to_string()))?;
-        let message = fields
-            .next()
-            .map(sanitize_message)
-            .filter(|m| !m.is_empty());
-        Ok(Self {
-            worktree_id: id.to_string(),
-            state,
-            message,
-        })
     }
 }
 
@@ -134,6 +184,8 @@ pub enum ProtocolError {
     Kind(String),
     #[error("unknown state `{0}`")]
     State(String),
+    #[error("`{0}` is not a number a worktree can carry: expected 1–9")]
+    Slot(String),
 }
 
 /// The notify socket path inside a runtime directory.
@@ -146,6 +198,14 @@ pub fn socket_path(runtime_dir: &Path) -> std::path::PathBuf {
 /// Returns `Ok(false)` when no GUI is listening, which is a normal state, not
 /// an error: the durable tmux option carries the signal until one starts.
 pub fn send(socket: &Path, notification: &Notification) -> Result<bool> {
+    send_command(socket, &Command::Notify(notification.clone()))
+}
+
+/// Send one command to a running GUI.
+///
+/// `Ok(false)` means nothing was listening. Each caller decides what that is:
+/// for `notify` it is normal, for `toggle` it is "no GUI to toggle yet".
+pub fn send_command(socket: &Path, command: &Command) -> Result<bool> {
     let mut stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         // Nothing listening, or a socket file left behind by a crashed GUI.
@@ -162,7 +222,7 @@ pub fn send(socket: &Path, notification: &Notification) -> Result<bool> {
     stream
         .set_write_timeout(Some(WRITE_TIMEOUT))
         .map_err(|err| Error::io("set the notify write timeout", err))?;
-    let line = format!("{}\n", notification.encode());
+    let line = format!("{}\n", command.encode());
     match stream.write_all(line.as_bytes()) {
         Ok(()) => Ok(true),
         // The GUI exited between connect and write, or stopped reading.
@@ -176,7 +236,7 @@ pub fn send(socket: &Path, notification: &Notification) -> Result<bool> {
         {
             Ok(false)
         }
-        Err(err) => Err(Error::io("write a notification", err)),
+        Err(err) => Err(Error::io("write to the notify socket", err)),
     }
 }
 
@@ -208,18 +268,19 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
     UnixListener::bind(socket).map_err(|err| Error::io(format!("bind {}", socket.display()), err))
 }
 
-/// Read one notification from an accepted connection.
+/// Read one command from an accepted connection.
 ///
-/// Only the first line is read: each `grove notify` process sends one and
-/// closes, and reading further would let a stuck writer hold the listener.
-pub fn read_notification(stream: UnixStream) -> std::result::Result<Notification, ProtocolError> {
+/// Only the first line is read: each `grove notify` or `grove toggle` process
+/// sends one and closes, and reading further would let a stuck writer hold the
+/// listener.
+pub fn read_command(stream: UnixStream) -> std::result::Result<Command, ProtocolError> {
     let mut line = String::new();
     let mut reader = BufReader::new(stream);
     // A read error and an empty line are the same thing here: nothing usable
     // arrived. The listener logs and moves on either way.
     match reader.read_line(&mut line) {
         Ok(0) | Err(_) => Err(ProtocolError::Malformed),
-        Ok(_) => Notification::decode(&line),
+        Ok(_) => Command::decode(&line),
     }
 }
 
@@ -273,6 +334,50 @@ mod tests {
         assert_eq!(
             Notification::decode("grove1\u{1}notify\u{1}a1b2c3\u{1}panic\u{1}"),
             Err(ProtocolError::State("panic".into()))
+        );
+    }
+
+    #[test]
+    fn round_trips_a_toggle_with_and_without_a_number() {
+        for slot in [None, Some(1), Some(9)] {
+            let command = Command::Toggle { slot };
+            assert_eq!(Command::decode(&command.encode()).expect("valid"), command);
+        }
+    }
+
+    #[test]
+    fn rejects_a_toggle_number_out_of_range() {
+        assert_eq!(
+            Command::decode("grove1\u{1}toggle\u{1}0"),
+            Err(ProtocolError::Slot("0".into()))
+        );
+        assert_eq!(
+            Command::decode("grove1\u{1}toggle\u{1}12"),
+            Err(ProtocolError::Slot("12".into()))
+        );
+        assert_eq!(
+            Command::decode("grove1\u{1}toggle\u{1}three"),
+            Err(ProtocolError::Slot("three".into()))
+        );
+    }
+
+    /// A truncated toggle line still means "the window": the number is the
+    /// optional part of that message, unlike every field of a notification.
+    #[test]
+    fn a_toggle_without_its_field_is_the_window() {
+        assert_eq!(
+            Command::decode("grove1\u{1}toggle"),
+            Ok(Command::Toggle { slot: None })
+        );
+    }
+
+    /// `read_notification`'s old contract, now that a second kind shares the
+    /// socket: a toggle is not a notification and must not be read as one.
+    #[test]
+    fn a_toggle_is_not_a_notification() {
+        assert_eq!(
+            Notification::decode(&Command::Toggle { slot: Some(3) }.encode()),
+            Err(ProtocolError::Kind("toggle".into()))
         );
     }
 
@@ -342,6 +447,19 @@ mod tests {
     }
 
     #[test]
+    fn bind_then_send_delivers_a_toggle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = socket_path(dir.path());
+        let listener = bind(&socket).expect("bind");
+        let sent = Command::Toggle { slot: Some(4) };
+        let expected = sent.clone();
+        let writer = std::thread::spawn(move || send_command(&socket, &sent).expect("send"));
+        let (stream, _) = listener.accept().expect("accept");
+        assert_eq!(read_command(stream).expect("decoded"), expected);
+        assert!(writer.join().expect("writer thread"));
+    }
+
+    #[test]
     fn bind_then_send_delivers_the_notification() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = socket_path(dir.path());
@@ -351,7 +469,10 @@ mod tests {
         let expected = sent.clone();
         let writer = std::thread::spawn(move || send(&socket, &sent).expect("send"));
         let (stream, _) = listener.accept().expect("accept");
-        assert_eq!(read_notification(stream).expect("decoded"), expected);
+        assert_eq!(
+            read_command(stream).expect("decoded"),
+            Command::Notify(expected)
+        );
         assert!(writer.join().expect("writer thread"));
     }
 

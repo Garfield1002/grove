@@ -515,7 +515,8 @@ Recommended persisted data:
 * agent command templates,
 * UI expansion state,
 * manual status overrides,
-* last activity timestamps.
+* last activity timestamps,
+* the numbers the user put on worktrees for `grove toggle <n>`.
 
 Git and tmux remain the source of truth for repository and session existence.
 
@@ -619,9 +620,36 @@ Ctrl+O          Open project
 Ctrl+R          Refresh project
 Ctrl+Shift+T    Open selected session in new terminal
 Delete          Open safe removal dialog
+Alt+1 … Alt+9   Put that number on the selected worktree, or take it off
 ```
 
 Shortcuts should be configurable later.
+
+### Numbered worktrees and `grove toggle`
+
+The window-manager shortcut is the one Grove cannot bind itself, so the CLI
+provides the other end of it:
+
+```text
+grove toggle          start Grove, or close the running one
+grove toggle <1-9>    open the session of the worktree carrying that number
+```
+
+`grove toggle <n>` reaches the running GUI over the same socket as
+`grove notify`; it selects the row and opens its session exactly as Enter
+does. With no GUI running it starts one and acts as soon as the first
+reconciliation has said what exists. Bound to Super+1…9 in the compositor,
+this is a one-keystroke jump to a worktree from anywhere on the desktop.
+
+Bare `grove toggle` closes a running Grove and starts one otherwise. It is not
+a hide: a Wayland client cannot hide and re-show its own window (winit's
+`set_visible` is a documented no-op there), and closing costs nothing —
+sessions outlive the GUI by design (FR-7).
+
+The numbers live in `state.toml` as a `[[slot]]` table, unique in both
+directions: one worktree per number, one number per worktree. They are labels
+and only labels — a number naming a worktree Grove is not listing selects
+nothing, and is never a reason to act on another row.
 
 ## 17. Notifications
 

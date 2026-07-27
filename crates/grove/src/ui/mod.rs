@@ -64,4 +64,11 @@ pub enum Action {
         project_id: String,
         worktree_id: String,
     },
+    /// Put a number on a worktree — the one `grove toggle <n>` opens — or
+    /// take the one it has off (`None`). A label in `state.toml` and nothing
+    /// more: it names no git or tmux object.
+    SetWorktreeSlot {
+        worktree_id: String,
+        slot: Option<u8>,
+    },
 }

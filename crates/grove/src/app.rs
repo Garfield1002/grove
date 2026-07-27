@@ -69,6 +69,9 @@ pub struct GroveApp {
     open_project_path: Option<String>,
     /// A worktree Grove just created, selected as soon as a refresh lists it.
     pending_selection: Option<(String, PathBuf)>,
+    /// The number `grove toggle <n>` started this process for, opened as soon
+    /// as the first reconciliation says what that number points at.
+    pending_toggle: Option<u8>,
     /// The three detached windows. The main window is a narrow sliver, so
     /// these render as their own toplevels (`ui::chrome`), one of each.
     create: Detached<CreateForm>,
@@ -83,7 +86,7 @@ const CREATE_VIEWPORT: &str = "grove-create-worktree-window";
 const REMOVAL_VIEWPORT: &str = "grove-removal-window";
 
 impl GroveApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, pending_toggle: Option<u8>) -> Self {
         theme::apply(&cc.egui_ctx);
         let (workers, messages) = Workers::start(paths.clone(), cc.egui_ctx.clone());
         let watch = StatusWatch::start(&paths, workers.message_sender(), cc.egui_ctx.clone());
@@ -146,13 +149,14 @@ impl GroveApp {
             quit_after_kill: false,
             open_project_path: None,
             pending_selection: None,
+            pending_toggle,
             create: Detached::default(),
             removal: Detached::default(),
             settings: Detached::default(),
         }
     }
 
-    fn drain_messages(&mut self) {
+    fn drain_messages(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.messages.try_recv() {
             match message {
                 Message::ConfigLoaded { loaded } => {
@@ -279,6 +283,7 @@ impl GroveApp {
                     self.windows = windows;
                     self.apply_session_windows();
                 }
+                Message::Toggled { slot } => self.apply_toggle(ctx, slot),
                 Message::Notified {
                     worktree_id,
                     state,
@@ -481,6 +486,55 @@ impl GroveApp {
         }
     }
 
+    /// One `grove toggle` from the CLI (`crate::toggle`).
+    ///
+    /// Without a number the window is the subject, and on Wayland the only
+    /// honest half of "hide" is to close: a client cannot un-hide itself
+    /// there. Closing leaves every tmux session running, and the next
+    /// `grove toggle` starts Grove again.
+    fn apply_toggle(&mut self, ctx: &egui::Context, slot: Option<u8>) {
+        let Some(slot) = slot else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        };
+        // Raising the window is a request, not a guarantee — a Wayland
+        // compositor may well refuse it. Opening the session is the part that
+        // has to happen, so it is not conditional on this.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.activate_slot(slot);
+    }
+
+    /// Select the worktree carrying `slot` and open its session, as pressing
+    /// Enter on its row does. A number pointing at nothing is reported and
+    /// nothing else: it is a stale label, never a reason to act on another row.
+    fn activate_slot(&mut self, slot: u8) {
+        match slot_target(&self.projects, &self.state, slot) {
+            Some((project_id, worktree_id)) => self.apply_action(Action::ActivateWorktree {
+                project_id,
+                worktree_id,
+            }),
+            None => {
+                self.status = Some(format!("No worktree in Grove's list is numbered {slot}."));
+            }
+        }
+    }
+
+    /// Put a number on the selected worktree, or take it off again.
+    ///
+    /// Pressing the digit a worktree already carries clears it, so one
+    /// keystroke both assigns and unassigns.
+    fn set_slot(&mut self, worktree_id: &str, slot: u8) {
+        if self.state.slot(worktree_id) == Some(slot) {
+            self.state.clear_slot(worktree_id);
+            self.status = Some(format!("Took {slot} off this worktree."));
+        } else if self.state.assign_slot(slot, worktree_id) {
+            self.status = Some(format!("`grove toggle {slot}` now opens this worktree."));
+        } else {
+            return;
+        }
+        self.save_state();
+    }
+
     /// An explicit `grove notify` report: show its message straight away.
     ///
     /// The status itself is left to the poller, which re-reads tmux a moment
@@ -596,6 +650,13 @@ impl GroveApp {
         self.apply_session_windows();
         self.describe_worktrees();
         self.status = Some(summary);
+        // A `grove toggle <n>` that had to start this process waited for this:
+        // until reconciliation has run there are no rows for a number to name.
+        // It is taken either way — one pass is the whole grace period, and a
+        // number that named nothing must not fire at some later refresh.
+        if let Some(slot) = self.pending_toggle.take() {
+            self.activate_slot(slot);
+        }
     }
 
     /// Note every worktree that currently has a session, so a session that
@@ -715,6 +776,15 @@ impl GroveApp {
                 }
             }
             Action::SelectWorktree { worktree_id, .. } => self.selected = Some(worktree_id),
+            Action::SetWorktreeSlot { worktree_id, slot } => match slot {
+                Some(slot) => self.set_slot(&worktree_id, slot),
+                None => {
+                    if self.state.clear_slot(&worktree_id) {
+                        self.status = Some("Took the number off this worktree.".to_string());
+                        self.save_state();
+                    }
+                }
+            },
             Action::OpenInNewTerminal {
                 project_id,
                 worktree_id,
@@ -1214,6 +1284,15 @@ impl GroveApp {
         if refresh {
             self.reconcile();
         }
+
+        // Alt+<digit> puts that number on the selected row, or takes it off
+        // again. Alt because the plain digits belong to the filter field and
+        // Ctrl+<digit> is what a terminal emulator tends to eat.
+        if let Some(digit) = ctx.input(pressed_digit)
+            && let Some((_, worktree_id)) = self.selected_row()
+        {
+            self.set_slot(&worktree_id, digit);
+        }
     }
 
     /// The header bar: the app title, the Restore placeholder, the open-project
@@ -1486,7 +1565,7 @@ impl eframe::App for GroveApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_messages();
+        self.drain_messages(ctx);
 
         // The worker has confirmed the tmux server is down (the footer's
         // quit-and-kill control): nothing is left to outlive the GUI, so quit.
@@ -1577,6 +1656,7 @@ impl eframe::App for GroveApp {
                                 .map(|(id, index)| (id.as_str(), *index)),
                             &self.filter,
                             self.home.as_deref(),
+                            &self.state.slots,
                         );
                         orphan_action = ui::orphans::show(
                             ui,
@@ -1642,6 +1722,45 @@ fn visible_rows(projects: &[Project], filter: &str) -> Vec<(String, String)> {
     rows
 }
 
+/// The (project id, worktree id) a number points at, if it still points at a
+/// row Grove is listing.
+///
+/// A number that names nothing resolves to `None` and is left alone: it is a
+/// stale label, and the worktree it named may simply be on a project that is
+/// currently unavailable.
+fn slot_target(projects: &[Project], state: &State, slot: u8) -> Option<(String, String)> {
+    let worktree_id = state.slot_worktree(slot)?;
+    projects
+        .iter()
+        .find(|project| project.worktree(worktree_id).is_some())
+        .map(|project| (project.id.clone(), worktree_id.to_string()))
+}
+
+/// The 1..=9 digit pressed with Alt this frame, if any.
+///
+/// Zero is not among them: the numbers are 1–9 (`state::MAX_SLOT`), and Alt+0
+/// meaning nothing is better than it quietly meaning something else.
+fn pressed_digit(input: &egui::InputState) -> Option<u8> {
+    if !input.modifiers.alt {
+        return None;
+    }
+    const DIGITS: [(egui::Key, u8); 9] = [
+        (egui::Key::Num1, 1),
+        (egui::Key::Num2, 2),
+        (egui::Key::Num3, 3),
+        (egui::Key::Num4, 4),
+        (egui::Key::Num5, 5),
+        (egui::Key::Num6, 6),
+        (egui::Key::Num7, 7),
+        (egui::Key::Num8, 8),
+        (egui::Key::Num9, 9),
+    ];
+    DIGITS
+        .iter()
+        .find(|(key, _)| input.key_pressed(*key))
+        .map(|(_, digit)| *digit)
+}
+
 /// The worktree id Up/Down should move to. `None` when there is nothing to
 /// select. The ends do not wrap: a held arrow key stops at the list edge.
 fn next_selection(
@@ -1698,6 +1817,78 @@ mod tests {
 
     fn ids(rows: &[(String, String)]) -> Vec<String> {
         rows.iter().map(|(_, w)| w.clone()).collect()
+    }
+
+    #[test]
+    fn a_number_resolves_to_its_row() {
+        let projects = vec![
+            project("p1", "acme", &["main", "feature"]),
+            project("p2", "design", &["main"]),
+        ];
+        let target = projects[1].worktrees[0].id.clone();
+        let mut state = State::default();
+        state.assign_slot(3, &target);
+        assert_eq!(
+            slot_target(&projects, &state, 3),
+            Some(("p2".to_string(), target))
+        );
+    }
+
+    /// A number Grove cannot resolve must select nothing at all — never the
+    /// nearest row, and never a row from another project.
+    #[test]
+    fn an_unassigned_or_stale_number_resolves_to_nothing() {
+        let projects = vec![project("p1", "acme", &["main"])];
+        let mut state = State::default();
+        assert_eq!(slot_target(&projects, &state, 3), None, "never assigned");
+
+        state.assign_slot(3, "deadbe");
+        assert_eq!(
+            slot_target(&projects, &state, 3),
+            None,
+            "points at a worktree Grove is not listing"
+        );
+
+        // A collapsed project still holds its rows: the number is about the
+        // worktree, not about what the list happens to be showing.
+        let mut collapsed = projects.clone();
+        collapsed[0].is_expanded = false;
+        state.assign_slot(3, &collapsed[0].worktrees[0].id);
+        assert!(slot_target(&collapsed, &state, 3).is_some());
+    }
+
+    #[test]
+    fn alt_and_a_digit_is_what_assigns_a_number() {
+        assert_eq!(digit_press(egui::Key::Num3, egui::Modifiers::ALT), Some(3));
+        assert_eq!(digit_press(egui::Key::Num9, egui::Modifiers::ALT), Some(9));
+        // Without Alt the digits belong to the filter field.
+        assert_eq!(digit_press(egui::Key::Num3, egui::Modifiers::NONE), None);
+        assert_eq!(digit_press(egui::Key::Num3, egui::Modifiers::COMMAND), None);
+        // Zero is not a number a worktree can carry.
+        assert_eq!(digit_press(egui::Key::Num0, egui::Modifiers::ALT), None);
+    }
+
+    /// Run one headless frame carrying a single key press, and ask what
+    /// `pressed_digit` made of it.
+    fn digit_press(key: egui::Key, modifiers: egui::Modifiers) -> Option<u8> {
+        let ctx = egui::Context::default();
+        let mut digit = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                // `InputState::modifiers` comes from here, not from the events.
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |ctx| digit = ctx.input(pressed_digit),
+        );
+        digit
     }
 
     #[test]

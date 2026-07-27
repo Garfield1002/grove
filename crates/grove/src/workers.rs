@@ -276,6 +276,12 @@ pub enum Message {
     /// The git-status cadence elapsed. The poller cannot run git itself: it
     /// has no worktree lists, so the UI turns this into per-project refreshes.
     GitStatusDue,
+    /// A `grove toggle` arrived over the socket: with a number, the worktree
+    /// carrying it is selected and its session opened; without one, the window
+    /// is the subject.
+    Toggled {
+        slot: Option<u8>,
+    },
     /// An explicit `grove notify` report arrived over the socket.
     Notified {
         worktree_id: String,

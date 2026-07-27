@@ -36,6 +36,12 @@ pub struct State {
     /// Orphaned tmux sessions the user chose to ignore, by session name.
     /// Ignoring hides a session from the restore report; it never closes it.
     pub ignored_sessions: Vec<String>,
+    /// The numbers the user has put on worktrees, so `grove toggle <n>` can
+    /// name one from a keyboard shortcut. A label and nothing more: a number
+    /// pointing at a worktree that no longer exists selects nothing, and is
+    /// never a reason to touch anything on disk.
+    #[serde(rename = "slot")]
+    pub slots: Vec<SlotRecord>,
 }
 
 impl Default for State {
@@ -45,8 +51,32 @@ impl Default for State {
             projects: Vec::new(),
             sessions: Vec::new(),
             ignored_sessions: Vec::new(),
+            slots: Vec::new(),
         }
     }
+}
+
+/// The highest number a worktree can be given. Nine because the point of the
+/// numbers is a one-keystroke shortcut, and there are nine digit keys.
+pub const MAX_SLOT: u8 = 9;
+
+/// Parse a slot number, accepting only 1..=[`MAX_SLOT`].
+///
+/// Used by the CLI and by the IPC decoder, so a number that could never name
+/// anything is rejected where it is typed rather than silently ignored later.
+pub fn parse_slot(raw: &str) -> Option<u8> {
+    let number: u8 = raw.trim().parse().ok()?;
+    (1..=MAX_SLOT).contains(&number).then_some(number)
+}
+
+/// One number the user put on a worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlotRecord {
+    /// 1..=[`MAX_SLOT`].
+    pub number: u8,
+    /// Deterministic worktree id the number points at.
+    pub worktree_id: String,
 }
 
 /// A project the user registered. Removing one from this list removes it from
@@ -100,10 +130,12 @@ pub struct SessionRecord {
 
 impl State {
     pub fn from_toml(text: &str, path: &Path) -> Result<Self> {
-        toml::from_str(text).map_err(|source| Error::StateRead {
+        let mut state: Self = toml::from_str(text).map_err(|source| Error::StateRead {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        state.sanitize_slots();
+        Ok(state)
     }
 
     pub fn to_toml(&self) -> Result<String> {
@@ -193,6 +225,68 @@ impl State {
         self.ignored_sessions.clear();
         before != 0
     }
+
+    /// The number on a worktree, if it has one.
+    pub fn slot(&self, worktree_id: &str) -> Option<u8> {
+        self.slots
+            .iter()
+            .find(|s| s.worktree_id == worktree_id)
+            .map(|s| s.number)
+    }
+
+    /// The worktree a number points at, if any.
+    pub fn slot_worktree(&self, number: u8) -> Option<&str> {
+        self.slots
+            .iter()
+            .find(|s| s.number == number)
+            .map(|s| s.worktree_id.as_str())
+    }
+
+    /// Put `number` on a worktree, taking it off whoever held it and off
+    /// whatever number that worktree had. Both directions are unique: one
+    /// worktree per number, one number per worktree.
+    ///
+    /// Returns false for a number outside 1..=[`MAX_SLOT`], which is the only
+    /// way this can fail.
+    pub fn assign_slot(&mut self, number: u8, worktree_id: &str) -> bool {
+        if !(1..=MAX_SLOT).contains(&number) {
+            return false;
+        }
+        self.slots
+            .retain(|s| s.number != number && s.worktree_id != worktree_id);
+        self.slots.push(SlotRecord {
+            number,
+            worktree_id: worktree_id.to_string(),
+        });
+        self.slots.sort_by_key(|s| s.number);
+        true
+    }
+
+    /// Take the number off a worktree.
+    pub fn clear_slot(&mut self, worktree_id: &str) -> bool {
+        let before = self.slots.len();
+        self.slots.retain(|s| s.worktree_id != worktree_id);
+        self.slots.len() != before
+    }
+
+    /// Drop slots a hand-edited (or newer) file could hold but Grove cannot
+    /// act on: numbers out of range, an empty id, and duplicates in either
+    /// direction. First entry wins, so the file reads as it behaves.
+    fn sanitize_slots(&mut self) {
+        let mut kept: Vec<SlotRecord> = Vec::with_capacity(self.slots.len());
+        for slot in std::mem::take(&mut self.slots) {
+            let usable = (1..=MAX_SLOT).contains(&slot.number)
+                && !slot.worktree_id.is_empty()
+                && !kept
+                    .iter()
+                    .any(|k| k.number == slot.number || k.worktree_id == slot.worktree_id);
+            if usable {
+                kept.push(slot);
+            }
+        }
+        kept.sort_by_key(|s| s.number);
+        self.slots = kept;
+    }
 }
 
 /// Load `state.toml`. A missing file is an empty state, not an error.
@@ -253,6 +347,88 @@ mod tests {
         let text = state.to_toml().expect("serializes");
         let parsed = State::from_toml(&text, Path::new("state.toml")).expect("parses");
         assert_eq!(parsed, state);
+    }
+
+    #[test]
+    fn a_number_is_unique_in_both_directions() {
+        let mut state = State::default();
+        assert!(state.assign_slot(3, "a1b2c3"));
+        assert_eq!(state.slot("a1b2c3"), Some(3));
+        assert_eq!(state.slot_worktree(3), Some("a1b2c3"));
+
+        // Giving 3 to another worktree takes it off the first.
+        assert!(state.assign_slot(3, "ddeeff"));
+        assert_eq!(state.slot("a1b2c3"), None);
+        assert_eq!(state.slot_worktree(3), Some("ddeeff"));
+
+        // And giving a numbered worktree a new number frees the old one.
+        assert!(state.assign_slot(5, "ddeeff"));
+        assert_eq!(state.slot_worktree(3), None);
+        assert_eq!(state.slot("ddeeff"), Some(5));
+        assert_eq!(state.slots.len(), 1);
+    }
+
+    #[test]
+    fn numbers_outside_one_to_nine_are_refused() {
+        let mut state = State::default();
+        assert!(!state.assign_slot(0, "a1b2c3"));
+        assert!(!state.assign_slot(10, "a1b2c3"));
+        assert!(state.slots.is_empty());
+        assert_eq!(parse_slot("0"), None);
+        assert_eq!(parse_slot("10"), None);
+        assert_eq!(parse_slot("-1"), None);
+        assert_eq!(parse_slot("three"), None);
+        assert_eq!(parse_slot(""), None);
+        assert_eq!(parse_slot(" 4 "), Some(4));
+        assert_eq!(parse_slot("9"), Some(9));
+    }
+
+    #[test]
+    fn clearing_a_number_leaves_the_others() {
+        let mut state = State::default();
+        state.assign_slot(1, "a1b2c3");
+        state.assign_slot(2, "ddeeff");
+        assert!(state.clear_slot("a1b2c3"));
+        assert!(!state.clear_slot("a1b2c3"), "already cleared");
+        assert_eq!(state.slot_worktree(2), Some("ddeeff"));
+    }
+
+    #[test]
+    fn slots_round_trip_through_toml_in_order() {
+        let mut state = State::default();
+        state.assign_slot(4, "ddeeff");
+        state.assign_slot(1, "a1b2c3");
+        let text = state.to_toml().expect("serializes");
+        let parsed = State::from_toml(&text, Path::new("state.toml")).expect("parses");
+        assert_eq!(parsed, state);
+        assert_eq!(
+            parsed.slots.iter().map(|s| s.number).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+    }
+
+    /// A hand-edited file is first-class input: unusable entries are dropped
+    /// rather than silently shadowing a working one.
+    #[test]
+    fn a_hand_edited_file_with_bad_slots_loads_with_the_usable_ones() {
+        let state = State::from_toml(
+            "[[slot]]\nnumber = 3\nworktree_id = \"a1b2c3\"\n\n\
+             [[slot]]\nnumber = 3\nworktree_id = \"ddeeff\"\n\n\
+             [[slot]]\nnumber = 99\nworktree_id = \"ccddee\"\n\n\
+             [[slot]]\nnumber = 0\nworktree_id = \"ffaabb\"\n\n\
+             [[slot]]\nnumber = 5\nworktree_id = \"\"\n\n\
+             [[slot]]\nnumber = 7\nworktree_id = \"a1b2c3\"\n",
+            Path::new("state.toml"),
+        )
+        .expect("parses");
+        assert_eq!(
+            state.slots,
+            vec![SlotRecord {
+                number: 3,
+                worktree_id: "a1b2c3".into()
+            }],
+            "first entry wins; out-of-range, empty and duplicate entries go"
+        );
     }
 
     #[test]
