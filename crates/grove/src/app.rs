@@ -6,11 +6,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use grove_core::config::Config;
+use grove_core::git::StatusSummary;
 use grove_core::model::{Project, SessionPresence};
 use grove_core::state::{ProjectRecord, State};
 use grove_core::workflow::Activation;
 use grove_core::{Paths, state};
 
+use crate::ui::dialogs::create_worktree::CreateForm;
+use crate::ui::dialogs::removal::{RemovalForm, Request};
 use crate::ui::{self, Action, theme};
 use crate::workers::{ErrorReport, Message, Task, Workers};
 
@@ -30,6 +33,10 @@ pub struct GroveApp {
     errors: Vec<ErrorReport>,
 
     open_project_path: Option<String>,
+    /// A worktree Grove just created, selected as soon as a refresh lists it.
+    pending_selection: Option<(String, PathBuf)>,
+    create: Option<CreateForm>,
+    removal: Option<RemovalForm>,
     show_settings: bool,
 }
 
@@ -83,6 +90,9 @@ impl GroveApp {
             status: None,
             errors,
             open_project_path: None,
+            pending_selection: None,
+            create: None,
+            removal: None,
             show_settings: false,
         }
     }
@@ -106,9 +116,86 @@ impl GroveApp {
                 } => {
                     if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
                         project.worktrees = worktrees;
+                        // Select a worktree Grove has just created, once the
+                        // refreshed list actually contains it.
+                        if let Some((pending_project, path)) = &self.pending_selection
+                            && pending_project == &project_id
+                            && let Some(worktree) =
+                                project.worktrees.iter().find(|w| &w.path == path)
+                        {
+                            self.selected = Some(worktree.id.clone());
+                            self.pending_selection = None;
+                        }
                     }
                 }
+                Message::StatusesRefreshed {
+                    project_id,
+                    statuses,
+                } => self.apply_statuses(&project_id, &statuses),
                 Message::SessionsRefreshed(presence) => self.apply_presence(&presence),
+                Message::BaseRefsLoaded {
+                    project_id,
+                    refs,
+                    current,
+                } => {
+                    if let Some(form) = &mut self.create
+                        && form.project_id == project_id
+                    {
+                        form.refs = refs;
+                        form.refs_loaded = true;
+                        if form.base_ref.trim().is_empty()
+                            && let Some(current) = current
+                        {
+                            form.base_ref = current;
+                            form.sync_path();
+                        }
+                    }
+                }
+                Message::WorktreeCreated { project_id, path } => {
+                    self.status = Some(format!("Created {}", path.display()));
+                    self.pending_selection = Some((project_id, path));
+                }
+                Message::RemovalGathered {
+                    project_id,
+                    worktree_id,
+                    report,
+                } => {
+                    if let Some(form) = &mut self.removal
+                        && form.project_id == project_id
+                        && form.worktree_id == worktree_id
+                    {
+                        form.report = Some(*report);
+                    }
+                }
+                Message::RemovalDone {
+                    project_id,
+                    operation,
+                    detail,
+                } => {
+                    self.status = Some(detail.clone());
+                    if let Some(form) = &mut self.removal
+                        && form.project_id == project_id
+                    {
+                        form.note_done(operation, detail);
+                    }
+                }
+                Message::RemovalFailed {
+                    project_id,
+                    operation,
+                    report,
+                } => {
+                    let summary = report.summary.clone();
+                    self.status = Some(format!(
+                        "Did not {} — see the error below.",
+                        operation.label()
+                    ));
+                    self.errors.push(report);
+                    if let Some(form) = &mut self.removal
+                        && form.project_id == project_id
+                    {
+                        form.note_refusal(operation, summary);
+                    }
+                }
                 Message::Activated {
                     worktree_id,
                     activation,
@@ -157,6 +244,14 @@ impl GroveApp {
         self.save_state();
     }
 
+    /// Stamp fresh git statuses onto a project's rows. A worktree with no
+    /// reading keeps whatever it had: never blanked, never invented.
+    fn apply_statuses(&mut self, project_id: &str, statuses: &HashMap<String, StatusSummary>) {
+        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
+            grove_core::workflow::apply_statuses(&mut project.worktrees, statuses);
+        }
+    }
+
     fn apply_presence(&mut self, presence: &HashMap<String, SessionPresence>) {
         for project in &mut self.projects {
             grove_core::workflow::apply_session_presence(&mut project.worktrees, presence);
@@ -203,12 +298,8 @@ impl GroveApp {
             }
             // Removing a project touches Grove's index only: no worktree,
             // branch, repository or tmux session is affected.
-            Action::RemoveProject(id) => {
-                self.projects.retain(|p| p.id != id);
-                self.state.remove(&id);
-                self.save_state();
-                self.status = Some("Removed from Grove. The repository is untouched.".to_string());
-            }
+            Action::RemoveProject(id) => self.remove_project(&id),
+            Action::CreateWorktree(id) => self.open_create_dialog(&id),
             Action::ActivateWorktree {
                 project_id,
                 worktree_id,
@@ -223,6 +314,214 @@ impl GroveApp {
                         worktree: Box::new(worktree.clone()),
                     });
                 }
+            }
+            Action::SelectWorktree { worktree_id, .. } => self.selected = Some(worktree_id),
+            Action::OpenInNewTerminal {
+                project_id,
+                worktree_id,
+            } => {
+                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
+                    && let Some(worktree) = project.worktree(&worktree_id)
+                {
+                    self.selected = Some(worktree_id);
+                    self.workers.send(Task::OpenInNewTerminal {
+                        project_name: project.name.clone(),
+                        git_common_dir: project.git_common_dir.clone(),
+                        worktree: Box::new(worktree.clone()),
+                    });
+                }
+            }
+            Action::RemoveWorktree {
+                project_id,
+                worktree_id,
+            } => self.open_removal_dialog(&project_id, &worktree_id),
+        }
+    }
+
+    /// Remove a project from Grove's index. Metadata only — this must never
+    /// be accompanied by a git or tmux operation (ARCHITECTURE.md §8.1).
+    fn remove_project(&mut self, id: &str) {
+        self.projects.retain(|p| p.id != id);
+        self.state.remove(id);
+        self.save_state();
+        if self.removal.as_ref().is_some_and(|f| f.project_id == id) {
+            self.removal = None;
+        }
+        self.status = Some("Removed from Grove. The repository is untouched.".to_string());
+    }
+
+    fn open_create_dialog(&mut self, project_id: &str) {
+        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
+            return;
+        };
+        let form = CreateForm::new(project);
+        self.workers.send(Task::LoadBaseRefs {
+            project_id: project.id.clone(),
+            repository_path: project.repository_path.clone(),
+        });
+        self.create = Some(form);
+    }
+
+    fn open_removal_dialog(&mut self, project_id: &str, worktree_id: &str) {
+        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
+            return;
+        };
+        let Some(worktree) = project.worktree(worktree_id) else {
+            return;
+        };
+        self.selected = Some(worktree_id.to_string());
+        self.workers.send(Task::GatherRemoval {
+            project_id: project.id.clone(),
+            worktree: Box::new(worktree.clone()),
+        });
+        self.removal = Some(RemovalForm {
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            repository_path: project.repository_path.clone(),
+            git_common_dir: project.git_common_dir.clone(),
+            worktree_id: worktree.id.clone(),
+            worktree_label: worktree.label(),
+            worktree_path: worktree.path.clone(),
+            branch: worktree.branch.clone(),
+            session: worktree.session.exists().then(|| worktree.session_name()),
+            report: None,
+            armed: None,
+            force_worktree_offered: false,
+            force_branch_offered: false,
+            done: Vec::new(),
+            refusals: Vec::new(),
+        });
+    }
+
+    /// Dispatch one confirmed removal operation. Exactly one, never a bundle.
+    fn apply_removal(&mut self, request: Request) {
+        let Some(form) = &self.removal else { return };
+        match request {
+            Request::RemoveProject => {
+                let id = form.project_id.clone();
+                self.remove_project(&id);
+            }
+            Request::CloseSession => {
+                if let Some(session) = form.session.clone() {
+                    self.workers.send(Task::CloseSession {
+                        project_id: form.project_id.clone(),
+                        session,
+                    });
+                }
+            }
+            Request::RemoveWorktree { force } => self.workers.send(Task::RemoveWorktree {
+                project_id: form.project_id.clone(),
+                repository_path: form.repository_path.clone(),
+                git_common_dir: form.git_common_dir.clone(),
+                worktree_path: form.worktree_path.clone(),
+                force,
+            }),
+            Request::DeleteBranch { force } => {
+                if let Some(branch) = form.branch.clone() {
+                    self.workers.send(Task::DeleteBranch {
+                        project_id: form.project_id.clone(),
+                        repository_path: form.repository_path.clone(),
+                        git_common_dir: form.git_common_dir.clone(),
+                        branch,
+                        force,
+                    });
+                }
+            }
+        }
+    }
+
+    /// The rows the keyboard walks: every visible worktree, in list order.
+    fn visible_rows(&self) -> Vec<(String, String)> {
+        let needle = self.filter.trim().to_ascii_lowercase();
+        let mut rows = Vec::new();
+        for project in &self.projects {
+            if !project.is_expanded {
+                continue;
+            }
+            for worktree in &project.worktrees {
+                if ui::project_list::matches_filter(project, worktree, &needle) {
+                    rows.push((project.id.clone(), worktree.id.clone()));
+                }
+            }
+        }
+        rows
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|id| rows.iter().position(|(_, w)| w == id));
+        let next = match current {
+            Some(index) => (index as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+            None if delta < 0 => rows.len() - 1,
+            None => 0,
+        };
+        self.selected = Some(rows[next].1.clone());
+    }
+
+    fn selected_row(&self) -> Option<(String, String)> {
+        let selected = self.selected.as_ref()?;
+        self.visible_rows()
+            .into_iter()
+            .find(|(_, worktree_id)| worktree_id == selected)
+    }
+
+    /// The project a keyboard shortcut acts on: the selected row's project,
+    /// else the only project, else nothing.
+    fn context_project(&self) -> Option<String> {
+        if let Some((project_id, _)) = self.selected_row() {
+            return Some(project_id);
+        }
+        match self.projects.as_slice() {
+            [only] => Some(only.id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keyboard navigation (DESIGN.md §16). Ignored while a dialog is open so
+    /// Delete cannot fire behind a confirmation.
+    fn keyboard(&mut self, ctx: &egui::Context) {
+        if self.create.is_some() || self.removal.is_some() || self.open_project_path.is_some() {
+            return;
+        }
+        let (down, up, enter, remove, new, refresh) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Delete),
+                i.modifiers.command && i.key_pressed(egui::Key::N),
+                i.modifiers.command && i.key_pressed(egui::Key::R),
+            )
+        });
+
+        if down {
+            self.move_selection(1);
+        }
+        if up {
+            self.move_selection(-1);
+        }
+        if enter && let Some((project_id, worktree_id)) = self.selected_row() {
+            self.apply_action(Action::ActivateWorktree {
+                project_id,
+                worktree_id,
+            });
+        }
+        if remove && let Some((project_id, worktree_id)) = self.selected_row() {
+            self.open_removal_dialog(&project_id, &worktree_id);
+        }
+        if new && let Some(project_id) = self.context_project() {
+            self.open_create_dialog(&project_id);
+        }
+        if refresh {
+            match self.context_project() {
+                Some(project_id) => self.apply_action(Action::RefreshProject(project_id)),
+                None => self.refresh_all(),
             }
         }
     }
@@ -303,6 +602,36 @@ impl eframe::App for GroveApp {
             }
         }
 
+        if let Some(form) = &mut self.create {
+            match ui::dialogs::create_worktree::show(ctx, form) {
+                ui::dialogs::create_worktree::Outcome::Idle => {}
+                ui::dialogs::create_worktree::Outcome::Cancelled => self.create = None,
+                ui::dialogs::create_worktree::Outcome::Create(add) => {
+                    self.workers.send(Task::CreateWorktree {
+                        project_id: form.project_id.clone(),
+                        project_name: form.project_name.clone(),
+                        repository_path: form.repository_path.clone(),
+                        git_common_dir: form.git_common_dir.clone(),
+                        add,
+                        open_after: form.open_after,
+                    });
+                    self.status = Some("Creating the worktree…".to_string());
+                    self.create = None;
+                }
+            }
+        }
+
+        if let Some(form) = &mut self.removal {
+            let mut open = true;
+            let request = ui::dialogs::removal::show(ctx, form, &mut open);
+            if !open {
+                self.removal = None;
+            }
+            if let Some(request) = request {
+                self.apply_removal(request);
+            }
+        }
+
         if self.show_settings {
             let mut open = true;
             ui::settings::show(ctx, &mut open, &self.paths, self.config.as_ref());
@@ -358,5 +687,6 @@ impl eframe::App for GroveApp {
         if let Some(action) = action {
             self.apply_action(action);
         }
+        self.keyboard(ctx);
     }
 }

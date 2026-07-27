@@ -4,6 +4,7 @@
 use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
 
+use super::worktree_row::RowAction;
 use super::{Action, theme, worktree_row};
 
 /// Draw every project, applying the filter. Returns the user's action.
@@ -37,10 +38,27 @@ pub fn show(
         if project.is_expanded {
             for worktree in &matches {
                 let is_selected = selected == Some(worktree.id.as_str());
-                if worktree_row::show(ui, worktree, is_selected, home) {
-                    action = Some(Action::ActivateWorktree {
-                        project_id: project.id.clone(),
-                        worktree_id: worktree.id.clone(),
+                if let Some(row_action) = worktree_row::show(ui, worktree, is_selected, home) {
+                    let project_id = project.id.clone();
+                    let worktree_id = worktree.id.clone();
+                    action = Some(match row_action {
+                        RowAction::Activate => Action::ActivateWorktree {
+                            project_id,
+                            worktree_id,
+                        },
+                        RowAction::Select => Action::SelectWorktree {
+                            project_id,
+                            worktree_id,
+                        },
+                        RowAction::OpenInNewTerminal => Action::OpenInNewTerminal {
+                            project_id,
+                            worktree_id,
+                        },
+                        RowAction::Refresh => Action::RefreshProject(project_id),
+                        RowAction::Remove => Action::RemoveWorktree {
+                            project_id,
+                            worktree_id,
+                        },
                     });
                 }
             }
@@ -68,7 +86,11 @@ pub fn show(
     action
 }
 
-fn matches_filter(project: &Project, worktree: &grove_core::model::Worktree, needle: &str) -> bool {
+pub fn matches_filter(
+    project: &Project,
+    worktree: &grove_core::model::Worktree,
+    needle: &str,
+) -> bool {
     if needle.is_empty() {
         return true;
     }
@@ -140,6 +162,10 @@ fn header(ui: &mut Ui, project: &Project, count: usize) -> Option<Action> {
             action = Some(Action::RefreshProject(project.id.clone()));
             ui.close();
         }
+        if ui.button("Create worktree…").clicked() {
+            action = Some(Action::CreateWorktree(project.id.clone()));
+            ui.close();
+        }
         if ui.button("Copy repository path").clicked() {
             ui.ctx()
                 .copy_text(project.repository_path.display().to_string());
@@ -151,7 +177,7 @@ fn header(ui: &mut Ui, project: &Project, count: usize) -> Option<Action> {
             10.0,
             theme::TEXT_FAINT,
         ));
-        if ui.button("Remove from Grove").clicked() {
+        if ui.button("Remove project from Grove").clicked() {
             action = Some(Action::RemoveProject(project.id.clone()));
             ui.close();
         }

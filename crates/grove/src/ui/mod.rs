@@ -12,8 +12,26 @@ pub mod worktree_row;
 pub enum Action {
     ToggleProject(String),
     RefreshProject(String),
+    /// Open the create-worktree dialog for a project.
+    CreateWorktree(String),
+    /// Open the removal dialog for a project, with no worktree selected.
     RemoveProject(String),
     ActivateWorktree {
+        project_id: String,
+        worktree_id: String,
+    },
+    /// Select a row without opening anything.
+    SelectWorktree {
+        project_id: String,
+        worktree_id: String,
+    },
+    /// Attach an additional terminal client without retargeting the primary.
+    OpenInNewTerminal {
+        project_id: String,
+        worktree_id: String,
+    },
+    /// Open the safe-removal dialog for a worktree.
+    RemoveWorktree {
         project_id: String,
         worktree_id: String,
     },

@@ -235,6 +235,39 @@ pub fn activate_worktree(
     })
 }
 
+/// Attach an *additional* terminal client to a worktree's session without
+/// retargeting the primary client (DESIGN.md §8).
+///
+/// Runs subprocesses: worker thread only.
+pub fn open_in_new_terminal(
+    server: &TmuxServer,
+    config: &Config,
+    project_name: &str,
+    git_common_dir: &Path,
+    worktree: &Worktree,
+) -> Result<Activation> {
+    if !worktree.path.is_dir() {
+        return Err(Error::WorktreeMissing(worktree.path.clone()));
+    }
+    if !config.has_terminal() {
+        return Err(Error::EmptyTerminalTemplate);
+    }
+    let spec = session_spec(project_name, git_common_dir, worktree);
+    let (session, _created) = tmux::ensure_session(server, &spec)?;
+    let vars = TemplateVars::new(
+        server.socket(),
+        &session,
+        &worktree.path,
+        project_name,
+        &worktree.label(),
+    );
+    let invocation = terminal::launch(&config.terminal.command, &vars)?;
+    Ok(Activation::LaunchedTerminal {
+        command: terminal::preview(&invocation),
+        session,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +354,20 @@ mod tests {
     fn activating_a_missing_worktree_fails_before_touching_tmux() {
         let server = TmuxServer::new("/tmp/grove-test-never-used.sock");
         let err = activate_worktree(
+            &server,
+            &Config::default(),
+            "proj",
+            Path::new("/home/u/proj/.git"),
+            &worktree("/nonexistent-grove/wt"),
+        )
+        .expect_err("worktree is gone");
+        assert!(matches!(err, Error::WorktreeMissing(_)));
+    }
+
+    #[test]
+    fn opening_a_new_terminal_on_a_missing_worktree_fails_before_touching_tmux() {
+        let server = TmuxServer::new("/tmp/grove-test-never-used.sock");
+        let err = open_in_new_terminal(
             &server,
             &Config::default(),
             "proj",

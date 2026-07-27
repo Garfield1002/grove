@@ -1,4 +1,7 @@
-//! The "Open project" dialog and the error area.
+//! Dialogs: open project, create worktree, safe removal, and the error area.
+
+pub mod create_worktree;
+pub mod removal;
 
 use egui::{Context, Ui};
 

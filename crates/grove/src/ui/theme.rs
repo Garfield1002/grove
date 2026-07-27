@@ -29,10 +29,12 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x5f, 0xa8, 0xd6);
 pub const ACCENT_FILL: Color32 = Color32::from_rgb(0x18, 0x26, 0x31);
 
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x5f, 0x57);
+/// Direction 1c's amber, used for the risks listed in the removal dialog and
+/// for the dirty marker on a row.
+pub const WARNING: Color32 = Color32::from_rgb(0xe0, 0xa4, 0x4a);
 
-// Reserved by direction 1c for Milestone 4 status pills, deliberately not
-// defined as constants until something computes them: working `#4bc07d`,
-// attention `#e0a44a`.
+// Direction 1c's working green `#4bc07d` stays undefined until Milestone 4
+// computes a working state; showing it now would be a lie.
 
 pub const ROW_RADIUS: u8 = 9;
 pub const CHIP_RADIUS: u8 = 8;
