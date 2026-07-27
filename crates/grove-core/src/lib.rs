@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod atomic;
 pub mod cgroup;
+pub mod claude;
 pub mod config;
 pub mod config_write;
 pub mod desktop;
@@ -17,6 +18,7 @@ pub mod git;
 pub mod ids;
 pub mod ipc;
 pub mod model;
+pub mod notice;
 pub mod paths;
 pub mod process;
 pub mod reconcile;

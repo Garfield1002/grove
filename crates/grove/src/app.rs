@@ -5,11 +5,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
+use grove_core::claude::HookChange;
 use grove_core::config::Config;
 use grove_core::git::StatusSummary;
+use grove_core::ipc::Notification;
 use grove_core::model::{Project, SessionPresence};
+use grove_core::notice::Notices;
 use grove_core::reconcile::{OrphanSession, ProjectRef, Reconciliation};
-use grove_core::state::{ProjectRecord, SessionRecord, State};
+use grove_core::state::{AgentRecord, ProjectRecord, SessionRecord, State};
 use grove_core::status::{SessionReport, SessionStatus};
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::Activation;
@@ -35,6 +38,13 @@ pub struct GroveApp {
     /// Last known windows per tmux session name, kept for the same reason: a
     /// refreshed worktree list keeps its child rows instead of blinking empty.
     windows: HashMap<String, Vec<WindowInfo>>,
+    /// What the last `grove notify` said, per worktree and per window. Held
+    /// here rather than on the rows because a refresh rebuilds those, and a
+    /// message has nothing to be re-derived from.
+    notices: Notices,
+    /// Grove's hooks in Claude Code's settings, as the last check found them.
+    /// `None` until one has run.
+    claude_hooks: Option<HookChange>,
 
     config: Option<Config>,
     state: State,
@@ -134,6 +144,8 @@ impl GroveApp {
             messages,
             statuses: HashMap::new(),
             windows: HashMap::new(),
+            notices: Notices::default(),
+            claude_hooks: None,
             config: None,
             state: loaded,
             projects,
@@ -284,11 +296,8 @@ impl GroveApp {
                     self.apply_session_windows();
                 }
                 Message::Toggled { slot } => self.apply_toggle(ctx, slot),
-                Message::Notified {
-                    worktree_id,
-                    state,
-                    message,
-                } => self.apply_notification(&worktree_id, state, message),
+                Message::Notified(notification) => self.apply_notification(&notification),
+                Message::ClaudeHooks { op, change } => self.apply_hook_change(op, *change),
                 Message::BaseRefsLoaded {
                     project_id,
                     refs,
@@ -484,6 +493,16 @@ impl GroveApp {
         for project in &mut self.projects {
             grove_core::workflow::apply_session_windows(&mut project.worktrees, &self.windows);
         }
+        // The notes hang off the windows, so they are restamped with them: a
+        // note for a window that has closed must not outlive its row.
+        self.apply_window_notes();
+    }
+
+    /// Stamp what each window last reported onto the rows that draw it.
+    fn apply_window_notes(&mut self) {
+        for project in &mut self.projects {
+            grove_core::workflow::apply_window_notes(&mut project.worktrees, &self.notices);
+        }
     }
 
     /// One `grove toggle` from the CLI (`crate::toggle`).
@@ -540,12 +559,10 @@ impl GroveApp {
     /// The status itself is left to the poller, which re-reads tmux a moment
     /// later — except for attention, which is latched in the engine and would
     /// otherwise not show until that poll lands.
-    fn apply_notification(
-        &mut self,
-        worktree_id: &str,
-        state: SessionStatus,
-        message: Option<String>,
-    ) {
+    fn apply_notification(&mut self, notification: &Notification) {
+        let worktree_id = notification.worktree_id.as_str();
+        let state = notification.state;
+        self.notices.record(notification);
         if state == SessionStatus::Attention {
             // Keep any resource figures the last poll produced; only the
             // status is being overridden here.
@@ -554,12 +571,62 @@ impl GroveApp {
         }
         for project in &mut self.projects {
             if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
-                worktree.status_message = message.clone();
+                worktree.status_message = notification.message.clone();
                 if state == SessionStatus::Attention && worktree.session.exists() {
                     worktree.status = Some(SessionStatus::Attention);
                 }
             }
         }
+        self.apply_window_notes();
+        self.record_agent(notification);
+    }
+
+    /// Remember the conversation an agent reported, so Grove can offer to
+    /// resume it or open its transcript later.
+    ///
+    /// `state.toml` is only written when something actually changed: agents
+    /// report several times a turn and the id is the same every time.
+    fn record_agent(&mut self, notification: &Notification) {
+        if !notification.has_agent_record() {
+            return;
+        }
+        let changed = self.state.record_agent(AgentRecord {
+            worktree_id: notification.worktree_id.clone(),
+            session_id: notification.agent_session.clone().unwrap_or_default(),
+            transcript_path: notification.transcript.clone().unwrap_or_default(),
+        });
+        if changed {
+            self.save_state();
+        }
+    }
+
+    /// What Claude Code's settings say after a check, an install or a removal.
+    fn apply_hook_change(&mut self, op: crate::workers::HookOp, change: HookChange) {
+        use crate::workers::HookOp;
+        // A check is how the Settings pane finds out where things stand; only
+        // an install or a removal is worth a line in the status bar.
+        match op {
+            HookOp::Check => {}
+            HookOp::Install if change.changed => {
+                self.status = Some(format!(
+                    "Installed Grove's hooks in {}. Restart Claude Code for them to take effect.",
+                    change.path.display()
+                ));
+            }
+            HookOp::Install => {
+                self.status = Some("Grove's hooks were already installed.".to_string());
+            }
+            HookOp::Uninstall if change.changed => {
+                self.status = Some(format!(
+                    "Removed Grove's hooks from {}.",
+                    change.path.display()
+                ));
+            }
+            HookOp::Uninstall => {
+                self.status = Some("Grove had no hooks installed.".to_string());
+            }
+        }
+        self.claude_hooks = Some(change);
     }
 
     /// Opening a session is what clears its attention: the in-memory latch
@@ -572,10 +639,14 @@ impl GroveApp {
             return;
         }
         self.statuses.remove(worktree_id);
+        // The messages explained a state the user has now gone and looked at,
+        // per window as well as for the worktree.
+        self.notices.clear(worktree_id);
         for project in &mut self.projects {
             if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
                 worktree.status = None;
                 worktree.status_message = None;
+                worktree.window_notes.clear();
             }
         }
         self.workers.send(Task::ClearAttention {
@@ -646,6 +717,7 @@ impl GroveApp {
             self.orphan_armed = None;
         }
         self.record_live_sessions();
+        self.forget_stale_notices();
         self.apply_session_statuses();
         self.apply_session_windows();
         self.describe_worktrees();
@@ -657,6 +729,23 @@ impl GroveApp {
         if let Some(slot) = self.pending_toggle.take() {
             self.activate_slot(slot);
         }
+    }
+
+    /// Drop reports for worktrees reconciliation no longer lists, so a Grove
+    /// left open for weeks cannot accumulate them.
+    ///
+    /// Bookkeeping only, and deliberately not tied to `state.toml`: forgetting
+    /// what an agent said about a row that is gone removes nothing anywhere.
+    fn forget_stale_notices(&mut self) {
+        if self.notices.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<&str> = self
+            .projects
+            .iter()
+            .flat_map(|project| project.worktrees.iter().map(|w| w.id.as_str()))
+            .collect();
+        self.notices.retain_ids(|id| live.contains(id));
     }
 
     /// Note every worktree that currently has a session, so a session that
@@ -718,6 +807,30 @@ impl GroveApp {
         self.save_state();
     }
 
+    /// Is there a `resume_command` to offer at all? Grove ships no default:
+    /// only the user knows how their agent spells "resume".
+    fn can_resume_agents(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.agents.resume_command().is_some())
+    }
+
+    /// Start the configured agent in a worktree, or resume the conversation
+    /// `resume` names.
+    fn start_agent(&mut self, project_id: &str, worktree_id: &str, resume: Option<String>) {
+        if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
+            && let Some(worktree) = project.worktree(worktree_id)
+        {
+            self.workers.send(Task::StartAgent {
+                project_name: project.name.clone(),
+                git_common_dir: project.git_common_dir.clone(),
+                worktree: Box::new(worktree.clone()),
+                resume,
+            });
+            self.selected = Some(worktree_id.to_string());
+        }
+    }
+
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::ToggleProject(id) => {
@@ -763,18 +876,33 @@ impl GroveApp {
             Action::StartAgent {
                 project_id,
                 worktree_id,
-            } => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-                    && let Some(worktree) = project.worktree(&worktree_id)
-                {
-                    self.workers.send(Task::StartAgent {
-                        project_name: project.name.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
-                        worktree: Box::new(worktree.clone()),
-                    });
-                    self.selected = Some(worktree_id);
+            } => self.start_agent(&project_id, &worktree_id, None),
+            // Resuming needs the conversation the agent last reported here.
+            // Without one there is nothing to resume, and starting a fresh
+            // conversation instead would look identical and lose the user's
+            // place — so this says so rather than doing something else.
+            Action::ResumeAgent {
+                project_id,
+                worktree_id,
+            } => match self.state.agent(&worktree_id) {
+                Some(record) if !record.session_id.is_empty() => {
+                    let resume = record.session_id.clone();
+                    self.start_agent(&project_id, &worktree_id, Some(resume));
                 }
-            }
+                _ => {
+                    self.status =
+                        Some("No agent conversation has been reported for this worktree.".into());
+                }
+            },
+            Action::OpenAgentTranscript { worktree_id } => match self.state.agent(&worktree_id) {
+                Some(record) if record.has_transcript() => {
+                    self.workers
+                        .send(Task::OpenWithDesktop(record.transcript_path.clone()));
+                }
+                _ => {
+                    self.status = Some("No transcript has been reported for this worktree.".into());
+                }
+            },
             Action::SelectWorktree { worktree_id, .. } => self.selected = Some(worktree_id),
             Action::SetWorktreeSlot { worktree_id, slot } => match slot {
                 Some(slot) => self.set_slot(&worktree_id, slot),
@@ -1053,6 +1181,7 @@ impl GroveApp {
             ui::settings::Action::OpenConfigFile => self
                 .workers
                 .send(Task::OpenWithDesktop(self.paths.config_file())),
+            ui::settings::Action::ClaudeHooks(op) => self.workers.send(Task::ClaudeHooks(op)),
             ui::settings::Action::BrowseWorktreeParent => {
                 let start = pick_start(&form.default_parent, self.home.as_deref());
                 self.workers.send(Task::PickDirectory {
@@ -1170,6 +1299,7 @@ impl GroveApp {
             return;
         };
         let (paths, home) = (&self.paths, self.home.as_deref());
+        let hooks = self.claude_hooks.as_ref();
 
         let mut action = None;
         let mut close = false;
@@ -1178,7 +1308,7 @@ impl GroveApp {
             ui::chrome::viewport("Settings", ui::settings::SIZE, ui::settings::MIN_SIZE),
             |ctx, class| {
                 let dialog = ui::chrome::show(ctx, class, "Settings", |ui| {
-                    ui::settings::body(ui, &mut *form, paths, home)
+                    ui::settings::body(ui, &mut *form, paths, home, hooks)
                 });
                 action = dialog.inner;
                 close |= dialog.close;
@@ -1433,6 +1563,11 @@ impl GroveApp {
                         // which is filesystem work and therefore the worker's.
                         self.workers
                             .send(Task::ProbeTerminal(form.terminal_command.clone()));
+                        // Same reasoning for Claude Code's settings: reading
+                        // that file is the worker's job, and the pane should
+                        // open already knowing what it says.
+                        self.workers
+                            .send(Task::ClaudeHooks(crate::workers::HookOp::Check));
                         self.settings.open(form);
                     }
                 }
@@ -1565,6 +1700,13 @@ impl eframe::App for GroveApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The poller polls slowly while Grove paints nothing, which is most of
+        // its life. A frame here is the window being looked at again; if it is
+        // the first one after a gap, the tree is stale, so poll at once rather
+        // than showing the user a snapshot from up to half a minute ago.
+        if self.watch.painted() {
+            self.watch.send(Control::PollNow);
+        }
         self.drain_messages(ctx);
 
         // The worker has confirmed the tmux server is down (the footer's
@@ -1650,13 +1792,18 @@ impl eframe::App for GroveApp {
                         action = ui::project_list::show(
                             ui,
                             &self.projects,
-                            self.selected.as_deref(),
-                            self.selected_window
-                                .as_ref()
-                                .map(|(id, index)| (id.as_str(), *index)),
-                            &self.filter,
-                            self.home.as_deref(),
-                            &self.state.slots,
+                            ui::project_list::Tree {
+                                selected: self.selected.as_deref(),
+                                selected_window: self
+                                    .selected_window
+                                    .as_ref()
+                                    .map(|(id, index)| (id.as_str(), *index)),
+                                filter: &self.filter,
+                                home: self.home.as_deref(),
+                                slots: &self.state.slots,
+                                agents: &self.state.agents,
+                                can_resume: self.can_resume_agents(),
+                            },
                         );
                         orphan_action = ui::orphans::show(
                             ui,

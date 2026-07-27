@@ -108,6 +108,23 @@ impl SessionPresence {
     }
 }
 
+/// What one tmux window last reported about itself, via `grove notify
+/// --window`.
+///
+/// Only windows that have reported get one. That absence is meaningful: a
+/// worktree with no notes at all has nothing reporting per window, and its
+/// window rows show the session's status as they always did; once *any* window
+/// has spoken, a window without a note is a window with nothing to say, and
+/// the row says so by staying quiet rather than repeating its neighbours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowNote {
+    /// tmux window index.
+    pub index: u32,
+    pub status: SessionStatus,
+    /// The agent's own sentence, when it sent one.
+    pub message: Option<String>,
+}
+
 /// A Git worktree of a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -148,6 +165,10 @@ pub struct Worktree {
     /// The message from the last `grove notify` for this worktree, shown while
     /// its status is still the one that message reported.
     pub status_message: Option<String>,
+    /// What individual windows last reported about themselves, in index order.
+    /// Empty means no window of this worktree has ever named itself, which is
+    /// not the same as every window being quiet — see [`WindowNote`].
+    pub window_notes: Vec<WindowNote>,
     /// RAM and CPU of the worktree's scoped agents, pre-rendered by the
     /// poller. `None` means there is no scoped agent — not that it uses
     /// nothing.
@@ -182,6 +203,7 @@ impl Worktree {
             git_status: None,
             status: None,
             status_message: None,
+            window_notes: Vec::new(),
             resources: None,
         }
     }
@@ -189,6 +211,16 @@ impl Worktree {
     /// tmux session name for this worktree.
     pub fn session_name(&self) -> String {
         ids::session_name(&self.id)
+    }
+
+    /// What window `index` last reported about itself, if it ever has.
+    pub fn window_note(&self, index: u32) -> Option<&WindowNote> {
+        self.window_notes.iter().find(|note| note.index == index)
+    }
+
+    /// Does anything about this worktree report per window?
+    pub fn reports_per_window(&self) -> bool {
+        !self.window_notes.is_empty()
     }
 
     /// Primary row label: the branch name, or a detached/bare marker.

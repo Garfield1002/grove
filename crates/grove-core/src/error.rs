@@ -172,8 +172,24 @@ pub enum Error {
     #[error("could not serialize state: {0}")]
     StateWrite(#[from] toml::ser::Error),
 
+    /// Claude Code's `settings.json` could not be rewritten. The file is left
+    /// exactly as it was: it is the user's, and a file Grove cannot parse is
+    /// the last one to overwrite.
+    #[error("could not update {path}: {source}")]
+    ClaudeSettings {
+        path: PathBuf,
+        #[source]
+        source: crate::claude::SettingsError,
+    },
+
     #[error("no agent command is configured — set `command` under [agents] in config.toml")]
     NoAgentCommand,
+
+    #[error("no resume command is configured — set `resume_command` under [agents] in config.toml")]
+    NoResumeCommand,
+
+    #[error("no agent conversation has been reported for this worktree yet")]
+    NoAgentSession,
 
     #[error("the terminal command template is empty")]
     EmptyTerminalTemplate,

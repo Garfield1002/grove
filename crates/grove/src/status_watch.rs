@@ -17,6 +17,7 @@
 //! never across a subprocess or a send.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,6 +34,20 @@ use crate::workers::{ErrorReport, Message};
 /// How often tmux is polled for session signals (ARCHITECTURE.md §1).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The cadence while nothing is on screen. Grove is a launcher: most of its
+/// life is spent minimised or behind the terminal it launched, where a
+/// two-second poll updates rows nobody can see. The slow tick is not zero
+/// because a bell raised while Grove is hidden still has to become a desktop
+/// notification — it just arrives up to this late.
+pub const DORMANT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long without a painted frame means nothing is on screen.
+///
+/// Comfortably longer than [`POLL_INTERVAL`]: every poll asks for a repaint,
+/// so a visible Grove paints at least that often and can never be mistaken
+/// for a hidden one.
+pub const DORMANT_AFTER: Duration = Duration::from_secs(6);
+
 /// How often git status is re-read. Five times cheaper than the tmux poll
 /// because it is five times more expensive: one `git status` per worktree,
 /// against one pair of tmux calls for the whole server.
@@ -45,6 +60,77 @@ pub fn git_refresh_due(last: Option<Instant>, now: Instant) -> bool {
     match last {
         None => true,
         Some(last) => now.saturating_duration_since(last) >= GIT_INTERVAL,
+    }
+}
+
+/// How long to wait before the next poll, given how long ago the UI painted.
+pub fn interval(since_paint: Duration) -> Duration {
+    if since_paint > DORMANT_AFTER {
+        DORMANT_INTERVAL
+    } else {
+        POLL_INTERVAL
+    }
+}
+
+/// When the UI last painted a frame, shared between the UI thread and the
+/// poller.
+///
+/// This is Grove's answer to "is anyone looking?", and it is a better one than
+/// window focus: the common way to use Grove is beside the terminal it
+/// launched, visible but not focused, and status dots have to stay live there.
+/// A frame is the honest signal — a Wayland surface that is minimised, on
+/// another workspace or fully occluded stops getting frame callbacks, so the
+/// repaint each poll asks for never becomes a frame. Where that is not true
+/// (X11, an unoccluded window), Grove simply keeps its old cadence.
+#[derive(Clone)]
+pub struct PaintClock {
+    start: Instant,
+    /// Milliseconds after `start` of the last painted frame.
+    last: Arc<AtomicU64>,
+}
+
+impl PaintClock {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Record a frame, returning how long it had been since the previous one.
+    fn mark(&self) -> Duration {
+        let now = self.millis();
+        let previous = self.last.swap(now, Ordering::Relaxed);
+        Duration::from_millis(now.saturating_sub(previous))
+    }
+
+    /// How long ago the UI last painted.
+    fn since_paint(&self) -> Duration {
+        Duration::from_millis(
+            self.millis()
+                .saturating_sub(self.last.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// A clock whose last frame was `gap` ago.
+    #[cfg(test)]
+    fn aged(gap: Duration) -> Self {
+        Self {
+            start: Instant::now()
+                .checked_sub(gap)
+                .expect("a gap shorter than the process"),
+            last: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn millis(&self) -> u64 {
+        // Saturating rather than wrapping: a process running for 584 million
+        // years would otherwise start reporting fresh frames.
+        self.start
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -86,6 +172,7 @@ pub struct WorktreeLabel {
 pub struct StatusWatch {
     engine: SharedEngine,
     control: Sender<Control>,
+    paint: PaintClock,
 }
 
 impl StatusWatch {
@@ -93,6 +180,7 @@ impl StatusWatch {
     pub fn start(paths: &Paths, out: Sender<Message>, ctx: egui::Context) -> Self {
         let engine = Arc::new(Mutex::new(StatusEngine::default()));
         let (control_tx, control_rx) = channel::<Control>();
+        let paint = PaintClock::new();
 
         let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
         let poller = Poller {
@@ -100,6 +188,7 @@ impl StatusWatch {
             engine: Arc::clone(&engine),
             out: out.clone(),
             ctx: ctx.clone(),
+            paint: paint.clone(),
             labels: HashMap::new(),
             notify_desktop: StatusConfig::default().desktop_notifications,
             known: HashMap::new(),
@@ -118,7 +207,16 @@ impl StatusWatch {
         Self {
             engine,
             control: control_tx,
+            paint,
         }
+    }
+
+    /// Record that the UI painted a frame, and say whether Grove was dormant
+    /// until now — a frame after a long gap is the window coming back into
+    /// view, and the caller turns that into an immediate poll rather than
+    /// leaving the tree stale for the rest of the slow interval.
+    pub fn painted(&self) -> bool {
+        self.paint.mark() > DORMANT_AFTER
     }
 
     /// The user opened a session: clear its attention latch, and clear the
@@ -156,6 +254,8 @@ struct Poller {
     engine: SharedEngine,
     out: Sender<Message>,
     ctx: egui::Context,
+    /// When the UI last painted, which sets the cadence.
+    paint: PaintClock,
     labels: HashMap<String, WorktreeLabel>,
     notify_desktop: bool,
     /// The status last reported per worktree, so a desktop notification fires
@@ -175,8 +275,9 @@ impl Poller {
         loop {
             self.tick();
             // One wait serves both purposes: it is the poll interval, and it
-            // is how control messages arrive.
-            match control.recv_timeout(POLL_INTERVAL) {
+            // is how control messages arrive. The interval is taken after the
+            // tick, so a poll that painted nothing slows the *next* wait.
+            match control.recv_timeout(interval(self.paint.since_paint())) {
                 Ok(message) => {
                     self.apply(message);
                     // Drain anything else already queued before polling again.
@@ -189,6 +290,12 @@ impl Poller {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+
+    /// Nothing has been on screen for a while, so this tick is a background
+    /// one: it exists to catch attention, not to keep rows current.
+    fn dormant(&self) -> bool {
+        self.paint.since_paint() > DORMANT_AFTER
     }
 
     fn apply(&mut self, message: Control) {
@@ -264,7 +371,12 @@ impl Poller {
         )));
         self.emit(Message::StatusPolled(reports));
 
-        if git_refresh_due(self.last_git_refresh, now) {
+        // Git status is the expensive half — one `git status` per worktree —
+        // and unlike attention it has no notification to raise, so nothing is
+        // lost by leaving it until Grove is back on screen. `last_git_refresh`
+        // is left alone while dormant, so the first tick after a frame finds
+        // the refresh overdue and asks for it at once.
+        if !self.dormant() && git_refresh_due(self.last_git_refresh, now) {
             self.last_git_refresh = Some(now);
             self.emit(Message::GitStatusDue);
         }
@@ -365,20 +477,11 @@ fn listen(
             Command::Toggle { slot } => Message::Toggled { slot },
             Command::Notify(notification) => {
                 fold(&engine, &notification);
-                let Notification {
-                    worktree_id,
-                    state,
-                    message,
-                } = notification;
                 // The poller owns the labels and the desktop notification, and
                 // it re-reads tmux anyway; asking it to poll now is what turns
                 // an immediate report into an immediate row update.
                 let _ = control.send(Control::PollNow);
-                Message::Notified {
-                    worktree_id,
-                    state,
-                    message,
-                }
+                Message::Notified(Box::new(notification))
             }
         };
         if out.send(message).is_err() {
@@ -433,6 +536,58 @@ mod tests {
             Some(start),
             start + Duration::from_secs(30)
         ));
+    }
+
+    #[test]
+    fn a_painting_ui_holds_the_fast_cadence() {
+        assert_eq!(interval(Duration::ZERO), POLL_INTERVAL);
+        assert_eq!(
+            interval(POLL_INTERVAL),
+            POLL_INTERVAL,
+            "one poll's worth of silence is what a visible Grove looks like"
+        );
+        assert_eq!(
+            interval(DORMANT_AFTER),
+            POLL_INTERVAL,
+            "the threshold itself is still awake"
+        );
+    }
+
+    #[test]
+    fn a_ui_that_stopped_painting_slows_the_poller() {
+        assert_eq!(
+            interval(DORMANT_AFTER + Duration::from_millis(1)),
+            DORMANT_INTERVAL
+        );
+        assert_eq!(interval(Duration::from_secs(3600)), DORMANT_INTERVAL);
+    }
+
+    #[test]
+    fn a_clock_that_has_just_marked_reads_as_awake() {
+        let clock = PaintClock::new();
+        clock.mark();
+        assert!(
+            clock.since_paint() < DORMANT_AFTER,
+            "a frame was painted a moment ago"
+        );
+        assert_eq!(interval(clock.since_paint()), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn a_frame_after_a_long_gap_reports_the_gap_and_wakes_the_clock() {
+        let gap = DORMANT_AFTER + Duration::from_secs(10);
+        let clock = PaintClock::aged(gap);
+        assert!(
+            clock.since_paint() >= gap,
+            "no frames since the clock began"
+        );
+        assert_eq!(interval(clock.since_paint()), DORMANT_INTERVAL);
+
+        // The window came back: the frame reports the whole gap, which is what
+        // `StatusWatch::painted` turns into an immediate poll.
+        assert!(clock.mark() >= gap);
+        assert!(clock.since_paint() < DORMANT_AFTER);
+        assert_eq!(interval(clock.since_paint()), POLL_INTERVAL);
     }
 
     #[test]

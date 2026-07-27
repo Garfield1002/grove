@@ -54,6 +54,23 @@ impl<'a> Stands<'a> {
     }
 }
 
+/// What a row can offer about the agent conversation last reported in its
+/// worktree (`grove notify --agent-session`, which Claude Code's hooks send).
+///
+/// Every field is a fact, not a preference: an entry appears only when there
+/// is something behind it, so the menu never offers an action that would have
+/// to answer "there is nothing to resume".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentActions<'a> {
+    /// The conversation the agent last reported here.
+    pub session_id: Option<&'a str>,
+    /// Whether `[agents] resume_command` is configured. Grove ships no
+    /// default: only the user knows how their agent spells "resume".
+    pub can_resume: bool,
+    /// Whether that conversation reported a transcript to open.
+    pub has_transcript: bool,
+}
+
 /// What the user did on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowAction {
@@ -62,6 +79,10 @@ pub enum RowAction {
     OpenInNewTerminal,
     OpenNewWindow,
     StartAgent,
+    /// Reopen the conversation the agent last reported in this worktree.
+    ResumeAgent,
+    /// Hand that conversation's transcript to the desktop.
+    OpenTranscript,
     Refresh,
     Remove,
     /// Only offered on a row standing in for its project, which is the only
@@ -105,6 +126,11 @@ impl RowAction {
                 project_id,
                 worktree_id,
             },
+            RowAction::ResumeAgent => Action::ResumeAgent {
+                project_id,
+                worktree_id,
+            },
+            RowAction::OpenTranscript => Action::OpenAgentTranscript { worktree_id },
             RowAction::Refresh => Action::RefreshProject(project_id),
             RowAction::Remove => Action::RemoveWorktree {
                 project_id,
@@ -191,19 +217,33 @@ pub fn indent(depth: u8) -> f32 {
     f32::from(depth) * INDENT_STEP
 }
 
+/// Everything a row needs to draw itself: what it stands for, where it sits in
+/// the tree, and what it can offer about the worktree behind it.
+#[derive(Debug, Clone, Copy)]
+pub struct Row<'a> {
+    pub worktree: &'a Worktree,
+    pub stands: Stands<'a>,
+    pub selected: bool,
+    pub home: Option<&'a std::path::Path>,
+    /// How far in the row sits: 0 with no header above it, one step per level.
+    pub depth: u8,
+    /// The number the user put on the worktree, if any. `None` on a window
+    /// row, which stands for a window and not a worktree.
+    pub slot: Option<u8>,
+    pub agent: AgentActions<'a>,
+}
+
 /// Draw a leaf row for a worktree, named after whatever it stands for.
-///
-/// `slot` is the number the user put on the worktree, if any — passed as
-/// `None` for a window row, which stands for a window and not a worktree.
-pub fn show(
-    ui: &mut Ui,
-    worktree: &Worktree,
-    selected: bool,
-    home: Option<&std::path::Path>,
-    stands: Stands,
-    depth: u8,
-    slot: Option<u8>,
-) -> Option<RowAction> {
+pub fn show(ui: &mut Ui, row: Row) -> Option<RowAction> {
+    let Row {
+        worktree,
+        stands,
+        selected,
+        home,
+        depth,
+        slot,
+        agent,
+    } = row;
     let project = stands.as_project();
     let mut action = None;
     let width = ui.available_width();
@@ -242,7 +282,7 @@ pub fn show(
 
         // The accent edge slot from direction 1c. It carries the status once
         // there is one, and selection otherwise.
-        let edge_color = match (status_color(worktree), selected, hovered) {
+        let edge_color = match (status_color(worktree, stands), selected, hovered) {
             (Some(status), _, _) => Some(status),
             (None, true, _) => Some(theme::ACCENT),
             (None, false, true) => Some(theme::HAIRLINE),
@@ -259,7 +299,7 @@ pub fn show(
         }
 
         let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
-        match (dot_presence(worktree, stands), worktree.status) {
+        match (dot_presence(worktree, stands), row_status(worktree, stands)) {
             // Attention gets its own mark, not just a colour: it is the one
             // state the user has to act on, and colour alone is not enough.
             (session, Some(SessionStatus::Attention)) if session.exists() => icons::bang(
@@ -304,11 +344,14 @@ pub fn show(
             .with_min_x(rect.left() + 31.0)
             .with_max_x(marker_x.max(rect.left() + 60.0))
             .shrink2(vec2(0.0, 6.0));
-        let mut content = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(text_rect)
-                .layout(Layout::top_down(Align::LEFT)),
-        );
+        let sublabel = row_sublabel(worktree, stands, home, project.is_some());
+        // With nothing under it the name is the whole row, so it is centred
+        // rather than left sitting where the top line of two would be.
+        let layout = match sublabel {
+            Some(_) => Layout::top_down(Align::LEFT),
+            None => Layout::left_to_right(Align::Center),
+        };
+        let mut content = ui.new_child(egui::UiBuilder::new().max_rect(text_rect).layout(layout));
         content.spacing_mut().item_spacing.y = 2.0;
 
         let name_color = if selected {
@@ -330,8 +373,8 @@ pub fn show(
         // On the selected row, the agent's own figures lead the sublabel: it
         // is the row the user is looking at, and putting them first means
         // truncation eats the path rather than the numbers.
-        match resource_line(worktree, selected) {
-            Some(resources) => {
+        match (sublabel, resource_line(worktree, selected, stands)) {
+            (Some((text, color)), Some(resources)) => {
                 content.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let (icon, _) =
@@ -342,27 +385,20 @@ pub fn show(
                             .selectable(false),
                     );
                     ui.add(
-                        egui::Label::new(theme::label(
-                            format!("· {}", sublabel(worktree, home, project.is_some())),
-                            theme::FONT_SUB,
-                            sublabel_color(worktree),
-                        ))
-                        .truncate()
-                        .selectable(false),
+                        egui::Label::new(theme::label(format!("· {text}"), theme::FONT_SUB, color))
+                            .truncate()
+                            .selectable(false),
                     );
                 });
             }
-            None => {
+            (Some((text, color)), None) => {
                 content.add(
-                    egui::Label::new(theme::label(
-                        sublabel(worktree, home, project.is_some()),
-                        theme::FONT_SUB,
-                        sublabel_color(worktree),
-                    ))
-                    .truncate()
-                    .selectable(false),
+                    egui::Label::new(theme::label(text, theme::FONT_SUB, color))
+                        .truncate()
+                        .selectable(false),
                 );
             }
+            (None, _) => {}
         }
     }
 
@@ -370,7 +406,7 @@ pub fn show(
         action = Some(RowAction::Activate);
     }
 
-    response.context_menu(|ui| menu(ui, worktree, stands, slot, &mut action));
+    response.context_menu(|ui| menu(ui, worktree, stands, slot, agent, &mut action));
 
     // Built lazily: the tooltip allocates, and most rows are never hovered.
     response.on_hover_ui(|ui| {
@@ -395,15 +431,16 @@ pub fn show(
 /// It opens the worktree on click like a leaf row does — the disclosure
 /// triangle is the affordance for folding it away, and a user who clicks the
 /// name almost always means "give me this worktree".
-pub fn header(
-    ui: &mut Ui,
-    worktree: &Worktree,
-    stands: Stands,
-    count: usize,
-    openness: f32,
-    depth: u8,
-    slot: Option<u8>,
-) -> Option<RowAction> {
+pub fn header(ui: &mut Ui, row: Row, count: usize, openness: f32) -> Option<RowAction> {
+    let Row {
+        worktree,
+        stands,
+        home: _,
+        selected: _,
+        depth,
+        slot,
+        agent,
+    } = row;
     let mut action = None;
     let (outer, _) = ui.allocate_exact_size(
         vec2(ui.available_width(), theme::PROJECT_ROW_HEIGHT),
@@ -457,7 +494,7 @@ pub fn header(
 
         // The status colour a leaf row would put on its edge is worth keeping
         // here: a folded worktree must still be able to say it wants the user.
-        let name_color = match status_color(worktree) {
+        let name_color = match status_color(worktree, stands) {
             Some(color) => color,
             None if worktree.session.exists() => theme::TEXT_DIM,
             None => theme::TEXT_MUTED,
@@ -523,9 +560,9 @@ pub fn header(
         action = Some(RowAction::Activate);
     }
 
-    response.context_menu(|ui| menu(ui, worktree, stands, slot, &mut action));
+    response.context_menu(|ui| menu(ui, worktree, stands, slot, agent, &mut action));
     let more = more.on_hover_cursor(egui::CursorIcon::PointingHand);
-    egui::Popup::menu(&more).show(|ui| menu(ui, worktree, stands, slot, &mut action));
+    egui::Popup::menu(&more).show(|ui| menu(ui, worktree, stands, slot, agent, &mut action));
 
     action
 }
@@ -536,6 +573,7 @@ fn menu(
     worktree: &Worktree,
     stands: Stands,
     slot: Option<u8>,
+    agent: AgentActions,
     action: &mut Option<RowAction>,
 ) {
     let open = match stands {
@@ -561,6 +599,26 @@ fn menu(
     }
     if ui.button("Start agent").clicked() {
         *action = Some(RowAction::StartAgent);
+        ui.close();
+    }
+    // Only what the agent has actually told Grove about itself. A worktree no
+    // agent has reported in shows none of this.
+    if agent.can_resume
+        && agent.session_id.is_some()
+        && ui.button("Resume agent conversation").clicked()
+    {
+        *action = Some(RowAction::ResumeAgent);
+        ui.close();
+    }
+    if agent.has_transcript && ui.button("Open agent transcript").clicked() {
+        *action = Some(RowAction::OpenTranscript);
+        ui.close();
+    }
+    if let Some(id) = agent.session_id
+        && ui.button("Copy agent conversation id").clicked()
+    {
+        ui.ctx().copy_text(id.to_string());
+        *action = Some(RowAction::Select);
         ui.close();
     }
     if ui.button("Refresh").clicked() {
@@ -737,22 +795,42 @@ fn markers(worktree: &Worktree) -> Markers {
 /// list twitch, and the tooltip has them for the others. Only when there is a
 /// scoped agent to measure — `resources` is `None` otherwise, which is not the
 /// same as zero.
-fn resource_line(worktree: &Worktree, selected: bool) -> Option<&str> {
-    if !selected || !worktree.session.exists() {
+/// Never on a window row: the figures are the worktree's whole session, and
+/// showing them beside one window's name would read as that window's.
+fn resource_line<'a>(worktree: &'a Worktree, selected: bool, stands: Stands) -> Option<&'a str> {
+    if !selected || !worktree.session.exists() || stands.as_window().is_some() {
         return None;
     }
     worktree.resources.as_deref()
 }
 
-/// The accent colour a row's status earns, if any.
+/// The status a row shows: the window's own when windows report for
+/// themselves here, the worktree's otherwise.
+///
+/// The fallback is what keeps the common case unchanged. Where nothing reports
+/// per window — no agent hooks, or an agent that does not say which window it
+/// is in — every window row shows the session's status exactly as it always
+/// did. Once *some* window of a worktree has reported, a window that has not
+/// is genuinely quiet, and saying so beats repeating its neighbour's state on
+/// every row.
+fn row_status(worktree: &Worktree, stands: Stands) -> Option<SessionStatus> {
+    match stands.as_window() {
+        Some(window) if worktree.reports_per_window() => {
+            worktree.window_note(window.index).map(|note| note.status)
+        }
+        _ => worktree.status,
+    }
+}
+
+/// The accent colour a status earns, if any.
 ///
 /// Idle earns none: an idle session is the resting state, and colouring every
 /// resting row would leave nothing for the two that matter to stand out from.
-fn status_color(worktree: &Worktree) -> Option<egui::Color32> {
+fn status_color(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
     if !worktree.session.exists() {
         return None;
     }
-    match worktree.status? {
+    match row_status(worktree, stands)? {
         SessionStatus::Attention => Some(theme::STATUS_ATTENTION),
         SessionStatus::Working => Some(theme::STATUS_WORKING),
         SessionStatus::Idle => None,
@@ -763,6 +841,40 @@ fn sublabel_color(worktree: &Worktree) -> egui::Color32 {
     match &worktree.git_status {
         Some(status) if status.operation.is_some() => theme::WARNING,
         _ => theme::TEXT_FAINT,
+    }
+}
+
+/// The muted second line of a row, and its colour.
+///
+/// A window row that has something of its own to say says it. A window row
+/// under a worktree where windows report for themselves and this one has not
+/// says nothing at all — repeating the worktree's git summary and path once
+/// per window is noise, not information, and the header above the rows already
+/// carries the worktree.
+///
+/// Everywhere else this is the worktree's own sublabel, unchanged.
+fn row_sublabel(
+    worktree: &Worktree,
+    stands: Stands,
+    home: Option<&std::path::Path>,
+    collapsed: bool,
+) -> Option<(String, egui::Color32)> {
+    let Some(window) = stands.as_window() else {
+        return Some((
+            sublabel(worktree, home, collapsed),
+            sublabel_color(worktree),
+        ));
+    };
+    match worktree.window_note(window.index) {
+        Some(note) => note
+            .message
+            .clone()
+            .map(|message| (message, theme::TEXT_MUTED)),
+        None if worktree.reports_per_window() => None,
+        None => Some((
+            sublabel(worktree, home, collapsed),
+            sublabel_color(worktree),
+        )),
     }
 }
 
@@ -785,6 +897,7 @@ mod tests {
     use super::*;
     use grove_core::git::status::Operation;
     use grove_core::git::{StatusSummary, WorktreeEntry};
+    use grove_core::model::WindowNote;
     use std::path::{Path, PathBuf};
 
     fn worktree() -> Worktree {
@@ -806,20 +919,26 @@ mod tests {
         worktree.session = SessionPresence::Detached;
 
         worktree.status = Some(SessionStatus::Attention);
-        assert_eq!(status_color(&worktree), Some(theme::STATUS_ATTENTION));
+        assert_eq!(
+            status_color(&worktree, Stands::Worktree),
+            Some(theme::STATUS_ATTENTION)
+        );
 
         worktree.status = Some(SessionStatus::Working);
-        assert_eq!(status_color(&worktree), Some(theme::STATUS_WORKING));
+        assert_eq!(
+            status_color(&worktree, Stands::Worktree),
+            Some(theme::STATUS_WORKING)
+        );
 
         worktree.status = Some(SessionStatus::Idle);
         assert_eq!(
-            status_color(&worktree),
+            status_color(&worktree, Stands::Worktree),
             None,
             "idle is the resting state and earns no accent"
         );
 
         worktree.status = None;
-        assert_eq!(status_color(&worktree), None);
+        assert_eq!(status_color(&worktree, Stands::Worktree), None);
     }
 
     #[test]
@@ -827,7 +946,7 @@ mod tests {
         let mut worktree = worktree();
         worktree.session = SessionPresence::None;
         worktree.status = Some(SessionStatus::Attention);
-        assert_eq!(status_color(&worktree), None);
+        assert_eq!(status_color(&worktree, Stands::Worktree), None);
     }
 
     #[test]
@@ -836,9 +955,12 @@ mod tests {
         worktree.session = SessionPresence::Detached;
         worktree.resources = Some("64%  1.4G".into());
 
-        assert_eq!(resource_line(&worktree, true), Some("64%  1.4G"));
         assert_eq!(
-            resource_line(&worktree, false),
+            resource_line(&worktree, true, Stands::Worktree),
+            Some("64%  1.4G")
+        );
+        assert_eq!(
+            resource_line(&worktree, false, Stands::Worktree),
             None,
             "unselected rows stay still; the tooltip has the figures"
         );
@@ -850,12 +972,12 @@ mod tests {
         worktree.session = SessionPresence::Detached;
         // No resource accounting, or no agent: not the same as zero usage.
         worktree.resources = None;
-        assert_eq!(resource_line(&worktree, true), None);
+        assert_eq!(resource_line(&worktree, true, Stands::Worktree), None);
 
         // And a closed session never shows a leftover reading.
         worktree.resources = Some("64%  1.4G".into());
         worktree.session = SessionPresence::None;
-        assert_eq!(resource_line(&worktree, true), None);
+        assert_eq!(resource_line(&worktree, true, Stands::Worktree), None);
     }
 
     #[test]
@@ -1046,6 +1168,111 @@ mod tests {
             dot_presence(&worktree, Stands::Worktree),
             SessionPresence::Attached,
             "a worktree row still reports its own session"
+        );
+    }
+
+    fn note(index: u32, status: SessionStatus, message: Option<&str>) -> WindowNote {
+        WindowNote {
+            index,
+            status,
+            message: message.map(str::to_string),
+        }
+    }
+
+    /// Nothing reports per window in most setups, and those rows must look
+    /// exactly as they always did.
+    #[test]
+    fn window_rows_fall_back_to_the_session_when_no_window_reports() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        let shell = window(0, "shell", true);
+
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&shell)),
+            Some(SessionStatus::Working)
+        );
+        assert_eq!(
+            row_sublabel(&worktree, Stands::Window(&shell), None, false).map(|(text, _)| text),
+            Some(sublabel(&worktree, None, false)),
+            "with nothing of its own to say, the row says what the worktree does"
+        );
+    }
+
+    /// Once a window has reported, the rows stop echoing each other: the one
+    /// that reported shows its own state and message, and the quiet one shows
+    /// that it is quiet.
+    #[test]
+    fn a_reporting_window_speaks_only_for_itself() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Attention);
+        worktree.window_notes = vec![note(
+            1,
+            SessionStatus::Attention,
+            Some("needs permission to run tests"),
+        )];
+        let shell = window(0, "shell", true);
+        let agent = window(1, "agent", false);
+
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&agent)),
+            Some(SessionStatus::Attention)
+        );
+        assert_eq!(
+            row_sublabel(&worktree, Stands::Window(&agent), None, false).map(|(text, _)| text),
+            Some("needs permission to run tests".to_string())
+        );
+
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&shell)),
+            None,
+            "the shell beside it is not the one that wants the user"
+        );
+        assert_eq!(
+            row_sublabel(&worktree, Stands::Window(&shell), None, false),
+            None,
+            "repeating the worktree's line under every window is noise"
+        );
+
+        // The worktree's own row still carries the worktree's state: a folded
+        // row has to be able to say that something under it wants the user.
+        assert_eq!(
+            row_status(&worktree, Stands::Worktree),
+            Some(SessionStatus::Attention)
+        );
+        assert!(row_sublabel(&worktree, Stands::Worktree, None, false).is_some());
+    }
+
+    /// A window can report a state without having anything to say about it.
+    #[test]
+    fn a_window_note_without_a_message_still_colours_its_row() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.window_notes = vec![note(1, SessionStatus::Working, None)];
+        let agent = window(1, "agent", false);
+        assert_eq!(
+            status_color(&worktree, Stands::Window(&agent)),
+            Some(theme::STATUS_WORKING)
+        );
+        assert_eq!(
+            row_sublabel(&worktree, Stands::Window(&agent), None, false),
+            None
+        );
+    }
+
+    /// The figures are the whole session's, so they belong to the row that
+    /// stands for the session.
+    #[test]
+    fn resource_figures_never_land_on_a_window_row() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.resources = Some("64%  1.4G".into());
+        let shell = window(0, "shell", true);
+        assert_eq!(resource_line(&worktree, true, Stands::Window(&shell)), None);
+        assert_eq!(
+            resource_line(&worktree, true, Stands::Worktree),
+            Some("64%  1.4G")
         );
     }
 

@@ -42,6 +42,13 @@ pub struct State {
     /// never a reason to touch anything on disk.
     #[serde(rename = "slot")]
     pub slots: Vec<SlotRecord>,
+    /// The last agent conversation seen in each worktree, as the agent named
+    /// it. An index like every other table here: it lets Grove offer to resume
+    /// that conversation or open its transcript, and pointing at one that no
+    /// longer exists means the offer does nothing — never that anything is
+    /// removed.
+    #[serde(rename = "agent")]
+    pub agents: Vec<AgentRecord>,
 }
 
 impl Default for State {
@@ -52,6 +59,7 @@ impl Default for State {
             sessions: Vec::new(),
             ignored_sessions: Vec::new(),
             slots: Vec::new(),
+            agents: Vec::new(),
         }
     }
 }
@@ -128,6 +136,36 @@ pub struct SessionRecord {
     pub last_activity_at: u64,
 }
 
+/// The agent conversation last reported in a worktree, by `grove notify
+/// --agent-session` (which Claude Code's hooks send through `grove notify
+/// --hook`).
+///
+/// Written from a report and read back into a menu entry; Grove never opens
+/// the transcript itself and never derives anything from the id. A record that
+/// points at a conversation the agent has since forgotten simply produces a
+/// command that says so — it is never a reason to remove anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentRecord {
+    /// Deterministic worktree id the conversation happened in.
+    pub worktree_id: String,
+    /// The agent's own session id, exactly as it reported it.
+    pub session_id: String,
+    /// Where the agent said it keeps the transcript. Empty when it did not say.
+    pub transcript_path: PathBuf,
+}
+
+impl AgentRecord {
+    /// Is there anything here worth keeping?
+    fn is_usable(&self) -> bool {
+        !self.worktree_id.is_empty() && (!self.session_id.is_empty() || self.has_transcript())
+    }
+
+    pub fn has_transcript(&self) -> bool {
+        !self.transcript_path.as_os_str().is_empty()
+    }
+}
+
 impl State {
     pub fn from_toml(text: &str, path: &Path) -> Result<Self> {
         let mut state: Self = toml::from_str(text).map_err(|source| Error::StateRead {
@@ -135,6 +173,7 @@ impl State {
             source,
         })?;
         state.sanitize_slots();
+        state.sanitize_agents();
         Ok(state)
     }
 
@@ -267,6 +306,70 @@ impl State {
         let before = self.slots.len();
         self.slots.retain(|s| s.worktree_id != worktree_id);
         self.slots.len() != before
+    }
+
+    /// The agent conversation last seen in a worktree, if there was one.
+    pub fn agent(&self, worktree_id: &str) -> Option<&AgentRecord> {
+        self.agents.iter().find(|a| a.worktree_id == worktree_id)
+    }
+
+    /// Record what an agent reported about itself, and say whether that
+    /// changed anything.
+    ///
+    /// The answer is what keeps `state.toml` from being rewritten on every
+    /// report: agents notify on each turn, and the id is the same every time.
+    ///
+    /// A field the report left out never erases what is already known — a
+    /// `Stop` hook that carries a session id but no transcript path must not
+    /// cost the path a `SessionStart` recorded a minute earlier.
+    pub fn record_agent(&mut self, record: AgentRecord) -> bool {
+        if !record.is_usable() {
+            return false;
+        }
+        let Some(existing) = self
+            .agents
+            .iter_mut()
+            .find(|a| a.worktree_id == record.worktree_id)
+        else {
+            self.agents.push(record);
+            return true;
+        };
+        let mut changed = false;
+        let has_transcript = record.has_transcript();
+        if !record.session_id.is_empty() && existing.session_id != record.session_id {
+            existing.session_id = record.session_id;
+            // A new conversation invalidates the old transcript: it is the
+            // previous conversation's file, and offering it under the new id
+            // would point the user at the wrong one.
+            existing.transcript_path = PathBuf::new();
+            changed = true;
+        }
+        if has_transcript && existing.transcript_path != record.transcript_path {
+            existing.transcript_path = record.transcript_path;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Forget a worktree's agent record. Bookkeeping only: the conversation
+    /// itself is the agent's, and Grove neither owns nor deletes it.
+    pub fn forget_agent(&mut self, worktree_id: &str) -> bool {
+        let before = self.agents.len();
+        self.agents.retain(|a| a.worktree_id != worktree_id);
+        self.agents.len() != before
+    }
+
+    /// Drop agent records a hand-edited (or newer) file could hold but Grove
+    /// cannot act on: no worktree, nothing to resume and nothing to open, or a
+    /// second record for a worktree that already has one. First entry wins.
+    fn sanitize_agents(&mut self) {
+        let mut kept: Vec<AgentRecord> = Vec::with_capacity(self.agents.len());
+        for record in std::mem::take(&mut self.agents) {
+            if record.is_usable() && !kept.iter().any(|k| k.worktree_id == record.worktree_id) {
+                kept.push(record);
+            }
+        }
+        self.agents = kept;
     }
 
     /// Drop slots a hand-edited (or newer) file could hold but Grove cannot
@@ -666,6 +769,121 @@ mod tests {
         .expect("older file");
         assert!(state.sessions.is_empty());
         assert!(state.ignored_sessions.is_empty());
+    }
+
+    // ------------------------------------------------------- agent records
+
+    fn agent(worktree_id: &str, session_id: &str, transcript: &str) -> AgentRecord {
+        AgentRecord {
+            worktree_id: worktree_id.to_string(),
+            session_id: session_id.to_string(),
+            transcript_path: PathBuf::from(transcript),
+        }
+    }
+
+    #[test]
+    fn agent_records_round_trip_through_toml() {
+        let mut state = State::default();
+        assert!(state.record_agent(agent(
+            "bceeb7",
+            "0f3a-91bc",
+            "/home/u/.claude/projects/x/0f3a.jsonl"
+        )));
+        let text = state.to_toml().expect("serializes");
+        let parsed = State::from_toml(&text, Path::new("state.toml")).expect("parses");
+        assert_eq!(parsed, state);
+        assert_eq!(
+            parsed.agent("bceeb7").map(|a| a.session_id.as_str()),
+            Some("0f3a-91bc")
+        );
+    }
+
+    /// Agents report every turn with the same id; rewriting `state.toml` each
+    /// time would be a file write per keystroke of conversation.
+    #[test]
+    fn recording_the_same_agent_again_changes_nothing() {
+        let mut state = State::default();
+        assert!(state.record_agent(agent("bceeb7", "0f3a", "/tmp/0f3a.jsonl")));
+        assert!(
+            !state.record_agent(agent("bceeb7", "0f3a", "/tmp/0f3a.jsonl")),
+            "nothing changed, so nothing to save"
+        );
+        assert_eq!(state.agents.len(), 1);
+    }
+
+    /// Hooks carry different fields: `SessionStart` knows the transcript,
+    /// later ones may only know the id. The record is the union, not the last
+    /// message.
+    #[test]
+    fn a_report_that_omits_a_field_does_not_erase_it() {
+        let mut state = State::default();
+        state.record_agent(agent("bceeb7", "0f3a", "/tmp/0f3a.jsonl"));
+        assert!(!state.record_agent(agent("bceeb7", "0f3a", "")));
+        assert_eq!(
+            state.agent("bceeb7").map(|a| a.transcript_path.as_path()),
+            Some(Path::new("/tmp/0f3a.jsonl"))
+        );
+    }
+
+    /// A new conversation's transcript is a different file, so the old path
+    /// must not survive under the new id.
+    #[test]
+    fn a_new_conversation_drops_the_previous_transcript() {
+        let mut state = State::default();
+        state.record_agent(agent("bceeb7", "0f3a", "/tmp/0f3a.jsonl"));
+        assert!(state.record_agent(agent("bceeb7", "77cd", "")));
+        let record = state.agent("bceeb7").expect("present");
+        assert_eq!(record.session_id, "77cd");
+        assert!(!record.has_transcript());
+    }
+
+    #[test]
+    fn an_empty_agent_report_is_not_recorded() {
+        let mut state = State::default();
+        assert!(!state.record_agent(agent("bceeb7", "", "")));
+        assert!(!state.record_agent(agent("", "0f3a", "/tmp/t.jsonl")));
+        assert!(state.agents.is_empty());
+        // A transcript alone is worth keeping: it can still be opened.
+        assert!(state.record_agent(agent("bceeb7", "", "/tmp/t.jsonl")));
+    }
+
+    #[test]
+    fn forgetting_an_agent_removes_only_that_record() {
+        let mut state = State::default();
+        state.record_agent(agent("bceeb7", "0f3a", ""));
+        state.record_agent(agent("69f1b5", "77cd", ""));
+        assert!(state.forget_agent("bceeb7"));
+        assert!(!state.forget_agent("bceeb7"));
+        assert_eq!(state.agents.len(), 1);
+        assert!(state.agent("69f1b5").is_some());
+    }
+
+    #[test]
+    fn a_hand_edited_file_with_bad_agent_records_loads_with_the_usable_ones() {
+        let state = State::from_toml(
+            "[[agent]]\nworktree_id = \"bceeb7\"\nsession_id = \"0f3a\"\n\n\
+             [[agent]]\nworktree_id = \"bceeb7\"\nsession_id = \"later\"\n\n\
+             [[agent]]\nworktree_id = \"\"\nsession_id = \"orphan\"\n\n\
+             [[agent]]\nworktree_id = \"69f1b5\"\n",
+            Path::new("state.toml"),
+        )
+        .expect("parses");
+        assert_eq!(
+            state
+                .agents
+                .iter()
+                .map(|a| a.worktree_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bceeb7"],
+            "first entry wins; empty and duplicate records go"
+        );
+    }
+
+    /// An older file has no `[[agent]]` table at all.
+    #[test]
+    fn a_file_without_the_agent_table_still_loads() {
+        let state = State::from_toml("version = 1\n", Path::new("state.toml")).expect("older file");
+        assert!(state.agents.is_empty());
     }
 
     #[test]

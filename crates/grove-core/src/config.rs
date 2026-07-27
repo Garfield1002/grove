@@ -34,6 +34,12 @@ pub struct AgentConfig {
     /// Shell-style command template, expanded like the terminal one. Empty
     /// means Grove offers no "start agent" action at all.
     pub command: String,
+    /// Template that reopens the agent's last conversation in a worktree,
+    /// with `{agent_session}` standing for the id the agent reported through
+    /// `grove notify`. Empty means Grove offers no "resume" action — it has no
+    /// idea how any given agent spells that, and guessing would produce a
+    /// command the user never asked for.
+    pub resume_command: String,
     /// Per-project overrides, keyed by project name.
     pub per_project: std::collections::BTreeMap<String, String>,
     /// `auto` (wrap when a systemd user manager is present), `always` or
@@ -51,6 +57,13 @@ impl AgentConfig {
             .or(Some(self.command.as_str()))
             .map(str::trim)
             .filter(|c| !c.is_empty())
+    }
+
+    /// The template that resumes an agent's last conversation, if the user
+    /// configured one. There is no default: only the user knows what their
+    /// agent's resume flag is.
+    pub fn resume_command(&self) -> Option<&str> {
+        Some(self.resume_command.trim()).filter(|c| !c.is_empty())
     }
 
     pub fn accounting(&self) -> Accounting {
@@ -176,6 +189,11 @@ pub fn first_run_document(terminal_command: &str) -> String {
          # into the resulting arguments — never the other way round.\n\
          # command = \"claude\"\n\
          # resource_accounting = \"auto\"   # auto | always | never\n\
+         #\n\
+         # Reopens the last conversation `grove notify --agent-session` saw in\n\
+         # a worktree. Grove ships no default: only you know how your agent\n\
+         # spells it. {{agent_session}} is the id the agent reported.\n\
+         # resume_command = \"claude --resume {{agent_session}}\"\n\
          #\n\
          # [agents.per_project]\n\
          # acme-web = \"claude --resume\"\n",

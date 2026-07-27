@@ -59,6 +59,17 @@ pub enum Action {
         project_id: String,
         worktree_id: String,
     },
+    /// Reopen the agent conversation last reported in a worktree, using the
+    /// configured `resume_command`.
+    ResumeAgent {
+        project_id: String,
+        worktree_id: String,
+    },
+    /// Hand the reported transcript to the desktop. Grove opens it; it never
+    /// reads it.
+    OpenAgentTranscript {
+        worktree_id: String,
+    },
     /// Open the safe-removal dialog for a worktree.
     RemoveWorktree {
         project_id: String,

@@ -11,6 +11,9 @@
 //! agent: a missing GUI, a missing tmux server and a missing session are all
 //! normal states that exit 0. Only a usage error is worth a non-zero exit.
 
+use std::io::{IsTerminal, Read};
+
+use grove_core::claude::HookPayload;
 use grove_core::ipc::{self, Notification};
 use grove_core::status::SessionStatus;
 use grove_core::tmux::session;
@@ -20,24 +23,53 @@ pub const USAGE: &str = "\
 grove notify — report a session's status to Grove
 
 Usage:
-  grove notify --state <state> [--session <id>] [--message <text>]
+  grove notify --state <state> [options]
+  grove notify --hook [options]
 
 Options:
-  --state <state>    one of: idle, working, attention
-  --session <id>     worktree id; defaults to $GROVE_SESSION, which every
-                     Grove-managed tmux session exports
-  --message <text>   optional one-line summary shown with the status
+  --state <state>       one of: idle, working, attention
+  --hook                read a Claude Code hook payload (JSON) on stdin and
+                        take the state, message, conversation id and
+                        transcript path from it. Explicit flags win.
+  --session <id>        worktree id; defaults to $GROVE_SESSION, which every
+                        Grove-managed tmux session exports
+  --message <text>      optional one-line summary shown with the status
+  --window <index>      the tmux window this is about; defaults to the one
+                        holding $TMUX_PANE, so the report marks the row that
+                        raised it rather than the whole worktree
+  --agent-session <id>  the agent's own conversation id, so Grove can offer to
+                        resume it later
+  --transcript <path>   absolute path to that conversation's transcript
 
 Attention is sticky: it stays until you open the session. Reporting `idle`
 or `working` does not clear it.
+
+`grove hooks install` writes the Claude Code configuration for --hook.
 ";
 
-/// A parsed command line.
+/// A parsed command line, resolved against the environment and any hook
+/// payload: everything needed to send one report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyArgs {
     pub worktree_id: String,
     pub state: SessionStatus,
     pub message: Option<String>,
+    pub window: Option<u32>,
+    pub agent_session: Option<String>,
+    pub transcript: Option<String>,
+}
+
+/// The command line before anything else has been consulted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Read a hook payload from stdin.
+    pub hook: bool,
+    pub state: Option<SessionStatus>,
+    pub session: Option<String>,
+    pub message: Option<String>,
+    pub window: Option<u32>,
+    pub agent_session: Option<String>,
+    pub transcript: Option<String>,
 }
 
 /// Why a command line was rejected. Every variant is a usage error the caller
@@ -53,20 +85,20 @@ pub enum ArgsError {
     MissingSession,
     #[error("`{0}` is not a worktree id: expected 6 hex characters")]
     BadSession(String),
+    #[error("`{0}` is not a window index")]
+    BadWindow(String),
     #[error("{0} needs a value")]
     MissingValue(String),
     #[error("unknown option `{0}`")]
     Unknown(String),
+    #[error("--hook reads a JSON payload on stdin; it is not meant to be run by hand")]
+    HookNeedsStdin,
 }
 
-/// Parse `notify`'s arguments, with `$GROVE_SESSION` as the session default.
-///
-/// `env_session` is passed in rather than read here so this stays testable
-/// without touching the process environment.
-pub fn parse_args(args: &[String], env_session: Option<&str>) -> Result<NotifyArgs, ArgsError> {
-    let mut state: Option<SessionStatus> = None;
-    let mut session: Option<String> = None;
-    let mut message: Option<String> = None;
+/// Parse `notify`'s arguments. Nothing outside the argument list is consulted
+/// here — the environment and any hook payload are applied by [`resolve`].
+pub fn parse_options(args: &[String]) -> Result<Options, ArgsError> {
+    let mut options = Options::default();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -76,46 +108,116 @@ pub fn parse_args(args: &[String], env_session: Option<&str>) -> Result<NotifyAr
                 .ok_or_else(|| ArgsError::MissingValue(name.to_string()))
         };
         match arg.as_str() {
+            "--hook" => options.hook = true,
             "--state" | "-s" => {
                 let raw = value("--state")?;
-                state = Some(SessionStatus::parse(&raw).ok_or(ArgsError::BadState(raw))?);
+                options.state = Some(SessionStatus::parse(&raw).ok_or(ArgsError::BadState(raw))?);
             }
-            "--session" => session = Some(value("--session")?),
-            "--message" | "-m" => message = Some(value("--message")?),
+            "--session" => options.session = Some(value("--session")?),
+            "--message" | "-m" => options.message = Some(value("--message")?),
+            "--window" | "-w" => {
+                let raw = value("--window")?;
+                options.window = Some(parse_window(&raw)?);
+            }
+            "--agent-session" => options.agent_session = Some(value("--agent-session")?),
+            "--transcript" => options.transcript = Some(value("--transcript")?),
             other => {
                 // `--state=attention` is the spelling people reach for first.
                 if let Some(raw) = other.strip_prefix("--state=") {
-                    state = Some(
+                    options.state = Some(
                         SessionStatus::parse(raw).ok_or_else(|| ArgsError::BadState(raw.into()))?,
                     );
                 } else if let Some(raw) = other.strip_prefix("--session=") {
-                    session = Some(raw.to_string());
+                    options.session = Some(raw.to_string());
                 } else if let Some(raw) = other.strip_prefix("--message=") {
-                    message = Some(raw.to_string());
+                    options.message = Some(raw.to_string());
+                } else if let Some(raw) = other.strip_prefix("--window=") {
+                    options.window = Some(parse_window(raw)?);
+                } else if let Some(raw) = other.strip_prefix("--agent-session=") {
+                    options.agent_session = Some(raw.to_string());
+                } else if let Some(raw) = other.strip_prefix("--transcript=") {
+                    options.transcript = Some(raw.to_string());
                 } else {
                     return Err(ArgsError::Unknown(other.to_string()));
                 }
             }
         }
     }
+    Ok(options)
+}
 
-    let state = state.ok_or(ArgsError::MissingState)?;
-    let worktree_id = session
+fn parse_window(raw: &str) -> Result<u32, ArgsError> {
+    raw.trim()
+        .parse()
+        .map_err(|_| ArgsError::BadWindow(raw.to_string()))
+}
+
+/// Fill the gaps in a command line from `$GROVE_SESSION` and, when `--hook`
+/// was passed, the payload Claude Code delivered.
+///
+/// `Ok(None)` means there is nothing to report: the payload described an event
+/// Grove has no opinion about, which is the normal answer for an event a newer
+/// Claude Code has added. That is a success — a hook must not fail an agent
+/// because Grove has not caught up with it.
+///
+/// A flag always beats the payload. Someone who spelled out `--state` in their
+/// own hook configuration meant it.
+pub fn resolve(
+    options: Options,
+    env_session: Option<&str>,
+    payload: Option<&HookPayload>,
+) -> Result<Option<NotifyArgs>, ArgsError> {
+    let state = match options
+        .state
+        .or_else(|| payload.and_then(HookPayload::state))
+    {
+        Some(state) => state,
+        // Only a hook may be silent; a hand-run `notify` still has to say what
+        // it is reporting.
+        None if options.hook => return Ok(None),
+        None => return Err(ArgsError::MissingState),
+    };
+    let worktree_id = match options
+        .session
         .or_else(|| env_session.map(str::to_string))
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
-        .ok_or(ArgsError::MissingSession)?;
+    {
+        Some(id) => id,
+        // A hook with no session is an agent started outside Grove — a plain
+        // terminal, or another multiplexer. There is no row to report about
+        // and nothing has gone wrong, so the hook says nothing and exits 0.
+        None if options.hook => return Ok(None),
+        None => return Err(ArgsError::MissingSession),
+    };
     // Validate here rather than in the GUI: an id that cannot name a session
     // would otherwise fail silently on both delivery paths.
     if !ids::is_worktree_id(&worktree_id) {
         return Err(ArgsError::BadSession(worktree_id));
     }
 
-    Ok(NotifyArgs {
+    Ok(Some(NotifyArgs {
         worktree_id,
         state,
-        message,
-    })
+        message: options
+            .message
+            .or_else(|| payload.and_then(HookPayload::summary)),
+        window: options.window,
+        agent_session: options
+            .agent_session
+            .or_else(|| payload.and_then(|p| p.session_id.clone())),
+        transcript: options
+            .transcript
+            .or_else(|| payload.and_then(|p| p.transcript_path.clone())),
+    }))
+}
+
+/// Parse and resolve in one step, for a command line with no hook payload
+/// behind it. The real path through [`run`] keeps the two apart, because a
+/// payload has to be read in between.
+#[cfg(test)]
+pub fn parse_args(args: &[String], env_session: Option<&str>) -> Result<NotifyArgs, ArgsError> {
+    resolve(parse_options(args)?, env_session, None)?.ok_or(ArgsError::MissingState)
 }
 
 /// What a notify run actually managed to deliver. Returned for the exit
@@ -128,6 +230,46 @@ pub struct Delivery {
     pub delivered: bool,
 }
 
+/// The most stdin a hook payload may be. Claude Code's payloads are a few
+/// hundred bytes; this is only here so a mistaken pipe cannot make a hook read
+/// forever.
+const MAX_PAYLOAD_LEN: u64 = 256 * 1024;
+
+/// Read the hook payload from stdin.
+///
+/// `None` for anything that is not a payload. Running `grove notify --hook` by
+/// hand is the one case worth an error instead: it would otherwise sit there
+/// waiting on a terminal that is never going to produce JSON.
+fn read_payload() -> Result<Option<HookPayload>, ArgsError> {
+    if std::io::stdin().is_terminal() {
+        return Err(ArgsError::HookNeedsStdin);
+    }
+    let mut input = String::new();
+    if std::io::stdin()
+        .take(MAX_PAYLOAD_LEN)
+        .read_to_string(&mut input)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(HookPayload::parse(&input))
+}
+
+/// Which window this report is about.
+///
+/// An explicit `--window` wins. Otherwise the pane the hook is running in
+/// names it, which is what puts an agent's report on the agent's row instead
+/// of on every row of the worktree. Every failure here is silent and yields
+/// `None`: it is a refinement of a report, never a reason to lose one.
+fn resolve_window(paths: &Paths, explicit: Option<u32>) -> Option<u32> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let pane = std::env::var(session::PANE_ENV_VAR).ok()?;
+    let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
+    session::window_of_pane(&server, &pane).ok().flatten()
+}
+
 /// Run `grove notify`.
 pub fn run(args: &[String]) -> Result<Delivery, Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -135,8 +277,13 @@ pub fn run(args: &[String]) -> Result<Delivery, Box<dyn std::error::Error>> {
         return Ok(Delivery::default());
     }
     let env_session = std::env::var(session::SESSION_ENV_VAR).ok();
-    let parsed = match parse_args(args, env_session.as_deref()) {
-        Ok(parsed) => parsed,
+    let parsed = match parse_options(args).and_then(|options| {
+        let payload = if options.hook { read_payload()? } else { None };
+        resolve(options, env_session.as_deref(), payload.as_ref())
+    }) {
+        // An event Grove has no opinion about. Nothing to send, nothing wrong.
+        Ok(None) => return Ok(Delivery::default()),
+        Ok(Some(parsed)) => parsed,
         Err(err) => {
             eprintln!("grove notify: {err}\n");
             eprint!("{USAGE}");
@@ -147,14 +294,20 @@ pub fn run(args: &[String]) -> Result<Delivery, Box<dyn std::error::Error>> {
     let mut delivery = Delivery::default();
 
     // The durable marker first: if this process is killed between the two, the
-    // signal should survive rather than be lost.
+    // signal should survive rather than be lost. It is deliberately the
+    // session's and not the window's — the durable half says *that* a worktree
+    // wants the user, which is what survives a restart; which window said so
+    // is live detail the GUI holds while it is running.
     if parsed.state == SessionStatus::Attention {
         let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
         delivery.marked = session::set_attention(&server, &ids::session_name(&parsed.worktree_id))?;
     }
 
-    let notification =
-        Notification::new(parsed.worktree_id, parsed.state).with_message(parsed.message);
+    let notification = Notification::new(parsed.worktree_id, parsed.state)
+        .with_message(parsed.message)
+        .with_window(resolve_window(&paths, parsed.window))
+        .with_agent_session(parsed.agent_session)
+        .with_transcript(parsed.transcript);
     delivery.delivered = ipc::send(&paths.notify_socket(), &notification)?;
     Ok(delivery)
 }
@@ -167,6 +320,10 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    fn payload(json: &str) -> HookPayload {
+        HookPayload::parse(json).expect("valid payload")
+    }
+
     #[test]
     fn parses_a_full_command_line() {
         let parsed = parse_args(
@@ -177,6 +334,12 @@ mod tests {
                 "a1b2c3",
                 "--message",
                 "needs permission",
+                "--window",
+                "2",
+                "--agent-session",
+                "0f3a",
+                "--transcript",
+                "/tmp/0f3a.jsonl",
             ]),
             None,
         )
@@ -187,7 +350,123 @@ mod tests {
                 worktree_id: "a1b2c3".into(),
                 state: SessionStatus::Attention,
                 message: Some("needs permission".into()),
+                window: Some(2),
+                agent_session: Some("0f3a".into()),
+                transcript: Some("/tmp/0f3a.jsonl".into()),
             }
+        );
+    }
+
+    #[test]
+    fn a_hook_payload_supplies_the_whole_report() {
+        let payload = payload(
+            "{\"hook_event_name\": \"Notification\", \"message\": \"Claude needs permission\", \
+              \"session_id\": \"0f3a\", \"transcript_path\": \"/tmp/0f3a.jsonl\"}",
+        );
+        let parsed = resolve(
+            parse_options(&args(&["--hook"])).expect("parses"),
+            Some("a1b2c3"),
+            Some(&payload),
+        )
+        .expect("resolves")
+        .expect("a report");
+        assert_eq!(parsed.state, SessionStatus::Attention);
+        assert_eq!(parsed.message.as_deref(), Some("Claude needs permission"));
+        assert_eq!(parsed.agent_session.as_deref(), Some("0f3a"));
+        assert_eq!(parsed.transcript.as_deref(), Some("/tmp/0f3a.jsonl"));
+    }
+
+    /// Someone who spelled a flag out in their own hook configuration meant
+    /// it; the payload fills gaps, it does not overrule.
+    #[test]
+    fn an_explicit_flag_beats_the_payload() {
+        let payload = payload(
+            "{\"hook_event_name\": \"Notification\", \"message\": \"from the payload\", \
+              \"session_id\": \"0f3a\"}",
+        );
+        let parsed = resolve(
+            parse_options(&args(&[
+                "--hook",
+                "--state",
+                "working",
+                "--message",
+                "mine",
+                "--agent-session",
+                "ddee",
+            ]))
+            .expect("parses"),
+            Some("a1b2c3"),
+            Some(&payload),
+        )
+        .expect("resolves")
+        .expect("a report");
+        assert_eq!(parsed.state, SessionStatus::Working);
+        assert_eq!(parsed.message.as_deref(), Some("mine"));
+        assert_eq!(parsed.agent_session.as_deref(), Some("ddee"));
+    }
+
+    /// A newer Claude Code will send events this Grove has never heard of.
+    /// Saying nothing is success: a hook must not fail inside an agent.
+    #[test]
+    fn a_hook_event_with_no_meaning_reports_nothing() {
+        let payload = payload("{\"hook_event_name\": \"SomethingNew\", \"session_id\": \"0f3a\"}");
+        let resolved = resolve(
+            parse_options(&args(&["--hook"])).expect("parses"),
+            Some("a1b2c3"),
+            Some(&payload),
+        )
+        .expect("resolves");
+        assert_eq!(resolved, None);
+    }
+
+    /// Claude Code started in a plain terminal has no Grove session to report
+    /// about. That is not an error either — there is simply no row.
+    #[test]
+    fn a_hook_outside_a_grove_session_reports_nothing() {
+        let payload = payload("{\"hook_event_name\": \"Stop\"}");
+        let resolved = resolve(
+            parse_options(&args(&["--hook"])).expect("parses"),
+            None,
+            Some(&payload),
+        )
+        .expect("resolves");
+        assert_eq!(resolved, None);
+    }
+
+    /// Without `--hook` the same silences are usage errors: a hand-run notify
+    /// that says nothing, or names nothing, is a mistake rather than a no-op.
+    #[test]
+    fn a_state_and_a_session_are_still_required_without_a_hook() {
+        assert_eq!(
+            resolve(Options::default(), Some("a1b2c3"), None),
+            Err(ArgsError::MissingState)
+        );
+        assert_eq!(
+            resolve(
+                Options {
+                    state: Some(SessionStatus::Idle),
+                    ..Options::default()
+                },
+                None,
+                None
+            ),
+            Err(ArgsError::MissingSession)
+        );
+    }
+
+    #[test]
+    fn a_window_must_be_a_window_index() {
+        assert_eq!(
+            parse_options(&args(&["--window", "two"])),
+            Err(ArgsError::BadWindow("two".into()))
+        );
+        assert_eq!(
+            parse_options(&args(&["--window=-1"])),
+            Err(ArgsError::BadWindow("-1".into()))
+        );
+        assert_eq!(
+            parse_options(&args(&["--window=0"])).expect("valid").window,
+            Some(0)
         );
     }
 

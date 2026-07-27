@@ -172,6 +172,159 @@ fn help_is_available_and_sends_nothing() {
     );
 }
 
+/// Run `grove notify --hook` with a payload on stdin, as Claude Code does.
+fn hook(runtime: &Path, session: Option<&str>, payload: &str) -> Output {
+    use std::io::Write;
+    let mut command = Command::new(GROVE);
+    command
+        .args(["notify", "--hook"])
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_CONFIG_HOME", runtime.join("config"))
+        .env("XDG_STATE_HOME", runtime.join("state"))
+        .env_remove("GROVE_SESSION")
+        .env_remove("TMUX_PANE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(session) = session {
+        command.env("GROVE_SESSION", session);
+    }
+    let mut child = command.spawn().expect("runs the grove binary");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(payload.as_bytes())
+        .expect("writes the payload");
+    child.wait_with_output().expect("waits")
+}
+
+fn listen(socket: &Path) -> std::thread::JoinHandle<String> {
+    let listener = UnixListener::bind(socket).expect("bind");
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).expect("read");
+        line
+    })
+}
+
+/// The whole Claude Code path in one go: the event on stdin becomes a report
+/// on the socket, with the message, the conversation id and the transcript
+/// that only the payload knew.
+#[test]
+fn a_claude_code_hook_payload_becomes_a_notification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runtime = runtime_dir(dir.path());
+    let reader = listen(&ipc::socket_path(&runtime.join("grove")));
+
+    let output = hook(
+        &runtime,
+        Some("a1b2c3"),
+        r#"{"hook_event_name": "Notification",
+            "message": "Claude needs your permission to run cargo test",
+            "session_id": "0f3a-91bc",
+            "transcript_path": "/home/u/.claude/projects/x/0f3a.jsonl",
+            "cwd": "/home/u/wt/auth"}"#,
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let notification = Notification::decode(&reader.join().expect("reader")).expect("valid");
+    assert_eq!(notification.worktree_id, "a1b2c3");
+    assert_eq!(notification.state, SessionStatus::Attention);
+    assert_eq!(
+        notification.message.as_deref(),
+        Some("Claude needs your permission to run cargo test")
+    );
+    assert_eq!(notification.agent_session.as_deref(), Some("0f3a-91bc"));
+    assert_eq!(
+        notification.transcript.as_deref(),
+        Some(Path::new("/home/u/.claude/projects/x/0f3a.jsonl"))
+    );
+}
+
+/// A hook runs inside someone's agent. Every way of having nothing to say —
+/// an event this Grove has never heard of, a payload that is not JSON, a
+/// session that is not Grove's — exits 0 and stays quiet.
+#[test]
+fn a_hook_never_fails_the_agent_it_runs_inside() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runtime = runtime_dir(dir.path());
+
+    for (session, payload) in [
+        (
+            Some("a1b2c3"),
+            r#"{"hook_event_name": "SomethingNewIn2027"}"#,
+        ),
+        (Some("a1b2c3"), "not json at all"),
+        (Some("a1b2c3"), ""),
+        // Claude Code started outside Grove: no session to report about.
+        (None, r#"{"hook_event_name": "Stop"}"#),
+    ] {
+        let output = hook(&runtime, session, payload);
+        assert!(
+            output.status.success(),
+            "{payload:?} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{payload:?} was not quiet: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// `grove hooks` writes Claude Code's settings, and reads back what it wrote.
+#[test]
+fn the_hooks_command_installs_and_removes_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let claude = dir.path().join("claude");
+    std::fs::create_dir_all(&claude).expect("mkdir");
+    let settings = claude.join("settings.json");
+    std::fs::write(&settings, "{\"model\": \"opus\"}\n").expect("write");
+
+    let hooks = |args: &[&str]| {
+        Command::new(GROVE)
+            .arg("hooks")
+            .args(args)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .output()
+            .expect("runs")
+    };
+
+    let status = hooks(&["status"]);
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("not installed"));
+
+    assert!(hooks(&["install"]).status.success());
+    let written = std::fs::read_to_string(&settings).expect("readable");
+    assert!(written.contains("grove notify --hook"));
+    assert!(written.contains("\"model\""), "the user's keys survive");
+    assert!(
+        String::from_utf8_lossy(&hooks(&["status"]).stdout).contains("installed on"),
+        "an install must be visible to the next status"
+    );
+
+    assert!(hooks(&["uninstall"]).status.success());
+    let after = std::fs::read_to_string(&settings).expect("readable");
+    assert!(!after.contains("grove notify"));
+    assert!(after.contains("\"model\""));
+
+    // And the file was copied aside before each rewrite.
+    let backups = std::fs::read_dir(&claude)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".bak"))
+        .count();
+    assert!(backups >= 1, "no backup was taken");
+}
+
 #[test]
 fn an_agents_control_characters_never_reach_the_socket() {
     let dir = tempfile::tempdir().expect("tempdir");

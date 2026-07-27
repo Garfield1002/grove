@@ -12,17 +12,25 @@
 //! The wire format is one newline-terminated line per message:
 //!
 //! ```text
-//! grove1<SEP>notify<SEP><worktree-id><SEP><state><SEP><message>
+//! grove1<SEP>notify<SEP><worktree-id><SEP><state><SEP><message><SEP><window><SEP><agent><SEP><transcript>
 //! grove1<SEP>toggle<SEP><slot>
 //! ```
 //!
 //! `<SEP>` is `\u{1}`, which cannot appear in a worktree id and is stripped
 //! from messages. The leading version tag lets a future format change be
 //! rejected cleanly by an older binary instead of being misread.
+//!
+//! Everything after the state is optional and *additive*: the three trailing
+//! fields were added after `grove1` shipped, so a line written by an older
+//! `grove notify` simply stops early and decodes with them unset, and a line
+//! written by a newer one is read up to whatever the reader understands. That
+//! is why they are appended rather than inserted, and why an unusable value in
+//! one of them is dropped rather than failing the whole report: none of them
+//! is load-bearing for the status itself.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -46,6 +54,20 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// summary line, short enough that a hostile writer cannot make the GUI
 /// allocate without bound.
 pub const MAX_MESSAGE_LEN: usize = 200;
+
+/// The maximum length of an agent's own session id, in characters. Agents mint
+/// these; Grove only stores one and hands it back to the agent's own command,
+/// so the cap is generous but finite.
+pub const MAX_AGENT_SESSION_LEN: usize = 128;
+
+/// The maximum length of a transcript path, in bytes. Longer than any path
+/// Linux will accept, so a real one is never truncated.
+pub const MAX_PATH_LEN: usize = 4096;
+
+/// The most a single line on the socket may be. Every field is capped above,
+/// so a longer line is not a report Grove could use — it is a writer that
+/// should not be able to make the GUI allocate for it.
+const MAX_LINE_LEN: u64 = 8 * 1024;
 
 /// One message on the socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +119,9 @@ impl Command {
                     worktree_id: id.to_string(),
                     state,
                     message,
+                    window: fields.next().and_then(parse_window),
+                    agent_session: fields.next().and_then(sanitize_agent_session),
+                    transcript: fields.next().and_then(sanitize_transcript),
                 }))
             }
             KIND_TOGGLE => {
@@ -123,6 +148,18 @@ pub struct Notification {
     pub state: SessionStatus,
     /// Optional one-line human summary, e.g. "needs permission to run tests".
     pub message: Option<String>,
+    /// The tmux window the report came from, when the reporter could say which
+    /// (`$TMUX_PANE` resolved against the server). It says *which* row of a
+    /// worktree wants the user — the agent's window rather than the shell
+    /// beside it — and nothing else: the status itself is still the session's.
+    pub window: Option<u32>,
+    /// The agent's own session id, as the agent names it. Grove stores the
+    /// last one per worktree so it can offer to resume that conversation; it
+    /// never parses or interprets it.
+    pub agent_session: Option<String>,
+    /// Where the agent keeps this session's transcript. An index entry Grove
+    /// hands to the desktop on request — never read, never parsed.
+    pub transcript: Option<PathBuf>,
 }
 
 impl Notification {
@@ -131,6 +168,9 @@ impl Notification {
             worktree_id: worktree_id.into(),
             state,
             message: None,
+            window: None,
+            agent_session: None,
+            transcript: None,
         }
     }
 
@@ -141,11 +181,41 @@ impl Notification {
         self
     }
 
+    pub fn with_window(mut self, window: Option<u32>) -> Self {
+        self.window = window;
+        self
+    }
+
+    pub fn with_agent_session(mut self, id: Option<String>) -> Self {
+        self.agent_session = id.as_deref().and_then(sanitize_agent_session);
+        self
+    }
+
+    pub fn with_transcript(mut self, path: Option<String>) -> Self {
+        self.transcript = path.as_deref().and_then(sanitize_transcript);
+        self
+    }
+
+    /// Does this report carry anything worth remembering across restarts?
+    pub fn has_agent_record(&self) -> bool {
+        self.agent_session.is_some() || self.transcript.is_some()
+    }
+
     /// Render the wire line, without its trailing newline.
     pub fn encode(&self) -> String {
         let message = self.message.as_deref().unwrap_or("");
+        let window = self.window.map(|w| w.to_string()).unwrap_or_default();
+        let agent = self.agent_session.as_deref().unwrap_or("");
+        // Lossy: a path that is not UTF-8 cannot cross this line-oriented
+        // protocol. It is an index entry for a menu item, so dropping the
+        // record is better than corrupting the rest of the report.
+        let transcript = self
+            .transcript
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         format!(
-            "{VERSION}{SEP}{KIND_NOTIFY}{SEP}{}{SEP}{}{SEP}{message}",
+            "{VERSION}{SEP}{KIND_NOTIFY}{SEP}{}{SEP}{}{SEP}{message}{SEP}{window}{SEP}{agent}{SEP}{transcript}",
             self.worktree_id,
             self.state.label(),
         )
@@ -171,6 +241,44 @@ fn sanitize_message(message: &str) -> String {
         .take(MAX_MESSAGE_LEN)
         .collect();
     cleaned.trim().to_string()
+}
+
+/// Parse the window field. A value that is not a window index is dropped
+/// rather than rejected: it is a hint about *which row* to mark, and losing it
+/// must never cost the status report it travels with.
+fn parse_window(raw: &str) -> Option<u32> {
+    raw.trim().parse().ok()
+}
+
+/// Accept an agent's session id, or nothing.
+///
+/// Conservative on purpose: this string is stored in `state.toml` and later
+/// substituted into the user's own agent command, so it is restricted to the
+/// characters an id is actually made of. Anything else — a space, a quote, a
+/// shell metacharacter — means this is not an id and it is dropped.
+fn sanitize_agent_session(raw: &str) -> Option<String> {
+    let id = raw.trim();
+    if id.is_empty() || id.chars().count() > MAX_AGENT_SESSION_LEN {
+        return None;
+    }
+    // Alphanumeric first: an id that begins with a dash would be read as an
+    // option by the very command it is substituted into.
+    if !id.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        .then(|| id.to_string())
+}
+
+/// Accept a transcript path, or nothing.
+///
+/// Absolute only: Grove hands this to the desktop opener from its own working
+/// directory, where a relative path would name something else entirely.
+fn sanitize_transcript(raw: &str) -> Option<PathBuf> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let path = Path::new(cleaned.trim());
+    (path.is_absolute() && cleaned.len() <= MAX_PATH_LEN).then(|| path.to_path_buf())
 }
 
 /// Why a line could not be understood.
@@ -270,12 +378,13 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
 
 /// Read one command from an accepted connection.
 ///
-/// Only the first line is read: each `grove notify` or `grove toggle` process
-/// sends one and closes, and reading further would let a stuck writer hold the
-/// listener.
+/// Only the first line is read, and only [`MAX_LINE_LEN`] bytes of it: each
+/// `grove notify` or `grove toggle` process sends one short line and closes,
+/// so reading further would only let a stuck or hostile writer hold the
+/// listener and grow its buffer.
 pub fn read_command(stream: UnixStream) -> std::result::Result<Command, ProtocolError> {
     let mut line = String::new();
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.take(MAX_LINE_LEN));
     // A read error and an empty line are the same thing here: nothing usable
     // arrived. The listener logs and moves on either way.
     match reader.read_line(&mut line) {
@@ -294,6 +403,132 @@ mod tests {
             .with_message(Some("needs permission".into()));
         let decoded = Notification::decode(&notification.encode()).expect("valid");
         assert_eq!(decoded, notification);
+    }
+
+    #[test]
+    fn round_trips_the_window_and_the_agent_record() {
+        let notification = Notification::new("a1b2c3", SessionStatus::Attention)
+            .with_message(Some("needs permission".into()))
+            .with_window(Some(2))
+            .with_agent_session(Some("0f3a-91bc".into()))
+            .with_transcript(Some("/home/u/.claude/projects/x/0f3a.jsonl".into()));
+        let decoded = Notification::decode(&notification.encode()).expect("valid");
+        assert_eq!(decoded, notification);
+        assert_eq!(decoded.window, Some(2));
+        assert_eq!(decoded.agent_session.as_deref(), Some("0f3a-91bc"));
+        assert_eq!(
+            decoded.transcript.as_deref(),
+            Some(Path::new("/home/u/.claude/projects/x/0f3a.jsonl"))
+        );
+    }
+
+    /// The trailing fields are additive: a line from a `grove notify` that
+    /// predates them is still a complete report.
+    #[test]
+    fn a_line_without_the_trailing_fields_still_decodes() {
+        let old = "grove1\u{1}notify\u{1}a1b2c3\u{1}attention\u{1}needs permission";
+        let decoded = Notification::decode(old).expect("valid");
+        assert_eq!(decoded.message.as_deref(), Some("needs permission"));
+        assert_eq!(decoded.window, None);
+        assert_eq!(decoded.agent_session, None);
+        assert_eq!(decoded.transcript, None);
+        assert!(!decoded.has_agent_record());
+    }
+
+    /// And a reader that does not understand a future field must still read
+    /// the ones it does.
+    #[test]
+    fn a_line_with_more_fields_than_expected_still_decodes() {
+        let newer = "grove1\u{1}notify\u{1}a1b2c3\u{1}working\u{1}building\u{1}3\u{1}sid\u{1}/tmp/t.jsonl\u{1}something-later";
+        let decoded = Notification::decode(newer).expect("valid");
+        assert_eq!(decoded.state, SessionStatus::Working);
+        assert_eq!(decoded.window, Some(3));
+        assert_eq!(decoded.agent_session.as_deref(), Some("sid"));
+    }
+
+    /// A hint that cannot be used is dropped; the status it travelled with is
+    /// not. Nothing here is worth failing a report over.
+    #[test]
+    fn unusable_trailing_fields_are_dropped_not_fatal() {
+        let line = "grove1\u{1}notify\u{1}a1b2c3\u{1}attention\u{1}hi\u{1}not-a-window\u{1}id with spaces\u{1}relative/path.jsonl";
+        let decoded = Notification::decode(line).expect("the report survives");
+        assert_eq!(decoded.state, SessionStatus::Attention);
+        assert_eq!(decoded.message.as_deref(), Some("hi"));
+        assert_eq!(decoded.window, None, "a window index or nothing");
+        assert_eq!(decoded.agent_session, None, "an id or nothing");
+        assert_eq!(decoded.transcript, None, "an absolute path or nothing");
+    }
+
+    /// The id is substituted into the user's own agent command later, so
+    /// anything a shell would notice is refused here, at the boundary.
+    #[test]
+    fn an_agent_session_id_is_restricted_to_id_characters() {
+        for good in ["abc123", "0f3a-91bc-4d", "a.b_c:d", "A1"] {
+            assert_eq!(
+                Notification::new("a1b2c3", SessionStatus::Idle)
+                    .with_agent_session(Some(good.into()))
+                    .agent_session
+                    .as_deref(),
+                Some(good)
+            );
+        }
+        for bad in [
+            "id with spaces",
+            "$(rm -rf /)",
+            "a;b",
+            "--flag",
+            "a/b",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                Notification::new("a1b2c3", SessionStatus::Idle)
+                    .with_agent_session(Some(bad.into()))
+                    .agent_session,
+                None,
+                "{bad} is not an id"
+            );
+        }
+        let long = "a".repeat(MAX_AGENT_SESSION_LEN + 1);
+        assert_eq!(
+            Notification::new("a1b2c3", SessionStatus::Idle)
+                .with_agent_session(Some(long))
+                .agent_session,
+            None
+        );
+    }
+
+    /// Grove opens this path from its own working directory, so a relative one
+    /// would name a different file than the agent meant.
+    #[test]
+    fn a_transcript_path_must_be_absolute() {
+        let absolute = Notification::new("a1b2c3", SessionStatus::Idle)
+            .with_transcript(Some("/home/u/.claude/t.jsonl".into()));
+        assert_eq!(
+            absolute.transcript.as_deref(),
+            Some(Path::new("/home/u/.claude/t.jsonl"))
+        );
+        for bad in ["t.jsonl", "../t.jsonl", "~/t.jsonl", ""] {
+            assert_eq!(
+                Notification::new("a1b2c3", SessionStatus::Idle)
+                    .with_transcript(Some(bad.into()))
+                    .transcript,
+                None,
+                "{bad} is not an absolute path"
+            );
+        }
+    }
+
+    /// A path with a separator in it must not become extra fields.
+    #[test]
+    fn a_transcript_cannot_smuggle_a_field_separator() {
+        let notification = Notification::new("a1b2c3", SessionStatus::Idle)
+            .with_transcript(Some("/tmp/a\u{1}b\nc.jsonl".into()));
+        assert_eq!(
+            notification.transcript.as_deref(),
+            Some(Path::new("/tmp/abc.jsonl"))
+        );
+        assert_eq!(notification.encode().matches(SEP).count(), 7);
     }
 
     #[test]
@@ -403,9 +638,10 @@ mod tests {
             notification.message.as_deref(),
             Some("badfieldbellnewline[31m")
         );
-        // And the encoded line therefore stays a single well-formed record.
+        // And the encoded line therefore stays a single well-formed record:
+        // one separator before each field after the version tag.
         let encoded = notification.encode();
-        assert_eq!(encoded.matches(SEP).count(), 4);
+        assert_eq!(encoded.matches(SEP).count(), 7);
         assert!(!encoded.contains('\n'));
         assert_eq!(Notification::decode(&encoded).expect("valid"), notification);
     }

@@ -3,6 +3,7 @@
 //! `grove` launches the GUI; `grove notify` reports an agent's status to it.
 
 mod app;
+mod hooks;
 mod notify;
 mod status_watch;
 mod toggle;
@@ -19,6 +20,8 @@ Usage:
   grove toggle     start or close Grove, or open a numbered worktree
                    (see `grove toggle --help`)
   grove notify     report a session's status (see `grove notify --help`)
+  grove hooks      install Grove's hooks into Claude Code's settings
+                   (see `grove hooks --help`)
   grove --help     show this message
   grove --version  show the version
 ";
@@ -32,6 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {}
         Some("notify") => {
             notify::run(&args[1..])?;
+            return Ok(());
+        }
+        Some("hooks") => {
+            hooks::run(&args[1..])?;
             return Ok(());
         }
         // Falls through to the GUI when nothing was listening: starting Grove

@@ -14,8 +14,9 @@ use crate::error::{Error, Result};
 use crate::git::{self, StatusSummary, WorktreeAdd};
 use crate::ids;
 use crate::model::{
-    Project, SessionPresence, Worktree, default_worktree_parent, worktrees_from_entries,
+    Project, SessionPresence, WindowNote, Worktree, default_worktree_parent, worktrees_from_entries,
 };
+use crate::notice::Notices;
 use crate::removal::{RemovalInputs, Unpushed};
 use crate::status::{SessionReport, SessionSignals};
 use crate::terminal::{self, TemplateVars};
@@ -216,6 +217,67 @@ pub fn apply_session_windows(
     }
 }
 
+/// Stamp what each window reported about itself onto a worktree list.
+///
+/// Notes are dropped for a worktree whose session is gone, exactly as statuses
+/// are: a sentence explaining what an agent was waiting for is not something to
+/// keep showing beside a session that no longer exists. Notes naming a window
+/// tmux no longer lists go too, so a closed window cannot leave the rest of the
+/// tree looking like it reports per window when nothing does any more.
+pub fn apply_window_notes(worktrees: &mut [Worktree], notices: &Notices) {
+    for worktree in worktrees {
+        if !worktree.session.exists() {
+            worktree.window_notes.clear();
+            continue;
+        }
+        let known: Vec<u32> = worktree.windows.iter().map(|window| window.index).collect();
+        worktree.window_notes = notices
+            .windows(&worktree.id)
+            // Before the first poll a worktree has no window list at all; that
+            // is "not known yet", not "no windows", so nothing is filtered.
+            .filter(|(index, _)| known.is_empty() || known.contains(index))
+            .map(|(index, notice)| WindowNote {
+                index,
+                status: notice.state,
+                message: notice.message.clone(),
+            })
+            .collect();
+    }
+}
+
+/// Which agent command to start in a worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStart<'a> {
+    /// The configured `[agents] command`: a new conversation.
+    Fresh,
+    /// The configured `[agents] resume_command`, carrying the conversation id
+    /// the agent last reported through `grove notify`.
+    Resume(&'a str),
+}
+
+impl<'a> AgentStart<'a> {
+    /// The template this start uses, and the id to substitute into it.
+    ///
+    /// Resuming is refused rather than quietly downgraded to a fresh start:
+    /// the user asked to continue a conversation, and silently beginning a new
+    /// one would look identical and lose their place.
+    fn template<'c>(self, config: &'c Config, project_name: &str) -> Result<(&'c str, &'a str)> {
+        match self {
+            AgentStart::Fresh => config
+                .agents
+                .command_for(project_name)
+                .map(|template| (template, ""))
+                .ok_or(Error::NoAgentCommand),
+            AgentStart::Resume("") => Err(Error::NoAgentSession),
+            AgentStart::Resume(id) => config
+                .agents
+                .resume_command()
+                .map(|template| (template, id))
+                .ok_or(Error::NoResumeCommand),
+        }
+    }
+}
+
 /// Start the configured agent in a worktree's session (DESIGN.md §7).
 ///
 /// The session is ensured first: starting an agent is also a reasonable way to
@@ -231,10 +293,9 @@ pub fn start_agent(
     project_name: &str,
     git_common_dir: &Path,
     worktree: &Worktree,
+    start: AgentStart,
 ) -> Result<agent::AgentLaunch> {
-    let Some(template) = config.agents.command_for(project_name) else {
-        return Err(Error::NoAgentCommand);
-    };
+    let (template, agent_session) = start.template(config, project_name)?;
     if !worktree.path.is_dir() {
         return Err(Error::WorktreeMissing(worktree.path.clone()));
     }
@@ -247,7 +308,8 @@ pub fn start_agent(
         &worktree.path,
         project_name,
         worktree.branch.as_deref().unwrap_or_default(),
-    );
+    )
+    .with_agent_session(agent_session);
     let launch = agent::launch(
         template,
         &vars,
@@ -657,6 +719,121 @@ mod tests {
         assert!(
             worktrees[0].windows.is_empty(),
             "stale rows would offer windows that are not there"
+        );
+    }
+
+    /// Resuming asks for a specific conversation. Every way of not having one
+    /// is refused, because the alternative — starting a fresh conversation
+    /// under the same menu entry — looks identical and loses the user's place.
+    #[test]
+    fn resuming_is_refused_rather_than_downgraded() {
+        let mut config = Config::default();
+        config.agents.command = "claude".into();
+
+        assert!(matches!(
+            AgentStart::Resume("0f3a").template(&config, "acme-web"),
+            Err(Error::NoResumeCommand)
+        ));
+
+        config.agents.resume_command = "claude --resume {agent_session}".into();
+        assert!(matches!(
+            AgentStart::Resume("").template(&config, "acme-web"),
+            Err(Error::NoAgentSession)
+        ));
+        assert_eq!(
+            AgentStart::Resume("0f3a")
+                .template(&config, "acme-web")
+                .expect("configured"),
+            ("claude --resume {agent_session}", "0f3a")
+        );
+    }
+
+    /// The two commands are independent: one configured is not the other.
+    #[test]
+    fn a_fresh_start_never_uses_the_resume_command() {
+        let mut config = Config::default();
+        config.agents.resume_command = "claude --resume {agent_session}".into();
+        assert!(matches!(
+            AgentStart::Fresh.template(&config, "acme-web"),
+            Err(Error::NoAgentCommand)
+        ));
+
+        config.agents.command = "claude".into();
+        assert_eq!(
+            AgentStart::Fresh
+                .template(&config, "acme-web")
+                .expect("configured"),
+            ("claude", ""),
+            "a fresh start carries no conversation id"
+        );
+    }
+
+    fn window_report(id: &str, index: u32, message: &str) -> crate::ipc::Notification {
+        crate::ipc::Notification::new(id, SessionStatus::Attention)
+            .with_message(Some(message.to_string()))
+            .with_window(Some(index))
+    }
+
+    #[test]
+    fn window_notes_land_on_the_worktree_that_reported_them() {
+        let mut worktrees = vec![worktree("/home/u/proj"), worktree("/home/u/wt/feature")];
+        worktrees[0].session = SessionPresence::Detached;
+        worktrees[1].session = SessionPresence::Detached;
+        let mut notices = Notices::default();
+        notices.record(&window_report(&worktrees[0].id, 1, "needs permission"));
+
+        apply_window_notes(&mut worktrees, &notices);
+        assert_eq!(
+            worktrees[0]
+                .window_note(1)
+                .and_then(|n| n.message.as_deref()),
+            Some("needs permission")
+        );
+        assert_eq!(worktrees[0].window_note(0), None, "window 0 said nothing");
+        assert!(
+            !worktrees[1].reports_per_window(),
+            "another worktree's report is not this one's"
+        );
+    }
+
+    /// A message explains a state; with the session gone there is no state
+    /// left for it to explain.
+    #[test]
+    fn notes_are_dropped_with_the_session() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        worktrees[0].session = SessionPresence::Detached;
+        let mut notices = Notices::default();
+        notices.record(&window_report(&worktrees[0].id, 1, "needs permission"));
+        apply_window_notes(&mut worktrees, &notices);
+        assert!(worktrees[0].reports_per_window());
+
+        worktrees[0].session = SessionPresence::None;
+        apply_window_notes(&mut worktrees, &notices);
+        assert!(!worktrees[0].reports_per_window());
+    }
+
+    #[test]
+    fn a_note_for_a_window_tmux_no_longer_lists_is_dropped() {
+        let mut worktrees = vec![worktree("/home/u/proj")];
+        worktrees[0].session = SessionPresence::Detached;
+        let session = worktrees[0].session_name();
+        let mut notices = Notices::default();
+        notices.record(&window_report(&worktrees[0].id, 1, "needs permission"));
+
+        // Before the first poll there is no window list to check against, so
+        // the note stands.
+        apply_window_notes(&mut worktrees, &notices);
+        assert!(worktrees[0].reports_per_window());
+
+        // Once tmux has listed the windows, one that is not among them is gone.
+        apply_session_windows(
+            &mut worktrees,
+            &group_windows(vec![window(&session, 0, "shell")]),
+        );
+        apply_window_notes(&mut worktrees, &notices);
+        assert!(
+            !worktrees[0].reports_per_window(),
+            "the window that reported has been closed"
         );
     }
 

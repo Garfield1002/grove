@@ -13,15 +13,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use grove_core::claude::{self, HookChange};
 use grove_core::config::{Config, LoadedConfig};
 use grove_core::config_write::{self, Edit};
 use grove_core::git::{RefEntry, StatusSummary, WorktreeAdd};
+use grove_core::ipc::Notification;
 use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::process::Invocation;
 use grove_core::reconcile::{self, ProjectRef, Reconciliation};
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
-use grove_core::status::{SessionReport, SessionStatus};
+use grove_core::status::SessionReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{self, Activation, NewWindow};
 use grove_core::{Error, Paths, TmuxServer, config, git, state, terminal, tmux};
@@ -109,12 +111,18 @@ pub enum Task {
         git_common_dir: PathBuf,
         worktree: Box<Worktree>,
     },
-    /// Start the configured agent in a worktree's `agent` window.
+    /// Start the configured agent in a worktree's `agent` window, either as a
+    /// new conversation or resuming the one the agent last reported.
     StartAgent {
         project_name: String,
         git_common_dir: PathBuf,
         worktree: Box<Worktree>,
+        /// The conversation to resume, when the user asked to resume one.
+        resume: Option<String>,
     },
+    /// Install or remove Grove's hooks in Claude Code's `settings.json`, or
+    /// just look at what is there. File work, so never the UI thread.
+    ClaudeHooks(HookOp),
     /// Local and remote-tracking branches for the create-worktree dialog.
     LoadBaseRefs {
         project_id: String,
@@ -176,6 +184,15 @@ pub enum Task {
         target: PickTarget,
         start: Option<PathBuf>,
     },
+}
+
+/// What to do about Grove's hooks in Claude Code's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookOp {
+    /// Read the file and report what is installed. Writes nothing.
+    Check,
+    Install,
+    Uninstall,
 }
 
 /// Which path field a picked directory belongs to.
@@ -283,10 +300,12 @@ pub enum Message {
         slot: Option<u8>,
     },
     /// An explicit `grove notify` report arrived over the socket.
-    Notified {
-        worktree_id: String,
-        state: SessionStatus,
-        message: Option<String>,
+    Notified(Box<Notification>),
+    /// Claude Code's hook configuration, after a check, an install or a
+    /// removal.
+    ClaudeHooks {
+        op: HookOp,
+        change: Box<HookChange>,
     },
     Activated {
         worktree_id: String,
@@ -350,6 +369,20 @@ pub enum Message {
         path: PathBuf,
     },
     Failed(ErrorReport),
+}
+
+/// Read or rewrite Claude Code's hook configuration.
+///
+/// The settings file is the user's, exactly as `config.toml` is: a copy is
+/// taken before it is replaced, their own hooks survive, and a file Grove
+/// cannot parse is reported rather than overwritten.
+fn claude_hooks(op: HookOp) -> Result<HookChange, Error> {
+    let path = claude::settings_path_from_env()?;
+    match op {
+        HookOp::Check => claude::hook_status(&path),
+        HookOp::Install => claude::install_hooks(&path),
+        HookOp::Uninstall => claude::uninstall_hooks(&path),
+    }
 }
 
 /// Handle used by the UI to queue work.
@@ -538,8 +571,13 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             project_name,
             git_common_dir,
             worktree,
+            resume,
         } => {
             let worktree_id = worktree.id.clone();
+            let start = match &resume {
+                Some(id) => workflow::AgentStart::Resume(id),
+                None => workflow::AgentStart::Fresh,
+            };
             match workflow::start_agent(
                 &worker.server,
                 &worker.config,
@@ -547,6 +585,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 &project_name,
                 &git_common_dir,
                 &worktree,
+                start,
             ) {
                 Ok(launch) => {
                     // The new window is activity tmux reports at once; a poll
@@ -563,6 +602,17 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 ))],
             }
         }
+
+        Task::ClaudeHooks(op) => match claude_hooks(op) {
+            Ok(change) => vec![Message::ClaudeHooks {
+                op,
+                change: Box::new(change),
+            }],
+            Err(e) => vec![Message::Failed(ErrorReport::new(
+                "could not read Claude Code's settings.json",
+                &e,
+            ))],
+        },
 
         Task::ClearAttention { session } => {
             match tmux::session::clear_attention(&worker.server, &session) {

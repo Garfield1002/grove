@@ -16,10 +16,11 @@ This document records the *resolved* architecture. The full product design
 | GUI framework | **egui/eframe** (glow backend) | Immediate mode fits a small list UI; native Wayland. **Hard budget: ≤ 100 MB RSS.** If egui cannot stay under it, fall back to GPUI. |
 | Persistence | **TOML only**, split into `config.toml` + `state.toml` | Config is hand-editable and never rewritten by the app; state is app-owned and written atomically (temp file + rename). No SQLite. |
 | Concurrency | **OS threads + channels** (`std::thread`, `std::process::Command`, mpsc back to UI) | No async runtime. Subprocess work is short-lived and blocking-friendly. UI wakes via `egui::Context::request_repaint`. |
-| Status detection | **Fixed-interval poller** | Background thread polls tmux every ~2 s and git status every ~10 s per visible project, diffs against cache, sends deltas to the UI. tmux hooks are a possible v2 upgrade. |
+| Status detection | **Interval poller, paced by what is on screen** | Background thread polls tmux every ~2 s and git status every ~10 s per visible project, diffs against cache, sends deltas to the UI. While the UI paints nothing (minimised, another workspace, fully occluded) the tmux poll drops to ~30 s and the git poll stops entirely; the first frame after that gap polls immediately. See §6. tmux hooks are a possible v2 upgrade. |
 | Worktree IDs | **Deterministic hash** | First 6 hex chars of a hash over `(git-common-dir, canonical worktree path)`. Session name = `wt-<id>`. Losing `state.toml` is recoverable: restore re-derives identical IDs and reattaches to live tmux sessions. |
 | Terminal default | **Auto-detect on first run** | Probe PATH in order (`ptyxis`, `foot`, `alacritty`, `kitty`, `gnome-terminal`); write the winning template into `config.toml` so it is visible and editable. |
 | Agent attention | **`grove notify` CLI + IPC** | The `grove` binary doubles as a CLI. Agent wrappers (e.g. Claude Code hooks) call `grove notify --session <id> --state attention`; the GUI receives it over a local IPC socket. Architected from v1, fully wired in Milestone 4. |
+| Claude Code | **`grove notify --hook` + `grove hooks`** | One command on every hook event reads Claude Code's JSON payload on stdin and reports from it: the state, the message, the window, and the conversation id. `grove hooks install` merges that command into `settings.json`, preserving the user's own hooks. See §6.1. |
 | Resource accounting | **systemd scopes (opt-in setting)** | On systemd machines, agent/user commands launched inside panes are wrapped in `systemd-run --user --scope --collect --unit=grove-<wt-id>-<kind>-<nonce>.scope --`. Each agent gets its own cgroup → per-agent/per-project RAM/CPU read from `/sys/fs/cgroup` (`memory.current`, `cpu.stat`), later `MemoryMax`/kill-by-scope. Auto-detected (systemd user manager present), off otherwise. Plain shells stay unwrapped. Implemented in Milestone 4. |
 | Crate layout | **Workspace: `grove-core` + `grove`** | Core (git, tmux, state, reconcile — no UI deps, fully testable) plus the binary crate (egui UI + CLI subcommands). |
 | Quality bar | **Strict** | Edition 2024, `clippy -D warnings`, rustfmt defaults, no `unwrap()`/`expect()` outside tests, `thiserror` error types, unit tests mandatory for all git/tmux output parsers. |
@@ -32,7 +33,8 @@ This document records the *resolved* architecture. The full product design
 │  egui event loop (main)     │
 │  ├─ worker: git commands    │──▶ git CLI (arg arrays, never shell)
 │  ├─ worker: tmux commands   │──▶ tmux -S $SOCKET … (private server)
-│  ├─ poller thread (2s/10s)  │
+│  ├─ poller thread (2s/10s,  │
+│  │    30s while off screen) │
 │  └─ IPC listener thread     │◀── grove notify (from agent hooks)
 │                             │◀── grove toggle (from a WM shortcut)
 └─────────────────────────────┘
@@ -102,7 +104,10 @@ grove/
 │   │       └── ipc.rs          # notify socket protocol
 │   └── grove/              # bin: GUI + CLI entry points
 │       └── src/
-│           ├── main.rs         # arg parsing: GUI by default, `notify` subcommand
+│           ├── main.rs         # arg parsing: GUI by default, `notify` and
+│           │                   # `hooks` subcommands
+│           ├── notify.rs       # `grove notify`, incl. `--hook` (stdin JSON)
+│           ├── hooks.rs        # `grove hooks`: Claude Code settings.json
 │           ├── app.rs          # eframe::App, channel plumbing
 │           ├── workers.rs      # thread pool, poller, IPC listener
 │           └── ui/
@@ -185,6 +190,55 @@ Three states, evaluated by `grove-core::status` from poller + IPC inputs:
 
 Precedence: attention > working > idle. Attention latches until the user
 opens the session.
+
+**Poll cadence follows the frames, not the focus.** Grove is normally used
+beside the terminal it launched — visible but not focused — so focus is the
+wrong signal for "is anyone looking"; a painted frame is the right one. A
+Wayland surface that is minimised, on another workspace or fully occluded
+stops receiving frame callbacks, so the repaint each poll asks for never
+becomes a frame, and the poller reads that as nobody watching: the tmux poll
+falls to 30 s (enough to keep raising desktop notifications for a bell) and
+git status, which raises nothing, waits for the window to come back. The
+first frame after such a gap asks for an immediate poll, so an unhidden
+Grove is current by the time the user has read it. Where frame callbacks do
+not stop (X11, a window merely behind another), nothing changes and the fast
+cadence stands.
+
+### 6.1 Claude Code
+
+Claude Code is the agent Grove is developed against, and the only one it
+knows by name. The integration is one command — `grove notify --hook` —
+configured on five events (`Notification`, `UserPromptSubmit`, `Stop`,
+`SessionStart`, `SessionEnd`) by `grove hooks install`, which merges it into
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`). That file is the user's:
+their own hooks survive, a copy is taken before it is replaced, one that
+cannot be parsed is reported rather than overwritten, and installing twice
+leaves one entry per event. The Settings pane shows the same status and runs
+the same code.
+
+`--hook` reads the event's JSON object on stdin and takes from it what flags
+would otherwise have to carry:
+
+- **state** — `Notification` is attention (the one signal Grove refuses to
+  infer for itself), a prompt is working, a turn or session ending is idle.
+  An event this Grove has no opinion about reports *nothing at all*: a hook
+  runs inside someone's agent, so an unknown event, an unparseable payload
+  and a Claude Code started outside Grove all exit 0 in silence.
+- **message** — what Claude is waiting for, or the first line of the prompt.
+  Shown as the row's second line and as the first line of its tooltip.
+- **window** — not from the payload but from `$TMUX_PANE`, resolved against
+  the tmux server. A report that names a window marks *that* row; a worktree
+  where no window has ever reported keeps showing the session's status on
+  every window row, exactly as before.
+- **conversation id and transcript path** — recorded in `state.toml` under
+  `[[agent]]`, which is what the row menu's *Resume agent conversation* and
+  *Open agent transcript* act on. An index like every other table there:
+  Grove never reads the transcript, and a record pointing at a conversation
+  the agent has forgotten produces a command that says so, never a deletion.
+  Resuming runs `[agents] resume_command`, which has no default — only the
+  user knows how their agent spells it.
+
+Nothing here parses terminal output or infers state from process names.
 
 There is **no Grove daemon**: the only long-lived processes are the tmux
 server and (when open) the GUI. `grove notify` delivers over the IPC socket

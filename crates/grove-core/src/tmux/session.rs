@@ -409,6 +409,31 @@ pub fn ensure_session(server: &TmuxServer, spec: &SessionSpec) -> Result<(String
     Ok((name, true))
 }
 
+/// The environment variable tmux exports into every pane, naming that pane.
+pub const PANE_ENV_VAR: &str = "TMUX_PANE";
+
+/// Which window a pane belongs to.
+///
+/// This is how `grove notify` learns which row of a worktree is reporting: a
+/// hook runs inside a pane and tmux tells it `$TMUX_PANE`, but not the window
+/// index, so the server is asked. Best-effort by construction — a pane that
+/// has gone, a server that is not there, or a reply that is not a number all
+/// yield `None`, and the report goes out naming the worktree alone.
+///
+/// Runs a subprocess: not the UI thread.
+pub fn window_of_pane(server: &TmuxServer, pane: &str) -> Result<Option<u32>> {
+    let out = server.run_allow_failure(["display-message", "-p", "-t", pane, "#{window_index}"])?;
+    if !out.success {
+        return Ok(None);
+    }
+    Ok(parse_window_index(&out.stdout))
+}
+
+/// Read a window index out of a `display-message` reply.
+fn parse_window_index(reply: &str) -> Option<u32> {
+    reply.lines().next()?.trim().parse().ok()
+}
+
 /// Read a variable from a session's environment.
 pub fn session_env(server: &TmuxServer, name: &str, var: &str) -> Result<Option<String>> {
     let out = server.run_allow_failure(["show-environment", "-t", name, var])?;
@@ -664,6 +689,19 @@ mod tests {
         assert!(!sessions[0].attention);
         assert_eq!(sessions[0].activity_epoch, None);
         assert!(!sessions[0].bell);
+    }
+
+    /// `display-message -p` answers with one line and a newline. Anything
+    /// else means the pane could not be resolved, and a report that names no
+    /// window is better than one that names the wrong one.
+    #[test]
+    fn a_window_index_is_read_from_the_reply_or_not_at_all() {
+        assert_eq!(parse_window_index("2\n"), Some(2));
+        assert_eq!(parse_window_index("0"), Some(0));
+        assert_eq!(parse_window_index(" 11 \n"), Some(11));
+        for reply in ["", "\n", "%3\n", "can't find pane\n", "-1\n"] {
+            assert_eq!(parse_window_index(reply), None, "{reply:?}");
+        }
     }
 
     #[test]

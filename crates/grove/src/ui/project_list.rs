@@ -10,9 +10,10 @@
 
 use egui::{Sense, Ui, vec2};
 use grove_core::model::Project;
-use grove_core::state::SlotRecord;
+use grove_core::state::{AgentRecord, SlotRecord};
 
 use super::{Action, icons, theme, worktree_row};
+use worktree_row::AgentActions;
 
 /// The number a worktree carries, if any.
 ///
@@ -25,17 +26,33 @@ fn slot_of(slots: &[SlotRecord], worktree_id: &str) -> Option<u8> {
         .map(|slot| slot.number)
 }
 
+/// What the tree needs beyond the projects themselves: what is selected, what
+/// is being filtered for, and the two `state.toml` indexes the rows read.
+#[derive(Clone, Copy)]
+pub struct Tree<'a> {
+    pub selected: Option<&'a str>,
+    /// The window row the user last opened, as (worktree id, window index).
+    pub selected_window: Option<(&'a str, u32)>,
+    pub filter: &'a str,
+    pub home: Option<&'a std::path::Path>,
+    pub slots: &'a [SlotRecord],
+    /// The agent conversations Grove has been told about, by worktree.
+    pub agents: &'a [AgentRecord],
+    /// Whether `[agents] resume_command` is configured at all.
+    pub can_resume: bool,
+}
+
 /// Draw every project, applying the filter. Returns the user's action.
-pub fn show(
-    ui: &mut Ui,
-    projects: &[Project],
-    selected: Option<&str>,
-    // The window row the user last opened, as (worktree id, window index).
-    selected_window: Option<(&str, u32)>,
-    filter: &str,
-    home: Option<&std::path::Path>,
-    slots: &[SlotRecord],
-) -> Option<Action> {
+pub fn show(ui: &mut Ui, projects: &[Project], tree: Tree) -> Option<Action> {
+    let Tree {
+        selected,
+        selected_window,
+        filter,
+        home,
+        slots,
+        agents,
+        can_resume,
+    } = tree;
     let mut action = None;
     let needle = filter.trim().to_ascii_lowercase();
 
@@ -46,6 +63,8 @@ pub fn show(
             selected_window,
             home,
             slots,
+            agents,
+            can_resume,
         };
         let matches: Vec<&grove_core::model::Worktree> = project
             .worktrees
@@ -150,6 +169,10 @@ struct Level<'a> {
     selected_window: Option<(&'a str, u32)>,
     home: Option<&'a std::path::Path>,
     slots: &'a [SlotRecord],
+    /// The agent conversations Grove has been told about, by worktree.
+    agents: &'a [AgentRecord],
+    /// Whether `[agents] resume_command` is configured at all.
+    can_resume: bool,
 }
 
 /// One worktree of a project: either a single leaf row, or a dropdown header
@@ -174,13 +197,24 @@ fn worktree_level(
         selected_window,
         home,
         slots,
+        agents,
+        can_resume,
     } = level;
     let is_selected = selected == Some(worktree.id.as_str());
     // The number names the *worktree*, so it goes on whichever row stands for
     // one — the leaf row here, the header below — and never on a window row.
     let slot = slot_of(slots, &worktree.id);
+    let row = worktree_row::Row {
+        worktree,
+        stands,
+        selected: is_selected,
+        home,
+        depth,
+        slot,
+        agent: agent_actions(agents, &worktree.id, can_resume),
+    };
     if !has_window_rows(worktree) {
-        let row_action = worktree_row::show(ui, worktree, is_selected, home, stands, depth, slot)?;
+        let row_action = worktree_row::show(ui, row)?;
         return row_action.into_action(&project.id, &worktree.id);
     }
 
@@ -192,15 +226,7 @@ fn worktree_level(
     let openness = state.openness(ui.ctx());
 
     let mut action = None;
-    if let Some(row_action) = worktree_row::header(
-        ui,
-        worktree,
-        stands,
-        worktree.windows.len(),
-        openness,
-        depth,
-        slot,
-    ) {
+    if let Some(row_action) = worktree_row::header(ui, row, worktree.windows.len(), openness) {
         if row_action == worktree_row::RowAction::Fold {
             state.toggle(ui);
         }
@@ -213,12 +239,13 @@ fn worktree_level(
             let selected = selected_window == Some((worktree.id.as_str(), window.index));
             let Some(row_action) = worktree_row::show(
                 ui,
-                worktree,
-                selected,
-                home,
-                worktree_row::Stands::Window(window),
-                depth + 1,
-                None,
+                worktree_row::Row {
+                    stands: worktree_row::Stands::Window(window),
+                    selected,
+                    depth: depth + 1,
+                    slot: None,
+                    ..row
+                },
             ) else {
                 continue;
             };
@@ -238,6 +265,24 @@ fn worktree_level(
     });
     state.store(ui.ctx());
     body.and_then(|body| body.inner).or(action)
+}
+
+/// What a worktree's rows can offer about the agent conversation reported in
+/// it. A linear scan, like the numbers above: there is one record per worktree
+/// that has ever reported, so the list is short and drawing allocates nothing.
+fn agent_actions<'a>(
+    agents: &'a [AgentRecord],
+    worktree_id: &str,
+    can_resume: bool,
+) -> AgentActions<'a> {
+    let record = agents.iter().find(|a| a.worktree_id == worktree_id);
+    AgentActions {
+        session_id: record
+            .map(|a| a.session_id.as_str())
+            .filter(|id| !id.is_empty()),
+        can_resume,
+        has_transcript: record.is_some_and(AgentRecord::has_transcript),
+    }
 }
 
 /// Does this worktree get a dropdown header with a row per window, or is it a

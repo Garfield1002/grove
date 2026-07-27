@@ -13,11 +13,13 @@
 use std::path::Path;
 
 use grove_core::agent::Accounting;
+use grove_core::claude::HookChange;
 use grove_core::config::Config;
 use grove_core::config_write::{self, Edit};
 use grove_core::{Paths, terminal};
 
 use super::{icons, theme};
+use crate::workers::HookOp;
 
 /// Sample values used for the live command preview. Real socket, illustrative
 /// worktree — the preview is never executed.
@@ -41,6 +43,8 @@ pub enum Action {
     OpenConfigFile,
     /// Pick the default worktree parent with the native directory picker.
     BrowseWorktreeParent,
+    /// Read, write or remove Grove's hooks in Claude Code's settings.
+    ClaudeHooks(HookOp),
 }
 
 /// The result of the worker's PATH probe, remembered with the exact template
@@ -60,6 +64,8 @@ pub struct Form {
     pub default_parent: String,
     /// The agent template started in a session's `agent` window.
     pub agent_command: String,
+    /// The template that reopens the conversation an agent reported.
+    pub resume_command: String,
     /// `auto`, `always` or `never`.
     pub resource_accounting: Accounting,
     /// Seconds of quiet before a session stops counting as working, as typed:
@@ -71,6 +77,7 @@ pub struct Form {
     loaded_terminal: String,
     loaded_parent: String,
     loaded_agent_command: String,
+    loaded_resume_command: String,
     loaded_accounting: Accounting,
     loaded_working_window: String,
     loaded_bell: bool,
@@ -97,6 +104,7 @@ impl Form {
             terminal_command: terminal.clone(),
             default_parent: parent.clone(),
             agent_command: agents.command.clone(),
+            resume_command: agents.resume_command.clone(),
             resource_accounting: agents.accounting(),
             working_window: window.clone(),
             bell_is_attention: status.bell_is_attention,
@@ -105,6 +113,7 @@ impl Form {
             loaded_parent: parent,
             loaded_accounting: agents.accounting(),
             loaded_agent_command: agents.command,
+            loaded_resume_command: agents.resume_command,
             loaded_working_window: window,
             loaded_bell: status.bell_is_attention,
             loaded_notifications: status.desktop_notifications,
@@ -150,6 +159,12 @@ impl Form {
                 self.agent_command.trim(),
             ));
         }
+        if self.resume_command != self.loaded_resume_command {
+            edits.push(Edit::string(
+                config_write::AGENTS_RESUME_COMMAND,
+                self.resume_command.trim(),
+            ));
+        }
         if self.resource_accounting != self.loaded_accounting {
             edits.push(Edit::string(
                 config_write::AGENTS_RESOURCE_ACCOUNTING,
@@ -190,6 +205,12 @@ impl Form {
         {
             return Some(format!("agent command: {e}"));
         }
+        // Same rule for the resume template: empty means "offer no resume".
+        if !self.resume_command.trim().is_empty()
+            && let Err(e) = terminal::tokenize(&self.resume_command)
+        {
+            return Some(format!("resume command: {e}"));
+        }
         if self.working_window_secs().is_none() {
             return Some("the working window must be a positive number of seconds".to_string());
         }
@@ -202,6 +223,7 @@ impl Form {
         self.loaded_terminal = config.terminal.command.clone();
         self.loaded_parent = config.worktrees.default_parent.clone();
         self.loaded_agent_command = config.agents.command.clone();
+        self.loaded_resume_command = config.agents.resume_command.clone();
         self.loaded_accounting = config.agents.accounting();
         self.loaded_working_window = config.status.working_window_secs.to_string();
         self.loaded_bell = config.status.bell_is_attention;
@@ -214,6 +236,7 @@ impl Form {
         self.terminal_command = self.loaded_terminal.clone();
         self.default_parent = self.loaded_parent.clone();
         self.agent_command = self.loaded_agent_command.clone();
+        self.resume_command = self.loaded_resume_command.clone();
         self.resource_accounting = self.loaded_accounting;
         self.working_window = self.loaded_working_window.clone();
         self.bell_is_attention = self.loaded_bell;
@@ -263,6 +286,7 @@ pub fn body(
     form: &mut Form,
     paths: &Paths,
     home: Option<&Path>,
+    hooks: Option<&HookChange>,
 ) -> Option<Action> {
     let mut action = None;
     let fields = (ui.available_width() - LABEL_COLUMN - 12.0).max(200.0);
@@ -394,6 +418,36 @@ pub fn body(
                          {session} and {socket} are substituted into the arguments. \
                          Empty offers no agent action. Per-project commands are set \
                          under [agents.per_project] in the file.",
+                        theme::FONT_SMALL,
+                        theme::TEXT_FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+            ui.end_row();
+
+            ui.label(theme::caption("Resume command"));
+            ui.vertical(|ui| {
+                ui.set_width(fields);
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut form.resume_command)
+                            .font(egui::FontId::monospace(theme::FONT_SMALL))
+                            .hint_text("claude --resume {agent_session}")
+                            .desired_width(fields),
+                    )
+                    .changed()
+                {
+                    form.note = None;
+                }
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(theme::label(
+                        "Reopens the conversation an agent last reported here, offered \
+                         on a worktree's menu. {agent_session} is the id it reported \
+                         through `grove notify --agent-session`. Empty offers no \
+                         resume: Grove ships no default because only you know how your \
+                         agent spells it.",
                         theme::FONT_SMALL,
                         theme::TEXT_FAINT,
                     ))
@@ -553,6 +607,14 @@ pub fn body(
             ui.end_row();
         });
 
+    // ------------------------------------------------------- Claude Code hooks
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    if let Some(hook_action) = claude_hooks(ui, hooks) {
+        action = Some(hook_action);
+    }
+
     // ------------------------------------------------------------------ paths
     ui.add_space(14.0);
     ui.separator();
@@ -615,6 +677,92 @@ pub fn body(
         .wrap(),
     );
 
+    action
+}
+
+/// Grove's hooks in Claude Code's settings: what is there, and the two
+/// buttons that change it.
+///
+/// The hooks are how an agent tells Grove that it needs the user — the one
+/// thing Grove refuses to infer for itself — so this says plainly whether that
+/// path is wired up, rather than leaving a silent row to be explained by a
+/// worktree that never lights up.
+fn claude_hooks(ui: &mut egui::Ui, hooks: Option<&HookChange>) -> Option<Action> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(theme::caption("Claude Code hooks"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let installed = hooks.is_some_and(HookChange::is_installed);
+            let label = if installed { "Remove" } else { "Install" };
+            if ui
+                .button(theme::label(label, theme::FONT_SMALL, theme::TEXT_MUTED))
+                .on_hover_text(if installed {
+                    "Take Grove's hooks back out of settings.json"
+                } else {
+                    "Add Grove's hooks to settings.json, backing it up first"
+                })
+                .clicked()
+            {
+                action = Some(Action::ClaudeHooks(if installed {
+                    HookOp::Uninstall
+                } else {
+                    HookOp::Install
+                }));
+            }
+            if ui
+                .button(theme::label(
+                    "Re-check",
+                    theme::FONT_SMALL,
+                    theme::TEXT_MUTED,
+                ))
+                .on_hover_text("Read settings.json again")
+                .clicked()
+            {
+                action = Some(Action::ClaudeHooks(HookOp::Check));
+            }
+        });
+    });
+    ui.add_space(4.0);
+    match hooks {
+        Some(change) if change.is_installed() => bullet(
+            ui,
+            icons::check,
+            theme::STATUS_WORKING,
+            &format!("Installed on {}", change.installed.join(", ")),
+        ),
+        Some(change) if change.installed.is_empty() => bullet(
+            ui,
+            icons::ellipsis,
+            theme::TEXT_FAINT,
+            "Not installed — Grove will not hear when Claude needs you",
+        ),
+        // Half a set is what an interrupted install or a hand-edited file
+        // leaves; naming the missing ones beats calling it installed.
+        Some(change) => bullet(
+            ui,
+            icons::warning,
+            theme::WARNING,
+            &format!("Partly installed: only {}", change.installed.join(", ")),
+        ),
+        None => bullet(ui, icons::ellipsis, theme::TEXT_FAINT, "checking…"),
+    }
+    ui.add_space(4.0);
+    if let Some(change) = hooks {
+        path_line(ui, &change.path);
+        ui.add_space(4.0);
+    }
+    ui.add(
+        egui::Label::new(theme::label(
+            "Each hook runs `grove notify --hook`, which reads the event on stdin: \
+             what Claude is waiting for, what it was asked to do, and the id of the \
+             conversation — which is what the worktree menu's resume and transcript \
+             entries need. Your own hooks are left alone and the file is backed up \
+             first. Restart Claude Code after installing.",
+            theme::FONT_SMALL,
+            theme::TEXT_FAINT,
+        ))
+        .wrap(),
+    );
     action
 }
 
@@ -727,6 +875,16 @@ mod tests {
         );
 
         let mut form = Form::new(Some(&config(TEMPLATE, "")));
+        form.resume_command = "claude --resume {agent_session}".into();
+        assert_eq!(
+            form.edits(),
+            vec![Edit::string(
+                config_write::AGENTS_RESUME_COMMAND,
+                "claude --resume {agent_session}"
+            )]
+        );
+
+        let mut form = Form::new(Some(&config(TEMPLATE, "")));
         form.resource_accounting = Accounting::Always;
         assert_eq!(
             form.edits(),
@@ -773,6 +931,16 @@ mod tests {
             );
         }
         form.working_window = "15".into();
+        assert_eq!(form.problem(), None);
+
+        // Empty agent templates are legitimate — they mean "offer nothing" —
+        // but a malformed one must not reach the file either.
+        form.resume_command = "claude --resume '".into();
+        assert!(
+            form.problem().is_some_and(|p| p.contains("resume command")),
+            "an unbalanced quote is not saveable"
+        );
+        form.resume_command = String::new();
         assert_eq!(form.problem(), None);
     }
 

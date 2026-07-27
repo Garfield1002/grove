@@ -794,6 +794,7 @@ fn starting_an_agent_opens_its_own_window_beside_the_shell() {
         "acme-web",
         Path::new("/repo/.git"),
         &worktree,
+        workflow::AgentStart::Fresh,
     )
     .expect("starts the agent");
     assert_eq!(launch.unit, None, "accounting is off in this test");
@@ -862,6 +863,7 @@ fn starting_an_agent_without_a_configured_command_is_refused() {
         "acme-web",
         Path::new("/repo/.git"),
         &worktree,
+        workflow::AgentStart::Fresh,
     )
     .expect_err("nothing is configured");
     assert!(err.to_string().contains("no agent command"));

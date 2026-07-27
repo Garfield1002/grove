@@ -36,7 +36,14 @@ pub const CANDIDATES: &[(&str, &str)] = &[
 ];
 
 /// Template placeholders Grove substitutes. Anything else is left alone.
-pub const PLACEHOLDERS: &[&str] = &["socket", "session", "worktree", "project", "branch"];
+pub const PLACEHOLDERS: &[&str] = &[
+    "socket",
+    "session",
+    "worktree",
+    "project",
+    "branch",
+    "agent_session",
+];
 
 /// Values substituted into a terminal template.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,6 +53,10 @@ pub struct TemplateVars {
     pub worktree: String,
     pub project: String,
     pub branch: String,
+    /// The agent's own conversation id, for a resume template. Empty for every
+    /// other command, which is why it is set separately rather than through
+    /// [`TemplateVars::new`]: a terminal template has no business carrying one.
+    pub agent_session: String,
 }
 
 impl TemplateVars {
@@ -56,7 +67,14 @@ impl TemplateVars {
             worktree: worktree.to_string_lossy().into_owned(),
             project: project.to_string(),
             branch: branch.to_string(),
+            agent_session: String::new(),
         }
+    }
+
+    /// Carry an agent's conversation id, for a resume template.
+    pub fn with_agent_session(mut self, id: &str) -> Self {
+        self.agent_session = id.to_string();
+        self
     }
 
     fn get(&self, key: &str) -> Option<&str> {
@@ -66,6 +84,7 @@ impl TemplateVars {
             "worktree" => Some(&self.worktree),
             "project" => Some(&self.project),
             "branch" => Some(&self.branch),
+            "agent_session" => Some(&self.agent_session),
             _ => None,
         }
     }
@@ -206,6 +225,17 @@ mod tests {
                 "{session}"
             ]
         );
+    }
+
+    /// A resume template is the only one that carries a conversation id, and
+    /// the id is one argument however it is spelled.
+    #[test]
+    fn an_agent_session_expands_as_one_argument() {
+        let resuming = vars().with_agent_session("0f3a-91bc");
+        let inv = expand("claude --resume {agent_session}", &resuming).expect("expands");
+        assert_eq!(argv(&inv), vec!["claude", "--resume", "0f3a-91bc"]);
+        // Every other template is expanded with no id at all.
+        assert_eq!(vars().agent_session, "");
     }
 
     #[test]

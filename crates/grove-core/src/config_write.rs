@@ -70,6 +70,13 @@ pub const AGENTS_COMMAND: Key = Key {
     name: "command",
 };
 
+/// `agents.resume_command` — the template that reopens the agent's last
+/// conversation in a worktree.
+pub const AGENTS_RESUME_COMMAND: Key = Key {
+    table: "agents",
+    name: "resume_command",
+};
+
 /// `agents.resource_accounting` — auto | always | never.
 pub const AGENTS_RESOURCE_ACCOUNTING: Key = Key {
     table: "agents",

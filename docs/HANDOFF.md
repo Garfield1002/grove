@@ -57,7 +57,10 @@ Nothing in M3 is machine-verified GUI-side either; see the smoke list below.
 | Per-agent RAM/CPU from `/sys/fs/cgroup` (`grove-core/src/cgroup.rs`) | **Done** — shown in the row tooltip |
 | Settings UI for `[status]` / `[agents]` | **Done** — except `agent_commands` and `[agents.per_project]`, a list and a map, which stay file-only |
 | 10 s git-status poll | **Done** |
-| `just install-claude-hook` | **Done** — merges `grove notify` into Claude Code's settings.json |
+| `grove hooks install` | **Done** — merges `grove notify --hook` into Claude Code's settings.json, backing it up and leaving the user's own hooks alone. `just install-claude-hook` now just runs it. |
+| Claude Code hook payloads (`grove-core/src/claude.rs`) | **Done** — `grove notify --hook` reads the event's JSON on stdin: state, message, `session_id`, `transcript_path` |
+| Per-window reports (`grove-core/src/notice.rs`, `--window`) | **Done** — a report resolves `$TMUX_PANE` to a window index, so an agent's message lands on the agent's row and quiet windows stop repeating the worktree's line |
+| Agent conversations in `state.toml` (`[[agent]]`) | **Done** — row menu offers *Resume agent conversation* (needs `[agents] resume_command`) and *Open agent transcript* |
 
 Nothing in M4 is machine-verified GUI-side; see the smoke list below.
 
@@ -96,6 +99,12 @@ commits with tests; `git log --oneline` is a usable index.
   tmux option — clear one and the next poll re-raises it.
 - **Attention is never inferred.** Not from a process name, not from
   terminal output. Only `grove notify` or an opted-in tmux bell.
+- **Claude Code is the one agent Grove knows by name**, and it knows it
+  through one command (`grove notify --hook`) on five events — see
+  ARCHITECTURE.md §6.1. Everything it learns is something the agent said:
+  no transcript is read, and an event Grove has no opinion about reports
+  nothing rather than guessing. `state.toml`'s `[[agent]]` table is an index
+  of conversation ids, never a reason to remove anything.
 - **systemd scopes (opt-in, auto when a user manager is present)**: agent
   commands are wrapped in `systemd-run --user --scope --collect` with a
   nonced unit name, for per-agent cgroup RAM/CPU. Plain shells are never
