@@ -32,13 +32,13 @@ const FADE_ROWS: usize = 12;
 /// top — so without this it ends on a visible straight cut.
 const FADE_ZONE: f32 = 0.35;
 
-/// How much taller than the free space the art is drawn. Above 1 it overflows
-/// the top and is cropped there, trading a little of the canopy for trees that
-/// read at a useful size.
-const HEIGHT_SCALE: f32 = 1.6;
+/// Height of the art as a fraction of the panel's. At 1 the whole
+/// illustration is visible when the list is empty; above 1 it overflows the
+/// top and is cropped there.
+const HEIGHT_SCALE: f32 = 1.0;
 
-/// Widest the art may get, as a fraction of the free space. A tall gap would
-/// otherwise scale it until it dominated the window.
+/// Widest the art may get, as a fraction of the panel. A tall window would
+/// otherwise scale it until it dominated the view.
 const MAX_WIDTH_FRACTION: f32 = 0.8;
 
 /// How far below the last row the art takes to reach full strength. Enough
@@ -68,13 +68,13 @@ fn texture(ctx: &Context) -> Option<TextureHandle> {
     Some(handle)
 }
 
-/// Paint the backdrop pinned to the bottom-right of `free` — the gap the
-/// list has not taken.
+/// Paint the backdrop pinned to the bottom-right of `panel`, revealed only
+/// within `free` — the gap the list has not taken.
 ///
-/// That corner is the panel's own, so the art never moves: as the list grows
-/// the gap shrinks from the top and the art fades out under the rows.
-pub fn show(ctx: &Context, free: Rect) {
-    if free.height() < MIN_HEIGHT || free.width() <= 0.0 {
+/// Size comes from `panel` and visibility from `free`, so adding a row
+/// uncovers or covers more of the art without ever resizing it.
+pub fn show(ctx: &Context, panel: Rect, free: Rect) {
+    if free.height() < MIN_HEIGHT || panel.width() <= 0.0 {
         return;
     }
     let Some(texture) = texture(ctx) else {
@@ -89,7 +89,7 @@ pub fn show(ctx: &Context, free: Rect) {
     painter.set_clip_rect(free);
     painter.add(fade_mesh(
         texture.id(),
-        placement(free, size.y / size.x),
+        placement(panel, size.y / size.x),
         free.top(),
     ));
 }
@@ -103,23 +103,26 @@ struct Placement {
     uv_top: f32,
 }
 
-/// Fit the art to the *height* of the gap and anchor it bottom-right.
+/// Fit the art to the panel's *height* and anchor it bottom-right.
 ///
 /// Fitting to width instead is what the first attempt did, and on a wide,
-/// shallow gap it scales a 941×1672 portrait until only hillside is left in
-/// frame. Sizing against the whole panel and then clipping to the gap has the
-/// same effect for the opposite reason: the trees live in the upper part of
-/// the illustration, which is exactly the part the list covers.
-fn placement(free: Rect, aspect: f32) -> Placement {
-    let max_width = free.width() * MAX_WIDTH_FRACTION;
-    let width = (free.height() * HEIGHT_SCALE / aspect).min(max_width);
+/// shallow panel it scales a 941×1672 portrait until only hillside is left in
+/// frame.
+///
+/// Deliberately a function of the panel and nothing else. Sizing against the
+/// gap under the list instead makes the art grow and shrink by a visible step
+/// every time a project is expanded, which reads as the illustration being
+/// part of the list rather than behind it.
+fn placement(panel: Rect, aspect: f32) -> Placement {
+    let max_width = panel.width() * MAX_WIDTH_FRACTION;
+    let width = (panel.height() * HEIGHT_SCALE / aspect).min(max_width);
     let uncropped_height = width * aspect;
-    let height = uncropped_height.min(free.height());
+    let height = uncropped_height.min(panel.height());
 
     Placement {
         quad: Rect::from_min_max(
-            pos2(free.right() - width, free.bottom() - height),
-            pos2(free.right(), free.bottom()),
+            pos2(panel.right() - width, panel.bottom() - height),
+            pos2(panel.right(), panel.bottom()),
         ),
         uv_top: 1.0 - height / uncropped_height,
     }
@@ -262,39 +265,35 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_shallow_gap_fits_the_art_to_its_height() {
+    fn a_wide_shallow_panel_fits_the_art_to_its_height() {
         // The bug the first version had: fitting a 941x1672 portrait to the
-        // width of a wide gap leaves only hillside in frame.
+        // width of a wide panel leaves only hillside in frame.
         let aspect = 1672.0 / 941.0;
         let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(900.0, 410.0));
         let p = placement(area, aspect);
 
-        assert_eq!(p.quad.height(), area.height(), "fills the gap's height");
+        assert_eq!(p.quad.height(), area.height(), "fills the panel's height");
         assert!(p.quad.width() < area.width() * MAX_WIDTH_FRACTION + 0.01);
-        // Oversized on purpose, so the trees read: the overflow is cropped
-        // off the top, where the fade hides the cut.
-        assert!(p.uv_top > 0.0, "the overflow is cropped: {}", p.uv_top);
-        assert!(
-            p.uv_top < 0.5,
-            "but never so much that the trees go: {}",
-            p.uv_top
-        );
+        assert!(p.uv_top.abs() < 0.001, "nothing cropped: {}", p.uv_top);
     }
 
     #[test]
-    fn the_art_is_drawn_larger_than_the_gap_it_sits_in() {
+    fn the_size_ignores_how_much_of_the_list_is_showing() {
+        // Sizing against the free space instead makes the art grow and shrink
+        // by a visible step every time a project is expanded.
+        let panel = panel();
         let aspect = 1672.0 / 941.0;
-        let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(900.0, 410.0));
-        let p = placement(area, aspect);
+        let fixed = placement(panel, aspect).quad.size();
 
-        // Scaling to fit exactly would make it this wide; HEIGHT_SCALE is
-        // what stops the trees from shrinking to nothing in a shallow gap.
-        let exact_fit_width = area.height() / aspect;
-        assert!(
-            p.quad.width() > exact_fit_width,
-            "{} should exceed {exact_fit_width}",
-            p.quad.width()
-        );
+        for content_bottom in [0.0, 100.0, 250.0, 400.0, 449.0] {
+            let free = free_space(panel, content_bottom).expect("room");
+            assert!(free.height() != panel.height() || content_bottom == 0.0);
+            assert_eq!(
+                placement(panel, aspect).quad.size(),
+                fixed,
+                "resized at content_bottom={content_bottom}"
+            );
+        }
     }
 
     #[test]
@@ -345,15 +344,15 @@ mod tests {
 
     #[test]
     fn the_art_stays_pinned_to_the_window_corner_as_the_list_grows() {
-        // The art is sized against the gap, so it shrinks as rows are added,
-        // but the corner it hangs from is the panel's and must not drift.
+        // The corner the art hangs from is the panel's own bottom-right —
+        // the window's edge, not the last row's — and must not drift.
         let panel = panel();
         let aspect = 1672.0 / 941.0;
 
         let corners: Vec<_> = [100.0, 200.0, 300.0, 400.0]
             .iter()
             .filter_map(|&bottom| free_space(panel, bottom))
-            .map(|free| placement(free, aspect).quad.max)
+            .map(|_| placement(panel, aspect).quad.max)
             .collect();
 
         assert_eq!(corners.len(), 4, "all four leave room");
