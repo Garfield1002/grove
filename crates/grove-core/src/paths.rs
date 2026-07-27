@@ -122,6 +122,13 @@ impl Paths {
     pub fn tmux_config_file(&self) -> PathBuf {
         self.config_dir.join("tmux.conf")
     }
+
+    /// The Grove-owned half of the tmux configuration, sourced by
+    /// `tmux.conf`. Rewritten from the binary on every start, so fixes ship
+    /// with an upgrade instead of being frozen into the user's copy.
+    pub fn managed_tmux_config_file(&self) -> PathBuf {
+        self.config_dir.join("grove.tmux.conf")
+    }
 }
 
 fn home(env: &Env, wanted: &'static str) -> Result<PathBuf> {

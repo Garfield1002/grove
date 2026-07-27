@@ -1135,6 +1135,7 @@ dependencies = [
  "eframe",
  "egui",
  "grove-core",
+ "image",
  "rfd",
  "tempfile",
  "thiserror 2.0.19",

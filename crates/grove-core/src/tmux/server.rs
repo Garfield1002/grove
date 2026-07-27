@@ -16,6 +16,18 @@ use crate::process::{CommandOutput, Invocation};
 /// The tmux executable. Not configurable in Milestone 1.
 pub const TMUX: &str = "tmux";
 
+/// The managed settings file that `tmux.conf` sources, as a sibling of it.
+///
+/// [`Paths::managed_tmux_config_file`](crate::paths::Paths::managed_tmux_config_file)
+/// names the same file; deriving it here keeps `with_config` a single knob
+/// and lets tests point a whole configuration at a temp directory.
+fn managed_config_path(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("grove.tmux.conf")
+}
+
 /// Handle to Grove's private tmux server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxServer {
@@ -60,14 +72,16 @@ impl TmuxServer {
         }
     }
 
-    /// Generate `tmux.conf` if it is missing. `tmux -f <missing file>` is an
-    /// error, so this runs before every invocation; it is a single `stat` once
-    /// the file exists.
+    /// Generate `tmux.conf` if it is missing and refresh the managed file it
+    /// sources. `tmux -f <missing file>` is an error, so this runs before
+    /// every invocation; it is two `stat`s and a read once both files exist.
     pub fn ensure_config_file(&self) -> Result<()> {
-        match &self.config {
-            Some(path) => crate::config::ensure_tmux_config(path).map(|_| ()),
-            None => Ok(()),
-        }
+        let Some(path) = &self.config else {
+            return Ok(());
+        };
+        let managed = managed_config_path(path);
+        crate::config::write_managed_tmux_config(&managed)?;
+        crate::config::ensure_tmux_config(path, &managed).map(|_| ())
     }
 
     /// Build `tmux [-f <config>] -S <socket> <args…>`.

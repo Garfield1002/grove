@@ -43,6 +43,15 @@ pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x8b, 0x92, 0x9c);
 pub const TEXT_GHOST: Color32 = Color32::from_rgb(0x6b, 0x70, 0x78);
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x5c, 0x62, 0x6b);
 
+/// The decorative line-art backdrop under a short list. Grove's quiet grey,
+/// the same hue as [`TEXT_MUTED`]; the shipped PNG is white and is tinted
+/// with this.
+pub const BACKDROP: Color32 = TEXT_MUTED;
+/// How strong the backdrop gets at its bottom edge, before the fade. Kept
+/// separate from [`BACKDROP`] because a premultiplied `Color32` would give
+/// the tint the wrong channel values.
+pub const BACKDROP_ALPHA: u8 = 0xc8;
+
 // ----------------------------------------------------------------- accents
 
 pub const DOT_IDLE: Color32 = Color32::from_rgb(0x79, 0x81, 0x8c);

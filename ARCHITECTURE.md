@@ -44,10 +44,22 @@ This document records the *resolved* architecture. The full product design
   invocation passes `-S` explicitly. Never touch the user's default server.
 - **Grove-owned tmux config.** The server is started with
   `-f $XDG_CONFIG_HOME/grove/tmux.conf` (a bare `-S` server would still read
-  `~/.tmux.conf`). The file is generated on first run and user-editable;
-  the default sources `~/.tmux.conf` when present, then applies the
-  settings Grove depends on (`monitor-bell on`, `monitor-activity on`,
-  `exit-empty off`).
+  `~/.tmux.conf`). The configuration is split in two so that fixes reach
+  existing installs without ever overwriting a user's edits:
+  - `tmux.conf` is **the user's**. Generated on first run, then never
+    rewritten. It sources `~/.tmux.conf` when present, sources the managed
+    file, and leaves its tail for overrides.
+  - `grove.tmux.conf` is **Grove's**. Shipped in the binary
+    (`grove-core/assets/grove.tmux.conf`, `include_str!`) and rewritten
+    atomically on every start, so it must not be hand-edited. It holds what
+    status detection depends on (`monitor-bell`, `monitor-activity`,
+    `exit-empty off`) plus the terminal behaviour a pane needs to be usable
+    (`mouse on`; `extended-keys always` with `extended-keys-format csi-u`
+    and per-terminal `extkeys` features, without which Shift+Enter and
+    friends never reach the agent running in the pane).
+
+  Note that `terminal-features` is resolved when a *client attaches*:
+  changing it only affects terminals opened afterwards.
 - **Session metadata as tmux user options.** At creation, each session gets
   `@grove_id`, `@grove_project`, `@grove_worktree` (canonical path), and
   `@grove_repo` (git-common-dir) set via `set-option`. The tmux server thus

@@ -238,14 +238,27 @@ pub fn detect_terminal_template() -> Result<&'static str> {
     terminal::detect()
 }
 
+/// The Grove-owned tmux settings, shipped inside the binary.
+///
+/// Kept in the source tree (`assets/grove.tmux.conf`) rather than inlined
+/// into the user's file so that a fix — a missing `mouse on`, a new
+/// `terminal-features` entry — reaches existing installs on upgrade. The
+/// user's own `tmux.conf` only sources this.
+pub const MANAGED_TMUX_CONFIG_DOCUMENT: &str = include_str!("../assets/grove.tmux.conf");
+
 /// Grove's own `tmux.conf`, written on first run.
 ///
 /// A private server started with `-S` alone still reads `~/.tmux.conf`, so
 /// Grove passes `-f` and owns the file (ARCHITECTURE.md §2). The default
-/// sources the user's own configuration when it exists and then applies the
-/// settings Grove's status detection depends on. Like `config.toml`, this is
+/// sources the user's own configuration, then Grove's managed settings, and
+/// leaves the tail of the file for overrides. Like `config.toml`, this is
 /// written once and never rewritten.
-pub const TMUX_CONFIG_DOCUMENT: &str = "\
+///
+/// `managed` must be absolute: tmux resolves a relative `source-file`
+/// against the working directory, not against the file doing the sourcing.
+pub fn tmux_config_document(managed: &Path) -> String {
+    format!(
+        "\
 # Grove's private tmux server configuration.
 #
 # Grove starts its server with `-f` pointing here, so ~/.tmux.conf is not
@@ -256,14 +269,29 @@ pub const TMUX_CONFIG_DOCUMENT: &str = "\
 # yours at ~/.config/tmux/tmux.conf, add a second source-file line for it.
 source-file -q ~/.tmux.conf
 
-# Settings Grove depends on. Removing these degrades status detection.
-set -g monitor-bell on
-set -g monitor-activity on
-set -s exit-empty off
-";
+# The settings Grove depends on. That file is regenerated on every start,
+# so edit it here instead — anything below this line wins.
+source-file '{}'
+",
+        managed.display()
+    )
+}
+
+/// Rewrite the managed half of the configuration from the shipped copy.
+///
+/// Unconditional and atomic: the file is Grove's, not the user's, and a
+/// half-written one would make `tmux -f` fail.
+pub fn write_managed_tmux_config(path: &Path) -> Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == MANAGED_TMUX_CONFIG_DOCUMENT
+    {
+        return Ok(());
+    }
+    crate::atomic::write(path, MANAGED_TMUX_CONFIG_DOCUMENT)
+}
 
 /// Create `tmux.conf` if it does not exist. Returns true when it was created.
-pub fn ensure_tmux_config(path: &Path) -> Result<bool> {
+pub fn ensure_tmux_config(path: &Path, managed: &Path) -> Result<bool> {
     if path.exists() {
         return Ok(false);
     }
@@ -274,7 +302,7 @@ pub fn ensure_tmux_config(path: &Path) -> Result<bool> {
     match std::fs::File::create_new(path) {
         Ok(mut file) => {
             use std::io::Write;
-            file.write_all(TMUX_CONFIG_DOCUMENT.as_bytes())
+            file.write_all(tmux_config_document(managed).as_bytes())
                 .map_err(|e| Error::io(format!("could not write {}", path.display()), e))?;
             Ok(true)
         }
@@ -525,26 +553,75 @@ mod tests {
     fn the_tmux_config_is_written_once_and_never_rewritten() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("grove").join("tmux.conf");
+        let managed = tmp.path().join("grove").join("grove.tmux.conf");
 
-        assert!(ensure_tmux_config(&path).expect("creates"));
+        assert!(ensure_tmux_config(&path, &managed).expect("creates"));
         let written = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(written, TMUX_CONFIG_DOCUMENT);
+        assert_eq!(written, tmux_config_document(&managed));
 
         // A user edit must survive every later run.
-        std::fs::write(&path, "set -g mouse on\n").expect("user edit");
-        assert!(!ensure_tmux_config(&path).expect("keeps the file"));
+        std::fs::write(&path, "set -g status off\n").expect("user edit");
+        assert!(!ensure_tmux_config(&path, &managed).expect("keeps the file"));
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
-            "set -g mouse on\n"
+            "set -g status off\n"
         );
     }
 
     #[test]
-    fn the_tmux_config_sources_the_users_own_and_sets_what_grove_needs() {
+    fn the_tmux_config_sources_the_users_own_and_then_groves_managed_file() {
+        let managed = Path::new("/home/u/.config/grove/grove.tmux.conf");
+        let document = tmux_config_document(managed);
+
         // source-file -q so a missing ~/.tmux.conf is not an error.
-        assert!(TMUX_CONFIG_DOCUMENT.contains("source-file -q ~/.tmux.conf"));
-        assert!(TMUX_CONFIG_DOCUMENT.contains("set -g monitor-bell on"));
-        assert!(TMUX_CONFIG_DOCUMENT.contains("set -g monitor-activity on"));
-        assert!(TMUX_CONFIG_DOCUMENT.contains("set -s exit-empty off"));
+        assert!(document.contains("source-file -q ~/.tmux.conf"));
+        // Absolute and quoted: tmux resolves relative paths against the
+        // working directory, and the path may contain spaces.
+        assert!(document.contains("source-file '/home/u/.config/grove/grove.tmux.conf'"));
+        // Grove's settings load after the user's, and before the tail of the
+        // file that the user is invited to override in.
+        let users = document.find("~/.tmux.conf").expect("sources the user's");
+        let groves = document.find("grove.tmux.conf").expect("sources Grove's");
+        assert!(users < groves);
+    }
+
+    #[test]
+    fn the_managed_file_carries_the_settings_grove_depends_on() {
+        let document = MANAGED_TMUX_CONFIG_DOCUMENT;
+        assert!(document.contains("set -g monitor-bell on"));
+        assert!(document.contains("set -g monitor-activity on"));
+        assert!(document.contains("set -s exit-empty off"));
+        // The wheel is dead without this: tmux holds the alternate screen.
+        assert!(document.contains("set -g mouse on"));
+        // Shift+Enter reaches the pane only as a CSI-u sequence, and only
+        // when the outer terminal is declared able to carry extended keys.
+        assert!(document.contains("set -s extended-keys on"));
+        assert!(document.contains("set -s extended-keys-format csi-u"));
+        assert!(document.contains("extkeys"));
+        // tmux ignores an application's kitty-protocol request and folds
+        // Shift+Enter into Enter, so the sequence is injected by hand.
+        assert!(document.contains("bind -n S-Enter send-keys -H 1b 5b 31 33 3b 32 75"));
+        // Agents signal attention with OSC sequences; tmux must pass them on.
+        assert!(document.contains("set -g allow-passthrough on"));
+    }
+
+    #[test]
+    fn the_managed_file_is_rewritten_over_any_local_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("grove").join("grove.tmux.conf");
+
+        write_managed_tmux_config(&path).expect("creates");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            MANAGED_TMUX_CONFIG_DOCUMENT
+        );
+
+        // Unlike tmux.conf, this file is Grove's; edits here are not kept.
+        std::fs::write(&path, "set -g mouse off\n").expect("stale edit");
+        write_managed_tmux_config(&path).expect("rewrites");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            MANAGED_TMUX_CONFIG_DOCUMENT
+        );
     }
 }
