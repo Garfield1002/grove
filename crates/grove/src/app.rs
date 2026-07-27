@@ -2,7 +2,7 @@
 //! worker, and the narrow vertical layout from direction 1c.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use grove_core::config::Config;
@@ -15,7 +15,7 @@ use grove_core::{Paths, state};
 use crate::ui::dialogs::create_worktree::CreateForm;
 use crate::ui::dialogs::removal::{RemovalForm, Request};
 use crate::ui::{self, Action, theme};
-use crate::workers::{ErrorReport, Message, Task, Workers};
+use crate::workers::{ErrorReport, Message, PickTarget, Task, Workers};
 
 pub struct GroveApp {
     paths: Paths,
@@ -37,7 +37,7 @@ pub struct GroveApp {
     pending_selection: Option<(String, PathBuf)>,
     create: Option<CreateForm>,
     removal: Option<RemovalForm>,
-    show_settings: bool,
+    settings: Option<ui::settings::Form>,
 }
 
 impl GroveApp {
@@ -93,7 +93,7 @@ impl GroveApp {
             pending_selection: None,
             create: None,
             removal: None,
-            show_settings: false,
+            settings: None,
         }
     }
 
@@ -107,8 +107,44 @@ impl GroveApp {
                             self.paths.config_file().display()
                         ));
                     }
+                    if let Some(form) = &mut self.settings {
+                        form.reloaded(&loaded.config);
+                    }
                     self.config = Some(loaded.config);
                 }
+                Message::ConfigSaved { path } => {
+                    self.status = Some(format!("Saved {}", path.display()));
+                    if let Some(form) = &mut self.settings {
+                        form.note = Some("Saved. Your comments are untouched.".to_string());
+                    }
+                }
+                Message::TerminalDetected { template } => {
+                    if let Some(form) = &mut self.settings {
+                        form.terminal_command = template.clone();
+                        form.note = None;
+                        self.workers.send(Task::ProbeTerminal(template));
+                    }
+                }
+                Message::TerminalProbed {
+                    command,
+                    program,
+                    found,
+                } => {
+                    if let Some(form) = &mut self.settings {
+                        form.probe = Some(ui::settings::Probe {
+                            command,
+                            program,
+                            found,
+                        });
+                    }
+                }
+                Message::DirectoryPicked { target, path } => apply_picked(
+                    target,
+                    path,
+                    &mut self.open_project_path,
+                    &mut self.create,
+                    &mut self.settings,
+                ),
                 Message::ProjectOpened(project) => self.add_project(*project),
                 Message::WorktreesRefreshed {
                     project_id,
@@ -213,7 +249,14 @@ impl GroveApp {
                         }
                     });
                 }
-                Message::Failed(report) => self.errors.push(report),
+                Message::Failed(report) => {
+                    // A failed save must release the Save button, or the pane
+                    // would sit on "Saving…" for ever.
+                    if let Some(form) = &mut self.settings {
+                        form.saving = false;
+                    }
+                    self.errors.push(report);
+                }
             }
         }
     }
@@ -430,6 +473,34 @@ impl GroveApp {
         }
     }
 
+    /// Settings never touch a file on the UI thread: writing `config.toml`,
+    /// probing PATH and handing a path to the desktop all go to the worker.
+    fn apply_settings_action(&mut self, action: ui::settings::Action) {
+        let Some(form) = &self.settings else { return };
+        match action {
+            ui::settings::Action::Save => {
+                let edits = form.edits();
+                if edits.is_empty() {
+                    return;
+                }
+                self.status = Some("Saving config.toml…".to_string());
+                self.workers.send(Task::SaveConfig(edits));
+            }
+            ui::settings::Action::DetectTerminal => self.workers.send(Task::DetectTerminal),
+            ui::settings::Action::Probe(command) => self.workers.send(Task::ProbeTerminal(command)),
+            ui::settings::Action::OpenConfigFile => self
+                .workers
+                .send(Task::OpenWithDesktop(self.paths.config_file())),
+            ui::settings::Action::BrowseWorktreeParent => {
+                let start = pick_start(&form.default_parent, self.home.as_deref());
+                self.workers.send(Task::PickDirectory {
+                    target: PickTarget::WorktreeParent,
+                    start,
+                });
+            }
+        }
+    }
+
     /// The rows the keyboard walks: every visible worktree, in list order.
     fn visible_rows(&self) -> Vec<(String, String)> {
         visible_rows(&self.projects, &self.filter)
@@ -607,7 +678,16 @@ impl GroveApp {
                     .on_hover_text("Settings")
                     .clicked()
                 {
-                    self.show_settings = !self.show_settings;
+                    self.settings = match self.settings {
+                        Some(_) => None,
+                        None => Some(ui::settings::Form::new(self.config.as_ref())),
+                    };
+                    // The valid/invalid indicator needs a PATH probe, which
+                    // is filesystem work and therefore the worker's.
+                    if let Some(form) = &self.settings {
+                        self.workers
+                            .send(Task::ProbeTerminal(form.terminal_command.clone()));
+                    }
                 }
             });
         });
@@ -617,6 +697,53 @@ impl GroveApp {
                 egui::Label::new(theme::label(status, theme::FONT_SMALL, theme::TEXT_FAINT))
                     .truncate(),
             );
+        }
+    }
+}
+
+/// Where the directory picker should open: what the user has typed so far,
+/// else a sensible fallback. Purely textual — deciding whether the path
+/// exists is the worker's job, not the UI thread's.
+fn pick_start(typed: &str, fallback: Option<&Path>) -> Option<PathBuf> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return fallback.map(Path::to_path_buf);
+    }
+    Some(PathBuf::from(typed))
+}
+
+/// Put a directory the user picked into the field that asked for it.
+///
+/// The picked path only ever *fills in* a text field: every path stays
+/// editable by hand, which is also the whole story when Grove is built
+/// without the `native-file-picker` feature.
+fn apply_picked(
+    target: PickTarget,
+    path: PathBuf,
+    open_project: &mut Option<String>,
+    create: &mut Option<CreateForm>,
+    settings: &mut Option<ui::settings::Form>,
+) {
+    let text = path.display().to_string();
+    match target {
+        PickTarget::ProjectPath => {
+            if let Some(field) = open_project {
+                *field = text;
+            }
+        }
+        PickTarget::WorktreePath => {
+            if let Some(form) = create {
+                form.path = text;
+                // The user chose this directory; stop re-deriving it from the
+                // branch name behind their back.
+                form.path_edited = true;
+            }
+        }
+        PickTarget::WorktreeParent => {
+            if let Some(form) = settings {
+                form.default_parent = text;
+                form.note = None;
+            }
         }
     }
 }
@@ -666,6 +793,10 @@ impl eframe::App for GroveApp {
         if let Some(path) = &mut self.open_project_path {
             match ui::dialogs::open_project(ctx, path) {
                 ui::dialogs::OpenProject::Idle => {}
+                ui::dialogs::OpenProject::Browse => self.workers.send(Task::PickDirectory {
+                    target: PickTarget::ProjectPath,
+                    start: pick_start(path, self.home.as_deref()),
+                }),
                 ui::dialogs::OpenProject::Cancelled => self.open_project_path = None,
                 ui::dialogs::OpenProject::Confirmed(path) => {
                     self.open_project_path = None;
@@ -678,6 +809,13 @@ impl eframe::App for GroveApp {
         if let Some(form) = &mut self.create {
             match ui::dialogs::create_worktree::show(ctx, form) {
                 ui::dialogs::create_worktree::Outcome::Idle => {}
+                ui::dialogs::create_worktree::Outcome::Browse => {
+                    let start = pick_start(&form.path, Some(&form.default_parent));
+                    self.workers.send(Task::PickDirectory {
+                        target: PickTarget::WorktreePath,
+                        start,
+                    });
+                }
                 ui::dialogs::create_worktree::Outcome::Cancelled => self.create = None,
                 ui::dialogs::create_worktree::Outcome::Create(add) => {
                     self.workers.send(Task::CreateWorktree {
@@ -705,10 +843,16 @@ impl eframe::App for GroveApp {
             }
         }
 
-        if self.show_settings {
+        if let Some(form) = &mut self.settings {
             let mut open = true;
-            ui::settings::show(ctx, &mut open, &self.paths, self.config.as_ref());
-            self.show_settings = open;
+            let action =
+                ui::settings::show(ctx, &mut open, form, &self.paths, self.home.as_deref());
+            if let Some(action) = action {
+                self.apply_settings_action(action);
+            }
+            if !open {
+                self.settings = None;
+            }
         }
 
         let header = egui::TopBottomPanel::top("grove-header")
@@ -952,5 +1096,84 @@ mod tests {
         assert_eq!(next_selection(&[], None, 1), None);
         assert_eq!(next_selection(&[], Some("a1b2c3"), -1), None);
         assert!(visible_rows(&[], "").is_empty());
+    }
+
+    // ------------------------------------------------ the directory picker
+
+    #[test]
+    fn the_picker_starts_where_the_user_was_already_pointing() {
+        assert_eq!(
+            pick_start("  /home/u/wt  ", Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/wt"))
+        );
+        assert_eq!(
+            pick_start("   ", Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u")),
+            "an empty field falls back"
+        );
+        assert_eq!(pick_start("", None), None);
+    }
+
+    #[test]
+    fn a_picked_directory_fills_in_the_field_that_asked_for_it() {
+        let mut open_project = Some(String::new());
+        let mut create = Some(CreateForm::new(&project("p1", "acme", &[])));
+        let mut settings = Some(ui::settings::Form::default());
+
+        apply_picked(
+            PickTarget::ProjectPath,
+            PathBuf::from("/home/u/acme"),
+            &mut open_project,
+            &mut create,
+            &mut settings,
+        );
+        assert_eq!(open_project.as_deref(), Some("/home/u/acme"));
+
+        apply_picked(
+            PickTarget::WorktreePath,
+            PathBuf::from("/home/u/wt/feature"),
+            &mut open_project,
+            &mut create,
+            &mut settings,
+        );
+        let form = create.as_ref().expect("form");
+        assert_eq!(form.path, "/home/u/wt/feature");
+        assert!(
+            form.path_edited,
+            "a chosen directory must not be re-derived from the branch name"
+        );
+
+        apply_picked(
+            PickTarget::WorktreeParent,
+            PathBuf::from("/home/u/trees"),
+            &mut open_project,
+            &mut create,
+            &mut settings,
+        );
+        assert_eq!(
+            settings.as_ref().expect("settings").default_parent,
+            "/home/u/trees"
+        );
+    }
+
+    /// The dialog may have been closed while the portal was open; the answer
+    /// then has nowhere to go and must not panic.
+    #[test]
+    fn a_picked_directory_for_a_closed_dialog_is_dropped() {
+        let (mut open_project, mut create, mut settings) = (None, None, None);
+        for target in [
+            PickTarget::ProjectPath,
+            PickTarget::WorktreePath,
+            PickTarget::WorktreeParent,
+        ] {
+            apply_picked(
+                target,
+                PathBuf::from("/home/u"),
+                &mut open_project,
+                &mut create,
+                &mut settings,
+            );
+        }
+        assert!(open_project.is_none() && create.is_none() && settings.is_none());
     }
 }

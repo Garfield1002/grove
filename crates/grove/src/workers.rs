@@ -14,8 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use grove_core::config::{Config, LoadedConfig};
+use grove_core::config_write::{self, Edit};
 use grove_core::git::{RefEntry, StatusSummary, WorktreeAdd};
 use grove_core::model::{Project, SessionPresence, Worktree};
+use grove_core::process::Invocation;
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
 use grove_core::workflow::{self, Activation};
@@ -94,6 +96,33 @@ pub enum Task {
     },
     /// Persist the project index.
     SaveState(Box<State>),
+    /// Write the changed `config.toml` keys, then re-read the file.
+    ///
+    /// Surgical, key by key: the user's comments and formatting survive
+    /// (ARCHITECTURE.md §4).
+    SaveConfig(Vec<Edit>),
+    /// Re-run terminal auto-detection for the settings pane. Writes nothing.
+    DetectTerminal,
+    /// Is this template's program on PATH? Filesystem work, so not the UI's.
+    ProbeTerminal(String),
+    /// Hand a path to the desktop (`xdg-open`), detached.
+    OpenWithDesktop(PathBuf),
+    /// Ask the desktop's directory picker for a path.
+    PickDirectory {
+        target: PickTarget,
+        start: Option<PathBuf>,
+    },
+}
+
+/// Which path field a picked directory belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickTarget {
+    /// The open-project dialog's repository path.
+    ProjectPath,
+    /// The create-worktree dialog's directory.
+    WorktreePath,
+    /// The settings pane's default worktree parent.
+    WorktreeParent,
 }
 
 /// One of the destructive operations the removal dialog offers separately.
@@ -177,6 +206,26 @@ pub enum Message {
         project_id: String,
         operation: RemovalOp,
         report: ErrorReport,
+    },
+    /// `config.toml` was written. The reloaded config follows as
+    /// [`Message::ConfigLoaded`].
+    ConfigSaved {
+        path: PathBuf,
+    },
+    /// Auto-detection's answer, for the settings pane's revert action.
+    TerminalDetected {
+        template: String,
+    },
+    /// The result of a PATH probe, with the template it was run for.
+    TerminalProbed {
+        command: String,
+        program: String,
+        found: bool,
+    },
+    /// The user chose a directory in the desktop's picker.
+    DirectoryPicked {
+        target: PickTarget,
+        path: PathBuf,
     },
     Failed(ErrorReport),
 }
@@ -575,13 +624,279 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 &e,
             ))],
         },
+
+        Task::SaveConfig(edits) => {
+            let path = worker.paths.config_file();
+            match config_write::apply(&path, &edits) {
+                Ok(()) => {
+                    let mut messages = vec![Message::ConfigSaved { path: path.clone() }];
+                    // Re-read rather than trusting what was sent: the file is
+                    // the truth, and a hand edit may have landed meanwhile.
+                    messages.extend(handle(worker, Task::LoadConfig));
+                    messages
+                }
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not save {}", path.display()),
+                    &e,
+                ))],
+            }
+        }
+
+        Task::DetectTerminal => match terminal::detect() {
+            Ok(template) => vec![Message::TerminalDetected {
+                template: template.to_string(),
+            }],
+            Err(e) => vec![Message::Failed(ErrorReport::new(
+                "could not detect a terminal",
+                &e,
+            ))],
+        },
+
+        Task::ProbeTerminal(command) => {
+            let program = terminal::tokenize(&command)
+                .ok()
+                .and_then(|tokens| tokens.first().cloned())
+                .map(|token| terminal::substitute_token(&token, &terminal::TemplateVars::default()))
+                .unwrap_or_default();
+            vec![Message::TerminalProbed {
+                found: !program.is_empty() && grove_core::process::is_on_path(&program),
+                program,
+                command,
+            }]
+        }
+
+        Task::OpenWithDesktop(path) => {
+            match Invocation::new("xdg-open").arg(&path).spawn_detached() {
+                Ok(()) => Vec::new(),
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not open {}", path.display()),
+                    &e,
+                ))],
+            }
+        }
+
+        Task::PickDirectory { target, start } => match pick_directory(start.as_deref()) {
+            // Cancelled, or no portal answered: the typed field stays.
+            None => Vec::new(),
+            Some(path) => vec![Message::DirectoryPicked { target, path }],
+        },
     }
+}
+
+/// Open the desktop's directory picker, blocking this worker thread (never
+/// the UI thread) until the user answers. On Wayland `rfd` talks to
+/// xdg-desktop-portal, so the dialog is a separate process and Grove keeps
+/// painting. `None` means "cancelled, or no picker available".
+#[cfg(feature = "native-file-picker")]
+fn pick_directory(start: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Choose a directory");
+    if let Some(start) = picker_start_dir(start) {
+        dialog = dialog.set_directory(start);
+    }
+    dialog.pick_folder()
+}
+
+/// Where the picker should open: the typed path if it is a directory, else
+/// its parent if that is one — a worktree path the user is about to create
+/// does not exist yet, but the directory it goes in usually does.
+#[cfg_attr(not(feature = "native-file-picker"), allow(dead_code))]
+fn picker_start_dir(start: Option<&Path>) -> Option<&Path> {
+    let start = start?;
+    if start.is_dir() {
+        return Some(start);
+    }
+    start.parent().filter(|parent| parent.is_dir())
+}
+
+/// Without the `native-file-picker` feature there is no picker: paths are
+/// typed, which every field already supports.
+#[cfg(not(feature = "native-file-picker"))]
+fn pick_directory(_start: Option<&Path>) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use grove_core::error::CommandFailure;
+
+    /// A worker bound to a throwaway config directory. Nothing here starts a
+    /// tmux server: the tasks under test only touch files.
+    fn worker(dir: &Path) -> WorkerState {
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+            runtime_dir: dir.join("run"),
+        };
+        let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
+        WorkerState {
+            paths,
+            server,
+            config: Config::default(),
+            tasks: channel().0,
+        }
+    }
+
+    const USER_FILE: &str = "\
+# My own notes, and Grove had better keep them.
+[terminal]
+# the terminal I actually use
+command = \"foot tmux -S {socket} attach-session -t {session}\"
+
+# where I keep my worktrees
+[worktrees]
+default_parent = \"/home/u/trees\"
+";
+
+    /// The whole save path the Settings pane uses: surgical edit, atomic
+    /// write, re-read, and the comments still there afterwards.
+    #[test]
+    fn saving_config_keeps_the_users_comments_and_reloads_the_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.config_dir).expect("mkdir");
+        let file = worker.paths.config_file();
+        std::fs::write(&file, USER_FILE).expect("write");
+
+        let messages = handle(
+            &mut worker,
+            Task::SaveConfig(vec![Edit::string(
+                config_write::TERMINAL_COMMAND,
+                "kitty tmux -S {socket} attach -t {session}",
+            )]),
+        );
+
+        let text = std::fs::read_to_string(&file).expect("read");
+        assert_eq!(
+            text,
+            USER_FILE.replace(
+                "\"foot tmux -S {socket} attach-session -t {session}\"",
+                "\"kitty tmux -S {socket} attach -t {session}\""
+            ),
+            "only the edited value may change"
+        );
+        assert!(matches!(
+            messages.first(),
+            Some(Message::ConfigSaved { .. })
+        ));
+        let reloaded = messages
+            .iter()
+            .find_map(|m| match m {
+                Message::ConfigLoaded { loaded } => Some(&loaded.config),
+                _ => None,
+            })
+            .expect("the file is re-read after the write");
+        assert_eq!(
+            reloaded.terminal.command,
+            "kitty tmux -S {socket} attach -t {session}"
+        );
+        assert_eq!(worker.config, *reloaded, "the worker adopts what it read");
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_edited_fails_without_touching_the_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.config_dir).expect("mkdir");
+        let file = worker.paths.config_file();
+        std::fs::write(&file, "[terminal\n").expect("write");
+
+        let messages = handle(
+            &mut worker,
+            Task::SaveConfig(vec![Edit::string(config_write::TERMINAL_COMMAND, "foot")]),
+        );
+        assert!(matches!(messages.as_slice(), [Message::Failed(_)]));
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "[terminal\n");
+    }
+
+    #[test]
+    fn probing_a_template_reports_its_program() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+
+        let messages = handle(
+            &mut worker,
+            Task::ProbeTerminal("sh -c {session}".to_string()),
+        );
+        match messages.as_slice() {
+            [
+                Message::TerminalProbed {
+                    command,
+                    program,
+                    found,
+                },
+            ] => {
+                assert_eq!(command, "sh -c {session}");
+                assert_eq!(program, "sh");
+                assert!(*found, "sh is on PATH everywhere Grove runs");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let messages = handle(
+            &mut worker,
+            Task::ProbeTerminal("grove-definitely-not-real -e tmux".to_string()),
+        );
+        match messages.as_slice() {
+            [Message::TerminalProbed { found, program, .. }] => {
+                assert_eq!(program, "grove-definitely-not-real");
+                assert!(!found);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probing_a_broken_template_finds_nothing_rather_than_guessing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        for command in ["   ", "foot 'unclosed"] {
+            match handle(&mut worker, Task::ProbeTerminal(command.to_string())).as_slice() {
+                [Message::TerminalProbed { found, program, .. }] => {
+                    assert!(!found);
+                    assert!(program.is_empty());
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_picker_opens_at_the_nearest_existing_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("worktrees");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let missing = dir.join("not-created-yet");
+
+        assert_eq!(picker_start_dir(Some(&dir)), Some(dir.as_path()));
+        assert_eq!(
+            picker_start_dir(Some(&missing)),
+            Some(dir.as_path()),
+            "a worktree path that does not exist yet opens in its parent"
+        );
+        assert_eq!(picker_start_dir(Some(Path::new("/nope/nope/nope"))), None);
+        assert_eq!(picker_start_dir(None), None);
+    }
+
+    /// Built without the feature there is no portal to ask, so the task is a
+    /// no-op and the typed field simply stays as the user left it. (With the
+    /// feature the picker needs a desktop portal, which a test run has not
+    /// got — that path is exercised by hand, see the smoke checklist.)
+    #[cfg(not(feature = "native-file-picker"))]
+    #[test]
+    fn without_the_feature_a_pick_request_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        assert_eq!(pick_directory(Some(tmp.path())), None);
+        let messages = handle(
+            &mut worker,
+            Task::PickDirectory {
+                target: PickTarget::ProjectPath,
+                start: Some(tmp.path().to_path_buf()),
+            },
+        );
+        assert!(messages.is_empty(), "unexpected {messages:?}");
+    }
 
     #[test]
     fn an_error_report_keeps_the_context_and_the_original_stderr() {

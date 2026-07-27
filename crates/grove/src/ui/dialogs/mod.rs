@@ -14,11 +14,14 @@ pub enum OpenProject {
     Idle,
     Cancelled,
     Confirmed(String),
+    /// Ask for the desktop's directory picker; the field stays typeable.
+    Browse,
 }
 
-/// Path entry for registering a project. A native folder picker would pull in
-/// a portal dependency; Milestone 1 takes a typed path, which the worker then
-/// validates with git.
+/// Path entry for registering a project. The path is always typeable — the
+/// worker validates it with git either way; with the `native-file-picker`
+/// feature a folder button additionally fills the field from the desktop's
+/// own portal dialog.
 pub fn open_project(ctx: &Context, path: &mut String) -> OpenProject {
     let mut outcome = OpenProject::Idle;
     let mut open = true;
@@ -36,12 +39,31 @@ pub fn open_project(ctx: &Context, path: &mut String) -> OpenProject {
                 theme::TEXT_MUTED,
             ));
             ui.add_space(8.0);
-            let field = ui.add(
-                egui::TextEdit::singleline(path)
-                    .hint_text("/home/you/projects/acme-web")
-                    .desired_width(f32::INFINITY),
-            );
-            field.request_focus();
+            let mut field = None;
+            ui.horizontal(|ui| {
+                let browse = super::NATIVE_FILE_PICKER;
+                let reserved = if browse {
+                    theme::ICON_BUTTON + 8.0
+                } else {
+                    0.0
+                };
+                let width = (ui.available_width() - reserved).max(120.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(path)
+                        .hint_text("/home/you/projects/acme-web")
+                        .desired_width(width),
+                );
+                response.request_focus();
+                field = Some(response);
+                if browse
+                    && super::icons::button(ui, true, super::icons::folder)
+                        .on_hover_text("Choose a directory")
+                        .clicked()
+                {
+                    outcome = OpenProject::Browse;
+                }
+            });
+            let Some(field) = field else { return };
             ui.add_space(6.0);
             ui.label(theme::label(
                 "Choosing a linked worktree registers its project.",

@@ -134,6 +134,8 @@ pub enum Outcome {
     Idle,
     Cancelled,
     Create(Box<WorktreeAdd>),
+    /// Ask for the desktop's directory picker; the field stays typeable.
+    Browse,
 }
 
 /// Draw the dialog.
@@ -176,14 +178,30 @@ pub fn show(ctx: &Context, form: &mut CreateForm) -> Outcome {
 
             ui.add_space(10.0);
             ui.label(theme::caption("Worktree directory"));
-            let path_field = ui.add(
-                egui::TextEdit::singleline(&mut form.path)
-                    .hint_text("/home/you/worktrees/feature-auth")
-                    .desired_width(f32::INFINITY),
-            );
-            if path_field.changed() {
-                form.path_edited = true;
-            }
+            ui.horizontal(|ui| {
+                let browse = crate::ui::NATIVE_FILE_PICKER;
+                let reserved = if browse {
+                    theme::ICON_BUTTON + 8.0
+                } else {
+                    0.0
+                };
+                let width = (ui.available_width() - reserved).max(120.0);
+                let path_field = ui.add(
+                    egui::TextEdit::singleline(&mut form.path)
+                        .hint_text("/home/you/worktrees/feature-auth")
+                        .desired_width(width),
+                );
+                if path_field.changed() {
+                    form.path_edited = true;
+                }
+                if browse
+                    && icons::button(ui, true, icons::folder)
+                        .on_hover_text("Choose a directory")
+                        .clicked()
+                {
+                    outcome = Outcome::Browse;
+                }
+            });
             if changed {
                 form.sync_path();
             }

@@ -214,6 +214,18 @@ pub fn cross(painter: &egui::Painter, rect: Rect, color: Color32) {
     path(painter, rect, &[(0.78, 0.22), (0.22, 0.78)], false, stroke);
 }
 
+/// A tick: "this executable was found on PATH", in the settings pane.
+pub fn check(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(line_width(rect).max(1.2), color);
+    path(
+        painter,
+        rect,
+        &[(0.18, 0.52), (0.42, 0.76), (0.84, 0.24)],
+        false,
+        stroke,
+    );
+}
+
 /// A warning triangle: the warning bullet in the removal dialog.
 pub fn warning(painter: &egui::Painter, rect: Rect, color: Color32) {
     let stroke = Stroke::new(line_width(rect).max(1.1), color);

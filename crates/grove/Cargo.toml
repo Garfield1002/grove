@@ -6,7 +6,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native-file-picker"]
+# The native directory picker. On Wayland `rfd` talks to xdg-desktop-portal,
+# so the dialog is the desktop's own. Building without it leaves every path
+# field typed by hand, which is the fallback in any case.
+native-file-picker = ["dep:rfd"]
+
 [dependencies]
 grove-core = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+rfd = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -9,6 +9,11 @@ pub mod theme;
 pub mod window_edge;
 pub mod worktree_row;
 
+/// Was the binary built with the native directory picker (`rfd`, which goes
+/// through xdg-desktop-portal on Wayland)? Without it every path is typed,
+/// which stays possible either way — the picker only fills the field in.
+pub const NATIVE_FILE_PICKER: bool = cfg!(feature = "native-file-picker");
+
 /// Something the user asked for in the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
