@@ -18,6 +18,7 @@ use grove_core::config_write::{self, Edit};
 use grove_core::git::{RefEntry, StatusSummary, WorktreeAdd};
 use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::process::Invocation;
+use grove_core::reconcile::{self, ProjectRef, Reconciliation};
 use grove_core::removal::RemovalReport;
 use grove_core::state::State;
 use grove_core::status::{SessionReport, SessionStatus};
@@ -45,6 +46,36 @@ pub enum Task {
     },
     /// Re-read session presence only.
     RefreshSessions,
+    /// Startup / refresh / restore reconciliation (ARCHITECTURE.md §7): diff
+    /// Grove's index against `git worktree list` and `tmux list-sessions`.
+    /// Marks; never deletes.
+    Reconcile {
+        projects: Vec<ProjectRef>,
+        /// Worktree ids `state.toml` has a session mapping for, so a session
+        /// that has gone can be reported as stopped.
+        recorded: Vec<String>,
+        /// Orphaned session names the user silenced.
+        ignored: Vec<String>,
+    },
+    /// Open an existing session by name — how an orphaned session is looked at
+    /// before the user decides what to do with it. Creates nothing.
+    OpenSession {
+        session: String,
+        /// Only used for the `{path}` template variable.
+        cwd: PathBuf,
+    },
+    /// Adopt an orphaned session as a worktree's session: rename and re-stamp
+    /// its `@grove_*` options. Nothing is created or killed.
+    AssociateSession {
+        project_name: String,
+        git_common_dir: PathBuf,
+        worktree: Box<Worktree>,
+        /// The orphan's current session name.
+        session: String,
+    },
+    /// Close an orphaned session, after its own confirmation. This is the
+    /// tmux-session operation of the four, and never accompanies another.
+    CloseOrphan { session: String },
     /// Unset `@grove_attention` on a session the user has just opened.
     ///
     /// The in-memory latch is cleared on the UI thread; this clears the
@@ -188,6 +219,22 @@ pub enum Message {
         statuses: HashMap<String, StatusSummary>,
     },
     SessionsRefreshed(HashMap<String, SessionPresence>),
+    /// One reconciliation pass: every project's rows, plus the orphaned
+    /// sessions the user is being offered a choice about.
+    Reconciled(Box<Reconciliation>),
+    /// An orphaned session was opened; nothing about the index changed.
+    SessionOpened {
+        activation: Activation,
+    },
+    /// An orphaned session was adopted by a worktree.
+    Associated {
+        worktree_id: String,
+        session: String,
+    },
+    /// An orphaned session was closed, on its own confirmation.
+    OrphanClosed {
+        session: String,
+    },
     /// An agent was started in a session's `agent` window.
     AgentStarted {
         worktree_id: String,
@@ -480,6 +527,73 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 Ok(_) => Vec::new(),
                 Err(e) => vec![Message::Failed(ErrorReport::new(
                     "could not clear the session's attention marker",
+                    &e,
+                ))],
+            }
+        }
+
+        Task::Reconcile {
+            projects,
+            recorded,
+            ignored,
+        } => match reconcile::reconcile_all(&worker.server, &projects, &recorded, &ignored) {
+            Ok(result) => {
+                // Statuses are a second pass, exactly as for a refresh: the
+                // restored list appears at once and the per-worktree
+                // `git status` calls never hold it up.
+                for project in &result.projects {
+                    if !project.worktrees.is_empty() {
+                        worker.enqueue(Task::RefreshStatuses {
+                            project_id: project.id.clone(),
+                            worktrees: project.worktrees.clone(),
+                        });
+                    }
+                }
+                vec![Message::Reconciled(Box::new(result))]
+            }
+            Err(e) => vec![Message::Failed(ErrorReport::new(
+                "could not reconcile with git and tmux",
+                &e,
+            ))],
+        },
+
+        Task::OpenSession { session, cwd } => {
+            match workflow::open_session(&worker.server, &worker.config, &session, &cwd) {
+                Ok(activation) => vec![Message::SessionOpened { activation }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not open {session}"),
+                    &e,
+                ))],
+            }
+        }
+
+        Task::AssociateSession {
+            project_name,
+            git_common_dir,
+            worktree,
+            session,
+        } => match workflow::associate_session(
+            &worker.server,
+            &project_name,
+            &git_common_dir,
+            &worktree,
+            &session,
+        ) {
+            Ok(name) => vec![Message::Associated {
+                worktree_id: worktree.id.clone(),
+                session: name,
+            }],
+            Err(e) => vec![Message::Failed(ErrorReport::new(
+                &format!("could not associate {session} with {}", worktree.label()),
+                &e,
+            ))],
+        },
+
+        Task::CloseOrphan { session } => {
+            match tmux::session::kill_session(&worker.server, &session) {
+                Ok(()) => vec![Message::OrphanClosed { session }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not close {session}"),
                     &e,
                 ))],
             }

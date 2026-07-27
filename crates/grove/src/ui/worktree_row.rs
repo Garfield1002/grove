@@ -22,6 +22,9 @@ pub enum RowAction {
 /// A quiet right-edge marker. Only ever built from something git reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Marker {
+    /// The worktree directory is gone (DESIGN.md §11). Nothing was removed —
+    /// the row is marked, and stays.
+    Unavailable,
     Locked,
     Detached,
     Dirty,
@@ -30,6 +33,7 @@ pub enum Marker {
 impl Marker {
     fn hint(self) -> &'static str {
         match self {
+            Marker::Unavailable => "the worktree directory is missing",
             Marker::Locked => "locked",
             Marker::Detached => "detached HEAD",
             Marker::Dirty => "uncommitted changes",
@@ -39,12 +43,13 @@ impl Marker {
     fn color(self) -> egui::Color32 {
         match self {
             Marker::Locked | Marker::Detached => theme::TEXT_MUTED,
-            Marker::Dirty => theme::WARNING,
+            Marker::Unavailable | Marker::Dirty => theme::WARNING,
         }
     }
 
     fn draw(self, painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         match self {
+            Marker::Unavailable => icons::warning(painter, rect, color),
             Marker::Locked => icons::lock(painter, rect, color),
             Marker::Detached => icons::unlink(painter, rect, color),
             Marker::Dirty => {
@@ -54,10 +59,10 @@ impl Marker {
     }
 }
 
-/// At most three markers, held inline so drawing a row allocates nothing.
+/// At most four markers, held inline so drawing a row allocates nothing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Markers {
-    items: [Option<Marker>; 3],
+    items: [Option<Marker>; 4],
 }
 
 impl Markers {
@@ -313,6 +318,9 @@ fn hover_lines(worktree: &Worktree) -> Vec<String> {
 /// Right-edge markers, worst first.
 fn markers(worktree: &Worktree) -> Markers {
     let mut markers = Markers::default();
+    if worktree.is_missing {
+        markers.push(Marker::Unavailable);
+    }
     if worktree.is_locked {
         markers.push(Marker::Locked);
     }
@@ -497,6 +505,35 @@ mod tests {
             hints,
             vec!["locked", "detached HEAD", "uncommitted changes"]
         );
+    }
+
+    /// A worktree whose directory has gone leads the markers: it is the one
+    /// that explains why nothing else on the row can be trusted.
+    #[test]
+    fn a_missing_worktree_is_marked_first() {
+        let mut worktree = worktree();
+        worktree.is_missing = true;
+        worktree.is_locked = true;
+        let hints: Vec<&str> = markers(&worktree).iter().map(Marker::hint).collect();
+        assert_eq!(hints, vec!["the worktree directory is missing", "locked"]);
+        assert!(
+            hover_lines(&worktree)
+                .iter()
+                .any(|line| line == "the worktree directory is missing")
+        );
+    }
+
+    #[test]
+    fn all_four_markers_fit_at_once() {
+        let mut worktree = worktree();
+        worktree.is_missing = true;
+        worktree.is_locked = true;
+        worktree.is_detached = true;
+        worktree.git_status = Some(StatusSummary {
+            modified: 1,
+            ..StatusSummary::default()
+        });
+        assert_eq!(markers(&worktree).iter().count(), 4);
     }
 
     #[test]

@@ -327,6 +327,7 @@ mod tests {
             default_worktree_path: PathBuf::from("/home/u/worktrees"),
             is_expanded: true,
             worktrees: Vec::new(),
+            unavailable: None,
         }
     }
 
