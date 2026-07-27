@@ -1,8 +1,8 @@
 # Grove — Handoff
 
-_Last updated: 2026-07-27. Repo state: branch `m4-agent-workflow` @ `3f5545a`
-(branched from `main` @ `5c9bd62`), working tree clean, all gates green
-(484 tests, clippy `-D warnings`, fmt, `--no-default-features` build)._
+_Last updated: 2026-07-27. Repo state: `main` @ `4bf830c`, working tree clean,
+all gates green — `just gate` (498 tests, clippy `-D warnings`, fmt,
+`--no-default-features` build)._
 
 ## What this is
 
@@ -24,7 +24,7 @@ Read in this order: [CLAUDE.md](../CLAUDE.md) (binding rules),
 | M2 — Worktree management (create worktree, refresh, git status sublabels, four-way safe removal with risk report) | **Done** |
 | M2.5 — Fresh paint (theme.rs, epaint icons, undecorated window, drag + edge-resize, editable Settings via `toml_edit`, feature-gated native file picker, detached dialog windows) | **Done** |
 | M3 — Persistence & restore (startup reconciliation, orphaned/missing handling, Restore UI) | **Not started** — the header Restore chip is a disabled placeholder |
-| M4 — Agent workflow | **Done** on branch `m4-agent-workflow` — see below |
+| M4 — Agent workflow | **Done** — see the breakdown below |
 
 ### M4 breakdown
 
@@ -45,8 +45,8 @@ Read in this order: [CLAUDE.md](../CLAUDE.md) (binding rules),
 
 Nothing in M4 is machine-verified GUI-side; see the smoke list below.
 
-Commit history is linear and each milestone landed as focused commits with
-tests; `git log --oneline` is a usable index. M4 is on a branch, not `main`.
+Commit history is linear on `main` and each milestone landed as focused
+commits with tests; `git log --oneline` is a usable index.
 
 ## Load-bearing decisions (full table in ARCHITECTURE.md §1)
 
@@ -119,7 +119,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-Tests: 484. Integration tests run real git in temp repos and real tmux on
+Tests: 498. Integration tests run real git in temp repos and real tmux on
 throwaway sockets in tempdirs (auto-killed by guard structs), and run the
 real `grove notify` binary against a temp `XDG_RUNTIME_DIR`. New features
 land with tests in the same commit.
@@ -159,10 +159,10 @@ land with tests in the same commit.
    inside a session), it clearing when the row is opened and *staying*
    clear across the next poll, the desktop notification firing once rather
    than every 2 s, "Start agent" opening an `agent` window, RAM/CPU in the
-   row tooltip when accounting is on, and the new Settings fields saving
+   row (selected) and tooltip when accounting is on, and the new Settings
+   fields saving
    without disturbing hand-written comments.
-4. **Merge `m4-agent-workflow` into `main`** once that passes.
-5. **Deferred small items**: window corner rounding
+4. **Deferred small items**: window corner rounding
    (mockup has 14 px radius; needs transparent viewport + manual shadow —
    consciously skipped); config hot-reload on external edits (mtime check
    on the poller — discussed, agreed as cheap, not yet implemented).
