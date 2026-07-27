@@ -197,6 +197,9 @@ pub enum Message {
     /// One poll of the status engine, keyed by worktree id. Sent by the
     /// poller thread, not by the worker.
     StatusPolled(HashMap<String, SessionReport>),
+    /// The git-status cadence elapsed. The poller cannot run git itself: it
+    /// has no worktree lists, so the UI turns this into per-project refreshes.
+    GitStatusDue,
     /// An explicit `grove notify` report arrived over the socket.
     Notified {
         worktree_id: String,

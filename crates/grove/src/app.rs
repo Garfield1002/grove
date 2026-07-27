@@ -202,6 +202,7 @@ impl GroveApp {
                     });
                     self.watch.send(Control::PollNow);
                 }
+                Message::GitStatusDue => self.refresh_git_statuses(),
                 Message::StatusPolled(statuses) => {
                     self.statuses = statuses;
                     self.apply_session_statuses();
@@ -348,6 +349,22 @@ impl GroveApp {
         // Presence just changed, so a row that lost its session must lose its
         // status with it rather than waiting for the next poll.
         self.apply_session_statuses();
+    }
+
+    /// Re-read every project's working-tree status, on the poller's cadence.
+    ///
+    /// Queued on the worker, never run here: this is one `git status` per
+    /// worktree.
+    fn refresh_git_statuses(&self) {
+        for project in &self.projects {
+            if project.worktrees.is_empty() {
+                continue;
+            }
+            self.workers.send(Task::RefreshStatuses {
+                project_id: project.id.clone(),
+                worktrees: project.worktrees.clone(),
+            });
+        }
     }
 
     /// Stamp the last polled statuses onto every row.

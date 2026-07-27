@@ -31,6 +31,21 @@ use crate::workers::{ErrorReport, Message};
 /// How often tmux is polled for session signals (ARCHITECTURE.md §1).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often git status is re-read. Five times cheaper than the tmux poll
+/// because it is five times more expensive: one `git status` per worktree,
+/// against one pair of tmux calls for the whole server.
+pub const GIT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a git-status refresh is due, given when the last one was.
+///
+/// Split out so the cadence is testable without waiting ten seconds.
+pub fn git_refresh_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= GIT_INTERVAL,
+    }
+}
+
 /// The status engine, shared by the poller, the listener and the UI.
 pub type SharedEngine = Arc<Mutex<StatusEngine>>;
 
@@ -87,6 +102,7 @@ impl StatusWatch {
             notify_desktop: StatusConfig::default().desktop_notifications,
             known: HashMap::new(),
             previous_usage: HashMap::new(),
+            last_git_refresh: None,
         };
         spawn("grove-poller", move || poller.run(control_rx));
 
@@ -147,6 +163,9 @@ struct Poller {
     /// The previous usage reading per worktree and when it was taken. CPU is a
     /// cumulative counter, so a percentage needs two readings.
     previous_usage: HashMap<String, (Usage, Instant)>,
+    /// When git status was last asked for. The poller only rings the bell;
+    /// the UI owns the worktree lists and the worker runs the git commands.
+    last_git_refresh: Option<Instant>,
 }
 
 impl Poller {
@@ -233,6 +252,11 @@ impl Poller {
             self.announce(&worktree_id, None);
         }
         self.emit(Message::StatusPolled(reports));
+
+        if git_refresh_due(self.last_git_refresh, now) {
+            self.last_git_refresh = Some(now);
+            self.emit(Message::GitStatusDue);
+        }
     }
 
     /// CPU percentage since this worktree's previous reading, recording the
@@ -373,6 +397,26 @@ mod tests {
             lock(&engine).is_latched("a1b2c3"),
             "status must survive a panic elsewhere"
         );
+    }
+
+    #[test]
+    fn git_refreshes_on_the_first_tick_then_on_its_own_cadence() {
+        let start = Instant::now();
+        assert!(
+            git_refresh_due(None, start),
+            "the first poll must not wait ten seconds for a status"
+        );
+        assert!(!git_refresh_due(Some(start), start));
+        // The tmux poll runs four more times before git does.
+        assert!(!git_refresh_due(
+            Some(start),
+            start + Duration::from_secs(8)
+        ));
+        assert!(git_refresh_due(Some(start), start + GIT_INTERVAL));
+        assert!(git_refresh_due(
+            Some(start),
+            start + Duration::from_secs(30)
+        ));
     }
 
     #[test]
