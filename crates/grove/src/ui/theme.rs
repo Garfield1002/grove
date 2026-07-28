@@ -190,6 +190,19 @@ pub fn label(text: impl Into<String>, size: f32, color: Color32) -> egui::RichTe
     egui::RichText::new(text).size(size).color(color)
 }
 
+/// Placeholder text for a field: the same size as what will be typed there,
+/// in the faint colour that says it is not a value.
+///
+/// Always use this for `TextEdit::hint_text`. A hint passed as a plain `&str`
+/// is coloured by `override_text_color` (`apply` sets it), which egui resolves
+/// *before* the weak colour it would otherwise paint the hint with — so the
+/// placeholder comes out looking exactly like typed text. A `RichText` with a
+/// colour of its own wins instead. No size or family is set here, so the hint
+/// keeps the font of the field it sits in.
+pub fn hint(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).color(TEXT_FAINT)
+}
+
 /// A section caption: small, uppercase-weight, muted.
 pub fn caption(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).size(FONT_CHIP).color(TEXT_MUTED)

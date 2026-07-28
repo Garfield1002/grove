@@ -168,7 +168,7 @@ pub fn body(ui: &mut Ui, form: &mut CreateForm) -> Outcome {
         changed |= ui
             .add(
                 egui::TextEdit::singleline(&mut form.branch)
-                    .hint_text("feature/auth")
+                    .hint_text(theme::hint("feature/auth"))
                     .desired_width(width),
             )
             .changed();
@@ -194,7 +194,7 @@ pub fn body(ui: &mut Ui, form: &mut CreateForm) -> Outcome {
         let field = (width - reserved).max(120.0);
         let path_field = ui.add(
             egui::TextEdit::singleline(&mut form.path)
-                .hint_text("/home/you/worktrees/feature-auth")
+                .hint_text(theme::hint("e.g. /home/you/worktrees/feature-auth"))
                 .desired_width(field),
         );
         if path_field.changed() {
@@ -265,7 +265,7 @@ fn base_ref_field(ui: &mut Ui, form: &mut CreateForm, row: f32) -> bool {
         changed = ui
             .add(
                 egui::TextEdit::singleline(&mut form.base_ref)
-                    .hint_text("main")
+                    .hint_text(theme::hint("main"))
                     .desired_width(width),
             )
             .changed();

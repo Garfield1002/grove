@@ -319,7 +319,9 @@ pub fn body(
                         .add(
                             egui::TextEdit::singleline(&mut form.terminal_command)
                                 .font(egui::FontId::monospace(theme::FONT_SMALL))
-                                .hint_text("foot tmux -S {socket} attach-session -t {session}")
+                                .hint_text(theme::hint(
+                                    "foot tmux -S {socket} attach-session -t {session}",
+                                ))
                                 .desired_width(width),
                         )
                         .changed()
@@ -380,7 +382,7 @@ pub fn body(
                         .add(
                             egui::TextEdit::singleline(&mut form.default_parent)
                                 .font(egui::FontId::monospace(theme::FONT_SMALL))
-                                .hint_text(hint_parent(home))
+                                .hint_text(theme::hint(hint_parent(home)))
                                 .desired_width(width),
                         )
                         .changed()
@@ -416,7 +418,7 @@ pub fn body(
                     .add(
                         egui::TextEdit::singleline(&mut form.agent_command)
                             .font(egui::FontId::monospace(theme::FONT_SMALL))
-                            .hint_text("claude")
+                            .hint_text(theme::hint("claude"))
                             .desired_width(fields),
                     )
                     .changed()
@@ -446,7 +448,7 @@ pub fn body(
                     .add(
                         egui::TextEdit::singleline(&mut form.resume_command)
                             .font(egui::FontId::monospace(theme::FONT_SMALL))
-                            .hint_text("claude --resume {agent_session}")
+                            .hint_text(theme::hint("claude --resume {agent_session}"))
                             .desired_width(fields),
                     )
                     .changed()

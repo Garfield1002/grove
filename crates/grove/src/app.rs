@@ -21,6 +21,7 @@ use grove_core::{Paths, state};
 use crate::status_watch::{Control, StatusWatch, WorktreeLabel};
 use crate::ui::chrome::Detached;
 use crate::ui::dialogs::create_worktree::CreateForm;
+use crate::ui::dialogs::open_project::OpenProjectForm;
 use crate::ui::dialogs::removal::{RemovalForm, Request};
 use crate::ui::{self, Action, theme};
 use crate::workers::{ErrorReport, Message, PickTarget, Task, Workers};
@@ -76,7 +77,6 @@ pub struct GroveApp {
     /// kill leaves Grove open with the error on screen.
     quit_after_kill: bool,
 
-    open_project_path: Option<String>,
     /// A worktree Grove just created, selected as soon as a refresh lists it.
     pending_selection: Option<(String, PathBuf)>,
     /// The number `grove toggle <n>` started this process for, opened as soon
@@ -86,8 +86,9 @@ pub struct GroveApp {
     /// pass per process: reconciliation also runs on refresh, on adopting an
     /// orphan and on closing one, and none of those is a restart.
     agents_resumed: bool,
-    /// The three detached windows. The main window is a narrow sliver, so
-    /// these render as their own toplevels (`ui::chrome`), one of each.
+    /// The detached windows. The main window is a narrow sliver, so these
+    /// render as their own toplevels (`ui::chrome`), one of each.
+    open_project: Detached<OpenProjectForm>,
     create: Detached<CreateForm>,
     removal: Detached<RemovalForm>,
     settings: Detached<ui::settings::Form>,
@@ -98,6 +99,7 @@ pub struct GroveApp {
 const SETTINGS_VIEWPORT: &str = "grove-settings-window";
 const CREATE_VIEWPORT: &str = "grove-create-worktree-window";
 const REMOVAL_VIEWPORT: &str = "grove-removal-window";
+const OPEN_PROJECT_VIEWPORT: &str = "grove-open-project-window";
 
 impl GroveApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, pending_toggle: Option<u8>) -> Self {
@@ -163,10 +165,10 @@ impl GroveApp {
             orphan_armed: None,
             shutdown_armed: false,
             quit_after_kill: false,
-            open_project_path: None,
             pending_selection: None,
             pending_toggle,
             agents_resumed: false,
+            open_project: Detached::default(),
             create: Detached::default(),
             removal: Detached::default(),
             settings: Detached::default(),
@@ -219,7 +221,7 @@ impl GroveApp {
                 Message::DirectoryPicked { target, path } => apply_picked(
                     target,
                     path,
-                    &mut self.open_project_path,
+                    &mut self.open_project,
                     &mut self.create,
                     &mut self.settings,
                 ),
@@ -1025,7 +1027,9 @@ impl GroveApp {
             // project id is derived from the git-common-dir.
             Action::LocateProject(id) => {
                 if let Some(project) = self.projects.iter().find(|p| p.id == id) {
-                    self.open_project_path = Some(project.repository_path.display().to_string());
+                    self.open_project.open(OpenProjectForm::at(
+                        project.repository_path.display().to_string(),
+                    ));
                     self.status = Some(format!(
                         "Point Grove at {} where it lives now.",
                         project.name
@@ -1251,6 +1255,48 @@ impl GroveApp {
     // `egui::Window` bodies did, and the worker plumbing is untouched: errors
     // still land in `self.errors` and are shown by the main window's strip.
 
+    fn open_project_window(&mut self, ctx: &egui::Context) {
+        use ui::dialogs::open_project::{self as open, Outcome};
+
+        let id = egui::ViewportId::from_hash_of(OPEN_PROJECT_VIEWPORT);
+        if self.open_project.take_focus_request() {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        let Some(form) = self.open_project.get_mut() else {
+            return;
+        };
+
+        let mut outcome = Outcome::Idle;
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            id,
+            ui::chrome::viewport(open::TITLE, open::SIZE, open::MIN_SIZE),
+            |ctx, class| {
+                let dialog =
+                    ui::chrome::show(ctx, class, open::TITLE, |ui| open::body(ui, &mut *form));
+                outcome = dialog.inner;
+                close |= dialog.close;
+            },
+        );
+
+        match outcome {
+            Outcome::Idle => {}
+            Outcome::Browse => self.workers.send(Task::PickDirectory {
+                target: PickTarget::ProjectPath,
+                start: pick_start(&form.path, self.home.as_deref()),
+            }),
+            Outcome::Cancelled => close = true,
+            Outcome::Confirmed(path) => {
+                self.status = Some(format!("Opening {path}…"));
+                self.workers.send(Task::OpenProject(PathBuf::from(path)));
+                close = true;
+            }
+        }
+        if close {
+            self.open_project.close();
+        }
+    }
+
     fn create_window(&mut self, ctx: &egui::Context) {
         use ui::dialogs::create_worktree::{self as create, Outcome};
 
@@ -1426,7 +1472,7 @@ impl GroveApp {
             return;
         }
 
-        if self.removal.is_open() || self.open_project_path.is_some() {
+        if self.removal.is_open() {
             return;
         }
         let (down, up, enter, remove, new, refresh) = ctx.input(|i| {
@@ -1540,11 +1586,7 @@ impl GroveApp {
                         egui::TextEdit::singleline(&mut self.filter)
                             .frame(false)
                             .font(egui::FontId::proportional(theme::FONT_BODY))
-                            .hint_text(theme::label(
-                                "Filter worktrees…",
-                                theme::FONT_BODY,
-                                theme::TEXT_FAINT,
-                            ))
+                            .hint_text(theme::hint("Filter worktrees…"))
                             .desired_width(f32::INFINITY),
                     );
                 });
@@ -1559,7 +1601,13 @@ impl GroveApp {
         ui.horizontal(|ui| {
             ui.set_min_height(theme::ICON_BUTTON);
             if open_project_entry(ui).clicked() {
-                self.open_project_path = Some(String::new());
+                // Like the gear: a second click raises the window already
+                // open rather than discarding what has been typed into it.
+                if self.open_project.is_open() {
+                    self.open_project.request_focus();
+                } else {
+                    self.open_project.open(OpenProjectForm::empty());
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui::icons::button(ui, true, ui::icons::gear)
@@ -1644,15 +1692,15 @@ fn pick_start(typed: &str, fallback: Option<&Path>) -> Option<PathBuf> {
 fn apply_picked(
     target: PickTarget,
     path: PathBuf,
-    open_project: &mut Option<String>,
+    open_project: &mut Detached<OpenProjectForm>,
     create: &mut Detached<CreateForm>,
     settings: &mut Detached<ui::settings::Form>,
 ) {
     let text = path.display().to_string();
     match target {
         PickTarget::ProjectPath => {
-            if let Some(field) = open_project {
-                *field = text;
+            if let Some(form) = open_project.get_mut() {
+                form.path = text;
             }
         }
         PickTarget::WorktreePath => {
@@ -1729,22 +1777,7 @@ impl eframe::App for GroveApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        if let Some(path) = &mut self.open_project_path {
-            match ui::dialogs::open_project(ctx, path) {
-                ui::dialogs::OpenProject::Idle => {}
-                ui::dialogs::OpenProject::Browse => self.workers.send(Task::PickDirectory {
-                    target: PickTarget::ProjectPath,
-                    start: pick_start(path, self.home.as_deref()),
-                }),
-                ui::dialogs::OpenProject::Cancelled => self.open_project_path = None,
-                ui::dialogs::OpenProject::Confirmed(path) => {
-                    self.open_project_path = None;
-                    self.status = Some(format!("Opening {path}…"));
-                    self.workers.send(Task::OpenProject(PathBuf::from(path)));
-                }
-            }
-        }
-
+        self.open_project_window(ctx);
         self.create_window(ctx);
         self.removal_window(ctx);
         self.settings_window(ctx);
@@ -2189,7 +2222,8 @@ mod tests {
 
     #[test]
     fn a_picked_directory_fills_in_the_field_that_asked_for_it() {
-        let mut open_project = Some(String::new());
+        let mut open_project = Detached::default();
+        open_project.open(OpenProjectForm::empty());
         let mut create = Detached::default();
         create.open(CreateForm::new(&project("p1", "acme", &[])));
         let mut settings = Detached::default();
@@ -2202,7 +2236,10 @@ mod tests {
             &mut create,
             &mut settings,
         );
-        assert_eq!(open_project.as_deref(), Some("/home/u/acme"));
+        assert_eq!(
+            open_project.get().map(|f| f.path.as_str()),
+            Some("/home/u/acme")
+        );
 
         apply_picked(
             PickTarget::WorktreePath,
@@ -2235,7 +2272,7 @@ mod tests {
     /// then has nowhere to go and must not panic.
     #[test]
     fn a_picked_directory_for_a_closed_dialog_is_dropped() {
-        let mut open_project = None;
+        let mut open_project: Detached<OpenProjectForm> = Detached::default();
         let mut create: Detached<CreateForm> = Detached::default();
         let mut settings: Detached<ui::settings::Form> = Detached::default();
         for target in [
@@ -2251,6 +2288,6 @@ mod tests {
                 &mut settings,
             );
         }
-        assert!(open_project.is_none() && !create.is_open() && !settings.is_open());
+        assert!(!open_project.is_open() && !create.is_open() && !settings.is_open());
     }
 }

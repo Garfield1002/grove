@@ -168,8 +168,9 @@ fidelity). Key elements beyond the original spec sketch:
   window manager's; Restore is Ctrl+R and the project menus, and opening a
   project is the footer's entry.
 
-The main window is a narrow vertical sliver, so the three large dialogs —
-**Settings**, **create worktree**, **safe removal** — are not drawn inside it.
+The main window is a narrow vertical sliver, so the dialogs — **Settings**,
+**create worktree**, **safe removal**, **open project** — are not drawn inside
+it.
 Each opens as its own toplevel via egui multi-viewport
 (`Context::show_viewport_immediate`, so a dialog keeps borrowing app state
 directly; deferred viewports would need `Arc<Mutex<…>>` for no benefit at this
@@ -179,7 +180,7 @@ as drag handle, `ui::window_edge` for resize, Esc / Ctrl+W / ✕ to close,
 Ctrl+Q to quit Grove from any window. Placement is
 the compositor's: Wayland toplevels are not positioned by the client. The error
 strip and status line stay in the main window; dialog failures keep flowing
-there. The small open-project prompt remains an in-window `egui::Window`.
+there.
 
 ## 6. Status model
 
