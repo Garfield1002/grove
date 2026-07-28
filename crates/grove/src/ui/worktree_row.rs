@@ -49,7 +49,9 @@ impl<'a> Stands<'a> {
         match self {
             Stands::Worktree => worktree.label(),
             Stands::Project(project) => project.name.clone(),
-            Stands::Window(window) => format!("{}: {}", window.index, window.name),
+            // No window index: the row is already nested under its worktree, and
+            // the index is tmux's bookkeeping, not something the user named.
+            Stands::Window(window) => window.label().to_string(),
         }
     }
 }
@@ -1161,6 +1163,7 @@ mod tests {
             name: name.into(),
             active,
             bell: false,
+            title: None,
         }
     }
 
@@ -1172,7 +1175,22 @@ mod tests {
         let window = window(2, "agent", true);
         assert_eq!(Stands::Worktree.name(&worktree), "feature/auth");
         assert_eq!(Stands::Project(&project).name(&worktree), "acme-web");
-        assert_eq!(Stands::Window(&window).name(&worktree), "2: agent");
+        assert_eq!(
+            Stands::Window(&window).name(&worktree),
+            "agent",
+            "a window row wears its label alone, without tmux's index"
+        );
+    }
+
+    /// A titled window is named after the title, index-free like any other.
+    #[test]
+    fn a_window_row_is_named_after_the_title_its_program_set() {
+        let mut window = window(1, "shell", true);
+        window.title = Some("✳ working on auth".into());
+        assert_eq!(
+            Stands::Window(&window).name(&worktree()),
+            "✳ working on auth"
+        );
     }
 
     /// A window row's dot reports that window, not the session as a whole:

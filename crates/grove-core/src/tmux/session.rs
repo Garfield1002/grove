@@ -282,6 +282,52 @@ pub fn set_option_args(session: &str, name: &str, value: &OsStr) -> Vec<OsString
     ]
 }
 
+/// Build one server-global `set-option -g <name> <value>` invocation.
+pub fn set_global_option_args(name: &str, value: &OsStr) -> Vec<OsString> {
+    vec![
+        OsString::from("set-option"),
+        OsString::from("-g"),
+        OsString::from(name),
+        value.to_os_string(),
+    ]
+}
+
+/// The title Grove asks tmux to put on the terminal emulator's own window.
+///
+/// The window part mirrors [`WindowInfo::label`] — the active pane's title
+/// unless it is still tmux's hostname default, else the window name — so the
+/// compositor's title bar and Grove's row agree on what a window is called. The
+/// project prefix comes from the session's own `@grove_project`, and drops out
+/// for a session that carries none.
+pub const TITLE_FORMAT: &str = concat!(
+    "#{?#{@grove_project},#{@grove_project} · ,}",
+    "#{?#{==:#{pane_title},#{host}},#{window_name},#{pane_title}}",
+);
+
+/// The server-global options that make the emulator's title track the selected
+/// tmux window, in order.
+///
+/// tmux ships `set-titles` off, so without these every worktree's terminal
+/// wears whatever its emulator derives from the command it launched (`tmux …`).
+/// Global on Grove's private server only: the user's own tmux is never touched.
+pub fn title_options() -> Vec<(&'static str, OsString)> {
+    vec![
+        ("set-titles", OsString::from("on")),
+        ("set-titles-string", OsString::from(TITLE_FORMAT)),
+    ]
+}
+
+/// Ask the server to title emulator windows after the selected tmux window.
+///
+/// Cosmetic, so a tmux that rejects either option leaves the title alone rather
+/// than failing the session the user asked for.
+pub fn set_titles(server: &TmuxServer) -> Result<()> {
+    for (name, value) in title_options() {
+        server.run_allow_failure(set_global_option_args(name, &value))?;
+    }
+    Ok(())
+}
+
 /// Build one `set-option -t <session> -u <name>` invocation, unsetting it.
 pub fn unset_option_args(session: &str, name: &str) -> Vec<OsString> {
     vec![
@@ -374,6 +420,9 @@ pub fn associate_session(
         server.run(rename_session_args(current_name, &name))?;
     }
     set_session_metadata(server, &name, spec)?;
+    // An adopted session may live on a server Grove did not start, which is the
+    // other way the title options can be missing.
+    set_titles(server)?;
     Ok(name)
 }
 
@@ -395,6 +444,10 @@ pub fn create_session(server: &TmuxServer, spec: &SessionSpec) -> Result<String>
     let name = spec.session_name();
     server.run(new_session_args(spec))?;
     set_session_metadata(server, &name, spec)?;
+    // The options are server-global and outlive this session, but the server
+    // itself may have just been started by that `new-session`, so they are set
+    // here rather than once at startup.
+    set_titles(server)?;
     Ok(name)
 }
 
@@ -467,6 +520,13 @@ pub struct PaneInfo {
     /// tmux is flagging a bell for this window. Unlike the session-wide alert,
     /// this says *which* window rang.
     pub window_bell: bool,
+    /// This is its window's active pane — the one whose title the window shows.
+    pub active: bool,
+    /// The title the program running here set, and empty when it set none.
+    /// tmux starts a pane's title off as the hostname, so the format asks tmux
+    /// to blank it when it still matches `#{host}`; Grove never has to guess at
+    /// what a default title looks like.
+    pub title: String,
 }
 
 /// A window of a session, as the tree lists it under a worktree.
@@ -480,6 +540,11 @@ pub struct WindowInfo {
     /// tmux rang a bell in this window and no client has looked at it yet.
     /// Grove treats that as "this one wants the user", per window.
     pub bell: bool,
+    /// The title the active pane's program set, when it set one. Agents like
+    /// Claude Code announce themselves by setting a title and never rename the
+    /// tmux window, so for a window still called `shell` this is the only thing
+    /// that says what is running in it.
+    pub title: Option<String>,
 }
 
 impl WindowInfo {
@@ -487,6 +552,23 @@ impl WindowInfo {
     pub fn target(&self) -> String {
         format!("{}:{}", self.session, self.index)
     }
+
+    /// What the tree calls this window: the running program's own title while
+    /// the window still carries the name Grove gave it, and the window name
+    /// once it has been renamed — a deliberate `rename-window` outranks a title
+    /// an application set in passing.
+    pub fn label(&self) -> &str {
+        match &self.title {
+            Some(title) if is_grove_window_name(&self.name) => title,
+            _ => &self.name,
+        }
+    }
+}
+
+/// Is this the name Grove itself gave a window at creation, rather than one a
+/// user or a script chose?
+fn is_grove_window_name(name: &str) -> bool {
+    name == SHELL_WINDOW || name == crate::agent::AGENT_WINDOW
 }
 
 /// Collapse a pane listing into the windows those panes live in.
@@ -500,7 +582,7 @@ pub fn windows_of(panes: &[PaneInfo]) -> Vec<WindowInfo> {
     let mut windows: std::collections::BTreeMap<(&str, u32), WindowInfo> =
         std::collections::BTreeMap::new();
     for pane in panes {
-        windows
+        let window = windows
             .entry((pane.session.as_str(), pane.window_index))
             .or_insert_with(|| WindowInfo {
                 session: pane.session.clone(),
@@ -508,7 +590,13 @@ pub fn windows_of(panes: &[PaneInfo]) -> Vec<WindowInfo> {
                 name: pane.window_name.clone(),
                 active: pane.window_active,
                 bell: pane.window_bell,
+                title: None,
             });
+        // A window wears the title of its active pane, so a split running
+        // something else in the background cannot relabel the row.
+        if pane.active && !pane.title.is_empty() {
+            window.title = Some(pane.title.clone());
+        }
     }
     windows.into_values().collect()
 }
@@ -517,6 +605,7 @@ const PANE_SOURCE: &str = "tmux list-panes";
 const PANE_FORMAT: &str = concat!(
     "#{session_name}\u{1}#{pane_pid}\u{1}#{pane_current_command}",
     "\u{1}#{window_index}\u{1}#{window_name}\u{1}#{window_active}\u{1}#{window_bell_flag}",
+    "\u{1}#{pane_active}\u{1}#{?#{==:#{pane_title},#{host}},,#{pane_title}}",
 );
 
 /// Parse the output of `list-panes -F` with [`PANE_FORMAT`].
@@ -536,7 +625,9 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             Some(window_name),
             Some(window_active),
             Some(window_bell),
+            Some(active),
         ) = (
+            fields.next(),
             fields.next(),
             fields.next(),
             fields.next(),
@@ -562,6 +653,9 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
                 format!("`{window_index}` is not a window index"),
             )
         })?;
+        // The title comes last and is program-controlled text: keep whatever is
+        // left of the line, separators and all, rather than cutting it short.
+        let title = fields.collect::<Vec<_>>().join(&SEP.to_string());
         panes.push(PaneInfo {
             session: session.to_string(),
             pid,
@@ -570,6 +664,8 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             window_name: window_name.to_string(),
             window_active: window_active.trim() == "1",
             window_bell: window_bell.trim() == "1",
+            active: active.trim() == "1",
+            title,
         });
     }
     Ok(panes)
@@ -914,8 +1010,8 @@ mod tests {
 
     #[test]
     fn parses_a_pane_listing() {
-        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n\
-                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\u{1}1\n";
+        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n\
+                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\u{1}1\u{1}0\u{1}building\n";
         let panes = parse_panes(text).expect("valid");
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].session, "wt-a1b2c3");
@@ -925,18 +1021,33 @@ mod tests {
         assert_eq!(panes[0].window_name, "shell");
         assert!(panes[0].window_active);
         assert!(!panes[0].window_bell);
+        assert!(panes[0].active);
+        assert_eq!(panes[0].title, "", "tmux blanks a default title for us");
         assert_eq!(panes[1].command, "cargo");
         assert_eq!(panes[1].window_index, 1);
         assert_eq!(panes[1].window_name, "agent");
         assert!(!panes[1].window_active);
         assert!(panes[1].window_bell, "the second window rang");
+        assert!(!panes[1].active);
+        assert_eq!(panes[1].title, "building");
     }
 
     #[test]
     fn a_window_name_may_hold_spaces_and_colons() {
-        let panes = parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\u{1}0\n")
-            .expect("valid");
+        let panes =
+            parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\u{1}0\u{1}1\u{1}\n")
+                .expect("valid");
         assert_eq!(panes[0].window_name, "notes: draft");
+    }
+
+    /// A title is program-controlled text, so the parser keeps the rest of the
+    /// line whole instead of stopping at a separator inside it.
+    #[test]
+    fn a_pane_title_keeps_the_rest_of_its_line() {
+        let panes =
+            parse_panes("wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}a\u{1}b\n")
+                .expect("valid");
+        assert_eq!(panes[0].title, "a\u{1}b");
     }
 
     #[test]
@@ -953,24 +1064,25 @@ mod tests {
 
     #[test]
     fn rejects_a_non_numeric_pid() {
-        let err = parse_panes("wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n")
-            .expect_err("bad pid");
+        let err =
+            parse_panes("wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n")
+                .expect_err("bad pid");
         assert!(err.reason.contains("is not a pid"));
     }
 
     #[test]
     fn rejects_a_non_numeric_window_index() {
-        let err = parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\u{1}0\n")
+        let err = parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n")
             .expect_err("bad window index");
         assert!(err.reason.contains("is not a window index"));
     }
 
     #[test]
     fn panes_collapse_into_their_windows() {
-        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n\
-                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\u{1}0\n\
-                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\u{1}1\n\
-                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\n";
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n\
+                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}0\u{1}\n\
+                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\u{1}1\u{1}1\u{1}\n\
+                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows.len(), 3, "two panes of window 0 are one window");
         assert_eq!(windows[0].target(), "wt-a1b2c3:0");
@@ -987,6 +1099,73 @@ mod tests {
     #[test]
     fn windows_of_no_panes_is_empty() {
         assert!(windows_of(&[]).is_empty());
+    }
+
+    /// An agent sets a terminal title and leaves the tmux window name alone, so
+    /// a window Grove called `shell` is labelled by that title instead.
+    #[test]
+    fn a_window_wears_the_title_its_active_pane_set() {
+        let text = "wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}✳ grove\n";
+        let windows = windows_of(&parse_panes(text).expect("valid"));
+        assert_eq!(windows[0].title.as_deref(), Some("✳ grove"));
+        assert_eq!(windows[0].label(), "✳ grove");
+    }
+
+    #[test]
+    fn a_window_with_no_title_keeps_its_name() {
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n";
+        let windows = windows_of(&parse_panes(text).expect("valid"));
+        assert_eq!(windows[0].title, None);
+        assert_eq!(windows[0].label(), "shell");
+    }
+
+    /// Only the active pane names the window: a background split running
+    /// something else must not relabel the row.
+    #[test]
+    fn a_background_pane_does_not_name_its_window() {
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}0\u{1}htop\n\
+                    wt-a1b2c3\u{1}2\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}✳ grove\n";
+        let windows = windows_of(&parse_panes(text).expect("valid"));
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label(), "✳ grove");
+    }
+
+    /// A window someone renamed keeps that name: a deliberate `rename-window`
+    /// outranks a title an application set in passing.
+    #[test]
+    fn a_renamed_window_outranks_a_pane_title() {
+        let text = "wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}notes\u{1}1\u{1}0\u{1}1\u{1}✳ grove\n";
+        let windows = windows_of(&parse_panes(text).expect("valid"));
+        assert_eq!(windows[0].label(), "notes");
+    }
+
+    #[test]
+    fn the_title_options_are_set_on_the_whole_server() {
+        let args: Vec<Vec<String>> = title_options()
+            .iter()
+            .map(|(name, value)| {
+                set_global_option_args(name, value)
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(args[0], ["set-option", "-g", "set-titles", "on"]);
+        assert_eq!(args[1][..3], ["set-option", "-g", "set-titles-string"]);
+        assert_eq!(args[1][3], TITLE_FORMAT, "the format goes over as one word");
+    }
+
+    /// The emulator's title and Grove's own row must not disagree about what a
+    /// window is called, so both read the pane title the same way.
+    #[test]
+    fn the_title_format_prefers_a_pane_title_like_a_row_does() {
+        assert!(
+            TITLE_FORMAT.contains("#{?#{==:#{pane_title},#{host}},#{window_name},#{pane_title}}")
+        );
+        assert!(
+            !TITLE_FORMAT.contains("#{window_index}"),
+            "the index means nothing outside Grove's own tree"
+        );
     }
 
     #[test]

@@ -9,5 +9,5 @@ pub use server::TmuxServer;
 pub use session::{
     PaneInfo, SessionInfo, SessionMetadata, SessionSpec, WindowInfo, associate_session,
     ensure_session, has_session, kill_session, list_panes, list_sessions, select_window,
-    windows_of,
+    set_titles, windows_of,
 };

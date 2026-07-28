@@ -163,6 +163,19 @@ fidelity). Key elements beyond the original spec sketch:
   "waiting for permission"), git summary ("clean · idle 2h", `+3 −1`), or
   "no session" with an inline **start** affordance;
 - per-project worktree-count badges on collapsed rows;
+- window rows are labelled by the title their active pane set, with no tmux
+  window index in front of it — the row is already nested under its worktree
+  (agents like Claude Code set a terminal title and
+  never rename the tmux window, so a window Grove created as `shell` would
+  otherwise say nothing about what runs in it). tmux blanks a pane's default
+  title for us by comparing it with `#{host}` in the format, and a window
+  anyone has renamed keeps its name: a deliberate `rename-window` outranks a
+  title an application set in passing. The terminal emulator's own title bar
+  says the same thing: creating or adopting a session sets `set-titles on` and
+  a `set-titles-string` with that precedence (plus the session's
+  `@grove_project`) on Grove's private server, so kitty or foot reads
+  `acme-web · working on auth` instead of `tmux`. Server-global, private
+  socket only — the user's own tmux is untouched;
 - a filter field as the whole header. The main window wears the compositor's
   title bar, so the app name, the drag handle and the close button are the
   window manager's; Restore is Ctrl+R and the project menus, and opening a

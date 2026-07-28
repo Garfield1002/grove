@@ -534,6 +534,7 @@ mod tests {
             name: "shell".into(),
             active: index == 0,
             bell: false,
+            title: None,
         }
     }
 

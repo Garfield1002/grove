@@ -761,6 +761,7 @@ mod tests {
             name: name.to_string(),
             active: index == 0,
             bell: false,
+            title: None,
         }
     }
 

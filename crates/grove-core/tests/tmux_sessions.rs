@@ -1051,6 +1051,121 @@ fn lists_the_panes_of_a_session_with_their_processes() {
     );
 }
 
+/// A real program setting a terminal title labels its window, since tmux leaves
+/// the window name alone when an application sets a title.
+#[test]
+fn a_pane_title_labels_its_window() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    let (name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+
+    // The shell window starts out with no title of its own: tmux reports the
+    // hostname there, which the format blanks.
+    let windows = tmux::windows_of(&tmux::list_panes(&test.server, &name).expect("lists panes"));
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].title, None, "a fresh pane has no title");
+    assert_eq!(windows[0].label(), "shell");
+
+    // A window whose program announces itself the way an agent does.
+    test.server
+        .run([
+            "new-window".to_string(),
+            "-t".to_string(),
+            name.clone(),
+            "-n".to_string(),
+            "shell".to_string(),
+            r"printf '\033]2;working on auth\033\\'; sleep 30".to_string(),
+        ])
+        .expect("opens a titled window");
+
+    // Not immediately: the title only lands once the pane has run the printf.
+    let labelled = wait_for(|| {
+        let windows =
+            tmux::windows_of(&tmux::list_panes(&test.server, &name).expect("lists panes"));
+        windows
+            .iter()
+            .find(|w| w.label() == "working on auth")
+            .cloned()
+    });
+    let labelled = labelled.expect("the pane's title never reached the window listing");
+    assert_eq!(labelled.name, "shell", "tmux keeps the window name");
+    assert_eq!(labelled.title.as_deref(), Some("working on auth"));
+}
+
+/// Creating a session leaves the server titling emulator windows after the
+/// selected tmux window, so kitty/foot's own title bar says what Grove's row
+/// says instead of just `tmux`.
+#[test]
+fn a_session_teaches_the_server_to_title_terminal_windows() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    let (name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+
+    let on = test
+        .server
+        .run([
+            "show-options".to_string(),
+            "-g".to_string(),
+            "set-titles".to_string(),
+        ])
+        .expect("reads the option");
+    assert_eq!(on.trim(), "set-titles on", "tmux ships this off");
+
+    // `#{E:…}` expands the option the way tmux does when it sets the title.
+    let title = test
+        .server
+        .run([
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            name.clone(),
+            "#{E:set-titles-string}".to_string(),
+        ])
+        .expect("expands the title");
+    assert_eq!(
+        title.trim(),
+        "acme-web · shell",
+        "the project and the same label the row shows"
+    );
+
+    // And a window whose program set a title titles the emulator with it.
+    test.server
+        .run([
+            "new-window".to_string(),
+            "-t".to_string(),
+            name.clone(),
+            "-n".to_string(),
+            "shell".to_string(),
+            r"printf '\033]2;working on auth\033\\'; sleep 30".to_string(),
+        ])
+        .expect("opens a titled window");
+    let titled = wait_for(|| {
+        let title = test
+            .server
+            .run([
+                "display-message".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                name.clone(),
+                "#{E:set-titles-string}".to_string(),
+            ])
+            .expect("expands the title");
+        (title.trim() == "acme-web · working on auth").then(|| title.trim().to_string())
+    });
+    assert!(
+        titled.is_some(),
+        "the pane's title never reached the emulator title"
+    );
+}
+
 /// The removal risk report, assembled from a real session.
 #[test]
 fn a_real_session_appears_in_the_removal_report() {
