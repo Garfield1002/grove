@@ -82,6 +82,21 @@ The field at the top filters the list as you type.
 Right-click a row for the rest: open in a new terminal, add a tmux window,
 start an agent, refresh, remove.
 
+## Automation
+
+Grove exposes its current projects, Git worktrees, and live sessions as
+versioned JSON:
+
+```bash
+grove project list
+grove worktree list
+grove session list
+```
+
+These commands are read-only. Worktree discovery reads Git as the source of
+truth, session discovery reads Grove's private tmux server, and an unavailable
+repository is reported without hiding healthy projects from the response.
+
 ## Reaching a worktree from anywhere
 
 Grove cannot bind a desktop shortcut itself, so it provides a command to bind:

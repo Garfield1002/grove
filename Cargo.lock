@@ -1137,6 +1137,7 @@ dependencies = [
  "grove-core",
  "image",
  "rfd",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
 ]
