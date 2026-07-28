@@ -461,7 +461,9 @@ pub fn poll_session_signals(
         let mut signal = session.signals(now_epoch, commands);
         signal.usage = usage;
         signal.windows = windows;
-        signals.insert(worktree_id, signal);
+        // tmux's session-wide stamp only follows the current window, so the
+        // windows themselves are what says whether anything here is busy.
+        signals.insert(worktree_id, signal.with_window_activity(now_epoch));
     }
     Ok(signals)
 }
@@ -762,6 +764,9 @@ mod tests {
             active: index == 0,
             bell: false,
             title: None,
+            activity_epoch: None,
+            commands: Vec::new(),
+            status: None,
         }
     }
 

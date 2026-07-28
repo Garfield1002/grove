@@ -310,7 +310,8 @@ impl Poller {
     }
 
     fn tick(&mut self) {
-        let signals = match workflow::poll_session_signals(&self.server, workflow::now_epoch()) {
+        let now_epoch = workflow::now_epoch();
+        let mut signals = match workflow::poll_session_signals(&self.server, now_epoch) {
             Ok(signals) => signals,
             Err(e) => {
                 self.report(&e);
@@ -332,7 +333,10 @@ impl Poller {
             // Latches for worktrees whose sessions are gone would otherwise
             // accumulate for the life of the process.
             engine.retain_ids(|id| signals.contains_key(id));
-            for (worktree_id, signal) in &signals {
+            for (worktree_id, signal) in &mut signals {
+                // Each window is judged on its own activity, so a busy agent
+                // cannot make the empty shell beside it look busy too.
+                engine.observe_windows(worktree_id, &mut signal.windows, now_epoch);
                 let status = engine.observe(worktree_id, signal);
                 if status == SessionStatus::Attention
                     && self.known.get(worktree_id) != Some(&SessionStatus::Attention)

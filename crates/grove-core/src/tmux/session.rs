@@ -520,6 +520,9 @@ pub struct PaneInfo {
     /// tmux is flagging a bell for this window. Unlike the session-wide alert,
     /// this says *which* window rang.
     pub window_bell: bool,
+    /// `#{window_activity}`: seconds since the epoch of the last activity in
+    /// this window, or `None` when tmux reported nothing usable.
+    pub window_activity_epoch: Option<u64>,
     /// This is its window's active pane — the one whose title the window shows.
     pub active: bool,
     /// The title the program running here set, and empty when it set none.
@@ -545,6 +548,20 @@ pub struct WindowInfo {
     /// tmux window, so for a window still called `shell` this is the only thing
     /// that says what is running in it.
     pub title: Option<String>,
+    /// `#{window_activity}` for this window, or `None` when tmux reported
+    /// nothing usable.
+    ///
+    /// Per window on purpose. `#{session_activity}` cannot answer "is *this*
+    /// window busy": it tracks the session's current window, so it both paints
+    /// every quiet window with its neighbour's work and misses work happening
+    /// in a window nobody is looking at.
+    pub activity_epoch: Option<u64>,
+    /// `pane_current_command` for this window's own panes.
+    pub commands: Vec<String>,
+    /// What the poller concluded about this window, and `None` for a window
+    /// listing built outside a poll (opening a window, the removal dialog):
+    /// deciding needs a clock and the user's status policy, which live there.
+    pub status: Option<crate::status::SessionStatus>,
 }
 
 impl WindowInfo {
@@ -591,12 +608,18 @@ pub fn windows_of(panes: &[PaneInfo]) -> Vec<WindowInfo> {
                 active: pane.window_active,
                 bell: pane.window_bell,
                 title: None,
+                activity_epoch: pane.window_activity_epoch,
+                commands: Vec::new(),
+                status: None,
             });
         // A window wears the title of its active pane, so a split running
         // something else in the background cannot relabel the row.
         if pane.active && !pane.title.is_empty() {
             window.title = Some(pane.title.clone());
         }
+        // Every pane's command, so "is an agent running in this window" is a
+        // question about the window and not about the whole session.
+        window.commands.push(pane.command.clone());
     }
     windows.into_values().collect()
 }
@@ -605,6 +628,7 @@ const PANE_SOURCE: &str = "tmux list-panes";
 const PANE_FORMAT: &str = concat!(
     "#{session_name}\u{1}#{pane_pid}\u{1}#{pane_current_command}",
     "\u{1}#{window_index}\u{1}#{window_name}\u{1}#{window_active}\u{1}#{window_bell_flag}",
+    "\u{1}#{window_activity}",
     "\u{1}#{pane_active}\u{1}#{?#{==:#{pane_title},#{host}},,#{pane_title}}",
 );
 
@@ -625,8 +649,10 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             Some(window_name),
             Some(window_active),
             Some(window_bell),
+            Some(window_activity),
             Some(active),
         ) = (
+            fields.next(),
             fields.next(),
             fields.next(),
             fields.next(),
@@ -664,6 +690,10 @@ pub fn parse_panes(output: &str) -> std::result::Result<Vec<PaneInfo>, ParseErro
             window_name: window_name.to_string(),
             window_active: window_active.trim() == "1",
             window_bell: window_bell.trim() == "1",
+            // An unusable stamp costs this window its "working" hint for one
+            // poll, exactly as at session level; it is not worth failing the
+            // whole listing over.
+            window_activity_epoch: window_activity.trim().parse::<u64>().ok(),
             active: active.trim() == "1",
             title,
         });
@@ -1010,8 +1040,8 @@ mod tests {
 
     #[test]
     fn parses_a_pane_listing() {
-        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n\
-                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\u{1}1\u{1}0\u{1}building\n";
+        let text = "wt-a1b2c3\u{1}4242\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n\
+                    wt-a1b2c3\u{1}4343\u{1}cargo\u{1}1\u{1}agent\u{1}0\u{1}1\u{1}1700000000\u{1}0\u{1}building\n";
         let panes = parse_panes(text).expect("valid");
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].session, "wt-a1b2c3");
@@ -1035,7 +1065,7 @@ mod tests {
     #[test]
     fn a_window_name_may_hold_spaces_and_colons() {
         let panes =
-            parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\u{1}0\u{1}1\u{1}\n")
+            parse_panes("wt-a1b2c3\u{1}1\u{1}nvim\u{1}2\u{1}notes: draft\u{1}0\u{1}0\u{1}1700000000\u{1}1\u{1}\n")
                 .expect("valid");
         assert_eq!(panes[0].window_name, "notes: draft");
     }
@@ -1045,7 +1075,7 @@ mod tests {
     #[test]
     fn a_pane_title_keeps_the_rest_of_its_line() {
         let panes =
-            parse_panes("wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}a\u{1}b\n")
+            parse_panes("wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}a\u{1}b\n")
                 .expect("valid");
         assert_eq!(panes[0].title, "a\u{1}b");
     }
@@ -1064,25 +1094,28 @@ mod tests {
 
     #[test]
     fn rejects_a_non_numeric_pid() {
-        let err =
-            parse_panes("wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n")
-                .expect_err("bad pid");
+        let err = parse_panes(
+            "wt-a1b2c3\u{1}none\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n",
+        )
+        .expect_err("bad pid");
         assert!(err.reason.contains("is not a pid"));
     }
 
     #[test]
     fn rejects_a_non_numeric_window_index() {
-        let err = parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n")
-            .expect_err("bad window index");
+        let err = parse_panes(
+            "wt-a1b2c3\u{1}1\u{1}bash\u{1}x\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n",
+        )
+        .expect_err("bad window index");
         assert!(err.reason.contains("is not a window index"));
     }
 
     #[test]
     fn panes_collapse_into_their_windows() {
-        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n\
-                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}0\u{1}\n\
-                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\u{1}1\u{1}1\u{1}\n\
-                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n";
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n\
+                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}0\u{1}\n\
+                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\u{1}1\u{1}1700000000\u{1}1\u{1}\n\
+                    wt-ddeeff\u{1}4\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows.len(), 3, "two panes of window 0 are one window");
         assert_eq!(windows[0].target(), "wt-a1b2c3:0");
@@ -1096,6 +1129,34 @@ mod tests {
         assert_eq!(windows[2].session, "wt-ddeeff");
     }
 
+    /// Each window carries its own activity stamp and its own pane commands:
+    /// "is this window busy" must not be answerable only session-wide.
+    #[test]
+    fn a_window_carries_its_own_activity_and_commands() {
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n\
+                    wt-a1b2c3\u{1}2\u{1}vim\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}0\u{1}\n\
+                    wt-a1b2c3\u{1}3\u{1}claude\u{1}1\u{1}agent\u{1}0\u{1}0\u{1}1700000042\u{1}1\u{1}\n";
+        let windows = windows_of(&parse_panes(text).expect("valid"));
+        assert_eq!(windows[0].activity_epoch, Some(1_700_000_000));
+        assert_eq!(windows[0].commands, ["bash", "vim"], "both of its panes");
+        assert_eq!(windows[1].activity_epoch, Some(1_700_000_042));
+        assert_eq!(windows[1].commands, ["claude"]);
+        assert!(
+            windows.iter().all(|w| w.status.is_none()),
+            "windows_of has no clock and no policy: judging is the poller's"
+        );
+    }
+
+    /// A stamp tmux could not give is unknown, not "just now".
+    #[test]
+    fn an_unusable_window_activity_stamp_is_not_an_error() {
+        let panes =
+            parse_panes("wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}\u{1}1\u{1}\n")
+                .expect("valid");
+        assert_eq!(panes[0].window_activity_epoch, None);
+        assert_eq!(windows_of(&panes)[0].activity_epoch, None);
+    }
+
     #[test]
     fn windows_of_no_panes_is_empty() {
         assert!(windows_of(&[]).is_empty());
@@ -1105,7 +1166,7 @@ mod tests {
     /// a window Grove called `shell` is labelled by that title instead.
     #[test]
     fn a_window_wears_the_title_its_active_pane_set() {
-        let text = "wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}✳ grove\n";
+        let text = "wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}✳ grove\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows[0].title.as_deref(), Some("✳ grove"));
         assert_eq!(windows[0].label(), "✳ grove");
@@ -1113,7 +1174,8 @@ mod tests {
 
     #[test]
     fn a_window_with_no_title_keeps_its_name() {
-        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}\n";
+        let text =
+            "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows[0].title, None);
         assert_eq!(windows[0].label(), "shell");
@@ -1123,8 +1185,8 @@ mod tests {
     /// something else must not relabel the row.
     #[test]
     fn a_background_pane_does_not_name_its_window() {
-        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}0\u{1}htop\n\
-                    wt-a1b2c3\u{1}2\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1\u{1}✳ grove\n";
+        let text = "wt-a1b2c3\u{1}1\u{1}bash\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}0\u{1}htop\n\
+                    wt-a1b2c3\u{1}2\u{1}node\u{1}0\u{1}shell\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}✳ grove\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label(), "✳ grove");
@@ -1134,7 +1196,7 @@ mod tests {
     /// outranks a title an application set in passing.
     #[test]
     fn a_renamed_window_outranks_a_pane_title() {
-        let text = "wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}notes\u{1}1\u{1}0\u{1}1\u{1}✳ grove\n";
+        let text = "wt-a1b2c3\u{1}1\u{1}node\u{1}0\u{1}notes\u{1}1\u{1}0\u{1}1700000000\u{1}1\u{1}✳ grove\n";
         let windows = windows_of(&parse_panes(text).expect("valid"));
         assert_eq!(windows[0].label(), "notes");
     }

@@ -535,6 +535,9 @@ mod tests {
             active: index == 0,
             bell: false,
             title: None,
+            activity_epoch: None,
+            commands: Vec::new(),
+            status: None,
         }
     }
 

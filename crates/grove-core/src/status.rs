@@ -138,8 +138,30 @@ pub struct SessionSignals {
     /// UI shows as nothing rather than as zero.
     pub usage: Option<crate::cgroup::Usage>,
     /// The session's windows, carried along because the poll already lists
-    /// every pane. Not a status signal: the tree renders these as child rows.
+    /// every pane. The tree renders these as child rows, and each carries the
+    /// activity stamp its own status is decided from.
     pub windows: Vec<crate::tmux::WindowInfo>,
+}
+
+impl SessionSignals {
+    /// Fold the windows' own activity stamps into the session's.
+    ///
+    /// `#{session_activity}` follows the session's *current* window only, so a
+    /// session whose agent works in a window nobody is looking at reads as idle
+    /// however much it prints. A session is as fresh as its freshest window.
+    pub fn with_window_activity(mut self, now_epoch: u64) -> Self {
+        let freshest = self
+            .windows
+            .iter()
+            .filter_map(|window| window.activity_epoch)
+            .map(|epoch| activity_age(now_epoch, epoch))
+            .min();
+        self.activity_age = match (self.activity_age, freshest) {
+            (Some(session), Some(window)) => Some(session.min(window)),
+            (session, window) => session.or(window),
+        };
+        self
+    }
 }
 
 /// Age of an activity timestamp, in whole seconds since the epoch.
@@ -192,6 +214,47 @@ pub fn classify_as(
         return SessionStatus::Working;
     }
     SessionStatus::Idle
+}
+
+/// The status of a single window, from that window's own facts.
+///
+/// The same rule as a session's, asked of one window: recent activity in *this*
+/// window, or a known agent process among *this* window's panes. Attention is
+/// not decided here — it comes from an explicit report, which names its window
+/// itself (`crate::model::Worktree::window_status`).
+pub fn classify_window(
+    activity_age: Option<Duration>,
+    commands: &[String],
+    policy: &StatusPolicy,
+    reporting: Reporting,
+) -> SessionStatus {
+    let recently_active = activity_age.is_some_and(|age| age <= policy.working_window);
+    let agent_running = reporting == Reporting::Silent && policy.agent_running(commands);
+    if recently_active || agent_running {
+        return SessionStatus::Working;
+    }
+    SessionStatus::Idle
+}
+
+/// Stamp every window of one session with its own status.
+///
+/// Without this a window row can only repeat the session's status, which paints
+/// an empty shell as working because the agent beside it is busy. A window whose
+/// activity stamp tmux did not report keeps `None` rather than being called
+/// idle: unknown is not quiet.
+pub fn classify_windows(
+    windows: &mut [crate::tmux::WindowInfo],
+    now_epoch: u64,
+    policy: &StatusPolicy,
+    reporting: Reporting,
+) {
+    for window in windows {
+        let age = window.activity_epoch.map(|e| activity_age(now_epoch, e));
+        window.status = match (age, window.commands.is_empty()) {
+            (None, true) => None,
+            _ => Some(classify_window(age, &window.commands, policy, reporting)),
+        };
+    }
 }
 
 /// What one poll concluded about a session: its status, and the resource
@@ -273,6 +336,22 @@ impl StatusEngine {
         observed
     }
 
+    /// Stamp one session's windows with their own statuses, under the same
+    /// policy and reporting rule the session itself is judged by.
+    pub fn observe_windows(
+        &self,
+        worktree_id: &str,
+        windows: &mut [crate::tmux::WindowInfo],
+        now_epoch: u64,
+    ) {
+        classify_windows(
+            windows,
+            now_epoch,
+            &self.policy,
+            self.reporting(worktree_id),
+        );
+    }
+
     /// Record an explicit `grove notify` report.
     ///
     /// Only `attention` is sticky. A `working` or `idle` report is a hint that
@@ -335,6 +414,123 @@ mod tests {
             activity_age: Some(Duration::from_secs(600)),
             ..SessionSignals::default()
         }
+    }
+
+    fn window(
+        index: u32,
+        activity_epoch: Option<u64>,
+        commands: &[&str],
+    ) -> crate::tmux::WindowInfo {
+        crate::tmux::WindowInfo {
+            session: "wt-a1b2c3".into(),
+            index,
+            name: "shell".into(),
+            active: index == 0,
+            bell: false,
+            title: None,
+            activity_epoch,
+            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            status: None,
+        }
+    }
+
+    /// The bug this exists for: an agent working in one window used to paint
+    /// the empty shell beside it as working too, because the only activity
+    /// stamp anyone looked at was the session's.
+    #[test]
+    fn a_quiet_window_beside_a_busy_one_is_idle() {
+        let now = 1_700_000_100;
+        let mut windows = vec![
+            window(0, Some(now - 600), &["bash"]),
+            window(1, Some(now - 2), &["node"]),
+        ];
+        classify_windows(
+            &mut windows,
+            now,
+            &StatusPolicy::default(),
+            Reporting::Speaks,
+        );
+        assert_eq!(windows[0].status, Some(SessionStatus::Idle));
+        assert_eq!(windows[1].status, Some(SessionStatus::Working));
+    }
+
+    /// The process-name rule is asked of the window's own panes, so the shell
+    /// next door does not inherit the agent's answer.
+    #[test]
+    fn an_agent_process_only_works_the_window_it_runs_in() {
+        let now = 1_700_000_100;
+        let mut windows = vec![
+            window(0, Some(now - 600), &["bash"]),
+            window(1, Some(now - 600), &["claude"]),
+        ];
+        classify_windows(
+            &mut windows,
+            now,
+            &StatusPolicy::default(),
+            Reporting::Silent,
+        );
+        assert_eq!(windows[0].status, Some(SessionStatus::Idle));
+        assert_eq!(windows[1].status, Some(SessionStatus::Working));
+
+        // Once its agent speaks for itself, the stand-in rule is dropped there
+        // exactly as it is session-wide.
+        classify_windows(
+            &mut windows,
+            now,
+            &StatusPolicy::default(),
+            Reporting::Speaks,
+        );
+        assert_eq!(windows[1].status, Some(SessionStatus::Idle));
+    }
+
+    /// A window tmux said nothing about is unknown, not idle.
+    #[test]
+    fn a_window_with_no_facts_is_not_judged() {
+        let mut windows = vec![window(0, None, &[])];
+        classify_windows(
+            &mut windows,
+            1_700_000_100,
+            &StatusPolicy::default(),
+            Reporting::Silent,
+        );
+        assert_eq!(windows[0].status, None);
+    }
+
+    /// `#{session_activity}` follows the current window only, so a session
+    /// whose agent works in a background window reads as idle without this.
+    #[test]
+    fn a_session_is_as_fresh_as_its_freshest_window() {
+        let now = 1_700_000_100;
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(600)),
+            windows: vec![
+                window(0, Some(now - 600), &["bash"]),
+                window(1, Some(now - 2), &["node"]),
+            ],
+            ..SessionSignals::default()
+        }
+        .with_window_activity(now);
+
+        assert_eq!(signals.activity_age, Some(Duration::from_secs(2)));
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Working,
+            "work in a window nobody is looking at is still work"
+        );
+    }
+
+    /// Windows can only make a session look busier than tmux said, never
+    /// quieter: the session's own stamp still counts.
+    #[test]
+    fn window_activity_never_ages_a_session() {
+        let now = 1_700_000_100;
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(1)),
+            windows: vec![window(0, Some(now - 600), &["bash"])],
+            ..SessionSignals::default()
+        }
+        .with_window_activity(now);
+        assert_eq!(signals.activity_age, Some(Duration::from_secs(1)));
     }
 
     #[test]

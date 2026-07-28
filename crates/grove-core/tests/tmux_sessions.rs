@@ -1166,6 +1166,77 @@ fn a_session_teaches_the_server_to_title_terminal_windows() {
     );
 }
 
+/// Real tmux, two windows: one printing, one an untouched shell. The busy one
+/// must be the only one that reads as working — the bug this guards is a quiet
+/// window wearing its neighbour's status.
+#[test]
+fn a_busy_window_does_not_make_its_neighbour_look_busy() {
+    require!("tmux");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = std::fs::canonicalize(dir.path()).expect("canonicalize");
+
+    let test = TestServer::new();
+    let (name, _) =
+        tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
+    test.server
+        .run([
+            "new-window".to_string(),
+            "-t".to_string(),
+            name.clone(),
+            "-n".to_string(),
+            "busy".to_string(),
+            "while :; do echo tick; sleep 0.2; done".to_string(),
+        ])
+        .expect("opens a printing window");
+
+    // A one-second working window keeps the test to a few polls; the rule is
+    // the one the default policy applies over ten seconds. Whole-second
+    // activity stamps mean the shell needs a moment to age out of it, so this
+    // waits for the split rather than asserting on the first reading.
+    let policy = grove_core::status::StatusPolicy {
+        working_window: std::time::Duration::from_secs(1),
+        ..grove_core::status::StatusPolicy::default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let split = loop {
+        let now = workflow::now_epoch();
+        let mut windows = tmux::windows_of(&tmux::list_panes(&test.server, &name).expect("panes"));
+        grove_core::status::classify_windows(
+            &mut windows,
+            now,
+            &policy,
+            grove_core::status::Reporting::Speaks,
+        );
+        let status = |wanted: &str| {
+            windows
+                .iter()
+                .find(|w| w.name == wanted)
+                .and_then(|w| w.status)
+        };
+        if status("shell") == Some(grove_core::status::SessionStatus::Idle)
+            && status("busy") == Some(grove_core::status::SessionStatus::Working)
+        {
+            break windows;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the two windows never split: {:?}",
+            windows
+                .iter()
+                .map(|w| (w.name.clone(), w.status, w.activity_epoch))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    let busy = split.iter().find(|w| w.name == "busy").expect("busy");
+    let shell = split.iter().find(|w| w.name == "shell").expect("shell");
+    assert!(
+        busy.activity_epoch > shell.activity_epoch,
+        "tmux stamps activity per window, and only one of them is printing"
+    );
+}
+
 /// The removal risk report, assembled from a real session.
 #[test]
 fn a_real_session_appears_in_the_removal_report() {

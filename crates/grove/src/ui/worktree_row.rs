@@ -827,9 +827,22 @@ fn resource_line<'a>(worktree: &'a Worktree, selected: bool, stands: Stands) -> 
 /// is genuinely quiet, and saying so beats repeating its neighbour's state on
 /// every row.
 fn row_status(worktree: &Worktree, stands: Stands) -> Option<SessionStatus> {
-    match stood_for_window(worktree, stands) {
-        Some(window) if worktree.reports_per_window() => worktree.window_status(window.index),
-        _ => worktree.status,
+    let Some(window) = stood_for_window(worktree, stands) else {
+        return worktree.status;
+    };
+    if worktree.reports_per_window() {
+        return worktree.window_status(window.index);
+    }
+    match worktree.status {
+        // Attention came from an explicit signal that named no window, and it
+        // is the one state Grove never narrows on its own: every row of the
+        // session says it until the user opens it.
+        Some(SessionStatus::Attention) => Some(SessionStatus::Attention),
+        // Otherwise the window's own poll: tmux's session-wide activity stamp
+        // says "something in here printed", which is not this window's answer.
+        // A window the poller has not judged falls back to the session's.
+        Some(session) => Some(window.status.unwrap_or(session)),
+        None => None,
     }
 }
 
@@ -1182,6 +1195,9 @@ mod tests {
             active,
             bell: false,
             title: None,
+            activity_epoch: None,
+            commands: Vec::new(),
+            status: None,
         }
     }
 
@@ -1418,6 +1434,70 @@ mod tests {
         assert_eq!(
             row_status(&worktree, Stands::Worktree),
             Some(SessionStatus::Working)
+        );
+    }
+
+    /// The poller judges each window on its own activity, and a row says what
+    /// its own window is doing — not what the busiest window beside it is.
+    #[test]
+    fn a_quiet_window_row_is_not_painted_by_its_busy_neighbour() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        let mut agent = window(1, "agent", false);
+        agent.status = Some(SessionStatus::Working);
+        let mut shell = window(2, "shell", false);
+        shell.status = Some(SessionStatus::Idle);
+        worktree.windows = vec![agent.clone(), shell.clone()];
+
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&agent)),
+            Some(SessionStatus::Working)
+        );
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&shell)),
+            Some(SessionStatus::Idle),
+            "an empty shell is idle however busy the agent next to it is"
+        );
+        assert_eq!(row_border(&worktree, Stands::Window(&shell)), None);
+        assert_eq!(
+            row_status(&worktree, Stands::Worktree),
+            Some(SessionStatus::Working),
+            "the worktree row still folds both, and something here is working"
+        );
+    }
+
+    /// A window the poller has not judged — a listing built outside a poll —
+    /// falls back to the session's status rather than claiming to be quiet.
+    #[test]
+    fn an_unjudged_window_row_shows_the_sessions_status() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        let shell = window(1, "shell", false);
+        worktree.windows = vec![shell.clone(), window(2, "agent", false)];
+
+        assert_eq!(shell.status, None);
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&shell)),
+            Some(SessionStatus::Working)
+        );
+    }
+
+    /// Attention named no window, and Grove never narrows it on its own: every
+    /// row of the session keeps saying it until the user opens it.
+    #[test]
+    fn attention_survives_a_quiet_window_row() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Attention);
+        let mut shell = window(1, "shell", false);
+        shell.status = Some(SessionStatus::Idle);
+        worktree.windows = vec![shell.clone(), window(2, "agent", false)];
+
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&shell)),
+            Some(SessionStatus::Attention)
         );
     }
 

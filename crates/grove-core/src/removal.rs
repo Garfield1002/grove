@@ -307,6 +307,7 @@ mod tests {
             window_name: "shell".into(),
             window_active: true,
             window_bell: false,
+            window_activity_epoch: None,
             active: true,
             title: String::new(),
         }

@@ -213,6 +213,17 @@ Three states, evaluated by `grove-core::status` from poller + IPC inputs:
 Precedence: attention > working > idle. Attention latches until the user
 opens the session.
 
+**Activity is measured per window, not per session.** `#{session_activity}`
+follows the session's *current* window only, so leaning on it both painted
+every quiet window with its busy neighbour's status and missed work happening
+in a window nobody was looking at. Each window carries its own
+`#{window_activity}` and its own pane commands, and `status::classify_windows`
+judges it by the same two rules the session is judged by; a session is then as
+fresh as its freshest window. A window row shows its own verdict — except for
+attention, which came from an explicit signal that named no window and so
+stands on every row of the session until it is opened. A window a hook has
+reported on is decided by that report, as before.
+
 **Poll cadence follows the frames, not the focus.** Grove is normally used
 beside the terminal it launched — visible but not focused — so focus is the
 wrong signal for "is anyone looking"; a painted frame is the right one. A
