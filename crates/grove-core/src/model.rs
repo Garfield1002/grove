@@ -82,7 +82,8 @@ pub fn suggest_worktree_path(parent: &Path, branch: &str) -> PathBuf {
 /// Milestone 1 only distinguishes "there is a session" from "there is not".
 /// Working / idle / attention (DESIGN.md §6) arrive with the poller in
 /// Milestone 4; until then no status is displayed, rather than a fake one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionPresence {
     /// No session on the private server for this worktree.
     #[default]
@@ -116,7 +117,7 @@ impl SessionPresence {
 /// window rows show the session's status as they always did; once *any* window
 /// has spoken, a window without a note is a window with nothing to say, and
 /// the row says so by staying quiet rather than repeating its neighbours.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowNote {
     /// tmux window index.
     pub index: u32,
@@ -126,7 +127,7 @@ pub struct WindowNote {
 }
 
 /// A Git worktree of a project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Worktree {
     /// Deterministic id: 6 hex characters over (git-common-dir, path).
     pub id: String,

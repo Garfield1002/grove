@@ -34,7 +34,20 @@ pub const DEFAULT_AGENT_COMMANDS: &[&str] = &["claude", "aider", "codex", "goose
 ///
 /// The `Ord` derive is the precedence rule: `Idle < Working < Attention`, so
 /// merging two observations is `max`. Keep the variants in this order.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// The session exists but nothing has happened recently. Idle does not
     /// mean "finished" — only that Grove saw no activity.

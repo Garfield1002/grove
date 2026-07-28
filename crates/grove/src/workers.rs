@@ -20,13 +20,14 @@ use grove_core::git::{RefEntry, StatusSummary, WorktreeAdd};
 use grove_core::ipc::Notification;
 use grove_core::model::{Project, SessionPresence, Worktree};
 use grove_core::process::Invocation;
-use grove_core::reconcile::{self, ProjectRef, Reconciliation};
+use grove_core::protocol::{self, Request};
+use grove_core::reconcile::{ProjectRef, Reconciliation};
 use grove_core::removal::RemovalReport;
 use grove_core::state::{AgentRecord, State};
 use grove_core::status::SessionReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{self, Activation, NewWindow};
-use grove_core::{Error, Paths, TmuxServer, config, git, state, terminal, tmux};
+use grove_core::{Error, Paths, TmuxServer, config, git, terminal, tmux};
 
 /// Work requested by the UI.
 #[derive(Debug)]
@@ -52,14 +53,7 @@ pub enum Task {
     /// Startup / refresh / restore reconciliation (ARCHITECTURE.md §7): diff
     /// Grove's index against `git worktree list` and `tmux list-sessions`.
     /// Marks; never deletes.
-    Reconcile {
-        projects: Vec<ProjectRef>,
-        /// Worktree ids `state.toml` has a session mapping for, so a session
-        /// that has gone can be reported as stopped.
-        recorded: Vec<String>,
-        /// Orphaned session names the user silenced.
-        ignored: Vec<String>,
-    },
+    Reconcile { projects: Vec<ProjectRef> },
     /// Open an existing session by name — how an orphaned session is looked at
     /// before the user decides what to do with it. Creates nothing.
     OpenSession {
@@ -274,7 +268,10 @@ pub enum Message {
     },
     /// One reconciliation pass: every project's rows, plus the orphaned
     /// sessions the user is being offered a choice about.
-    Reconciled(Box<Reconciliation>),
+    Reconciled {
+        result: Box<Reconciliation>,
+        state: Box<State>,
+    },
     /// An orphaned session was opened; nothing about the index changed.
     SessionOpened {
         activation: Activation,
@@ -476,6 +473,100 @@ impl WorkerState {
             git_common_dir: git_common_dir.to_path_buf(),
         });
     }
+}
+
+const SERVICE_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn call_service(
+    worker: &WorkerState,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let request = Request::new(id, method, params);
+    let mut attempts = 0;
+    let response = loop {
+        match protocol::call_with_timeout(
+            &worker.paths.notify_socket(),
+            &request,
+            SERVICE_OPERATION_TIMEOUT,
+        ) {
+            Ok(response) => break response,
+            Err(error) if service_is_starting(&error) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(service_error(method, error)),
+        }
+    };
+    match (response.result, response.error) {
+        (Some(result), None) if response.ok => Ok(result),
+        (None, Some(error)) if !response.ok => Err(Error::io(
+            format!("service method {method}"),
+            std::io::Error::other(format!("{}: {}", error.code, error.message)),
+        )),
+        _ => Err(Error::io(
+            format!("service method {method}"),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "service returned an invalid response shape",
+            ),
+        )),
+    }
+}
+
+fn service_is_starting(error: &protocol::Error) -> bool {
+    matches!(
+        error,
+        protocol::Error::Io { context, source }
+            if *context == "connect to Grove service"
+                && matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+    )
+}
+
+fn service_error(method: &str, error: protocol::Error) -> Error {
+    Error::io(
+        format!("service method {method}"),
+        std::io::Error::other(error.to_string()),
+    )
+}
+
+fn save_state_through_service(worker: &WorkerState, state: State) -> Result<(), Error> {
+    call_service(
+        worker,
+        "gui-state-replace",
+        "state.replace",
+        serde_json::json!({"state": state}),
+    )
+    .map(|_| ())
+}
+
+fn reconcile_through_service(
+    worker: &WorkerState,
+    projects: Vec<ProjectRef>,
+) -> Result<(Reconciliation, State), Error> {
+    let value = call_service(
+        worker,
+        "gui-reconcile",
+        "state.reconcile",
+        serde_json::json!({"projects": projects}),
+    )?;
+    #[derive(serde::Deserialize)]
+    struct ServiceResult {
+        reconciliation: Reconciliation,
+        state: State,
+    }
+    serde_json::from_value::<ServiceResult>(value)
+        .map(|result| (result.reconciliation, result.state))
+        .map_err(|error| {
+            Error::io(
+                "decode service reconciliation",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            )
+        })
 }
 
 fn run(
@@ -691,12 +782,8 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             }
         }
 
-        Task::Reconcile {
-            projects,
-            recorded,
-            ignored,
-        } => match reconcile::reconcile_all(&worker.server, &projects, &recorded, &ignored) {
-            Ok(result) => {
+        Task::Reconcile { projects } => match reconcile_through_service(worker, projects) {
+            Ok((result, state)) => {
                 // Statuses are a second pass, exactly as for a refresh: the
                 // restored list appears at once and the per-worktree
                 // `git status` calls never hold it up.
@@ -708,7 +795,10 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                         });
                     }
                 }
-                vec![Message::Reconciled(Box::new(result))]
+                vec![Message::Reconciled {
+                    result: Box::new(result),
+                    state: Box::new(state),
+                }]
             }
             Err(e) => vec![Message::Failed(ErrorReport::new(
                 "could not reconcile with git and tmux",
@@ -1048,7 +1138,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             }],
         },
 
-        Task::SaveState(state) => match state::save(&worker.paths.state_file(), &state) {
+        Task::SaveState(state) => match save_state_through_service(worker, *state) {
             Ok(()) => Vec::new(),
             Err(e) => vec![Message::Failed(ErrorReport::new(
                 "could not save state.toml",

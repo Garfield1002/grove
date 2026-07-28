@@ -105,6 +105,78 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         "project1"
     );
 
+    let replacement = State {
+        projects: vec![ProjectRecord {
+            id: "project2".into(),
+            name: "service-owned".into(),
+            repository_path: temp.path().join("service-owned"),
+            git_common_dir: temp.path().join("service-owned/.git"),
+            default_worktree_path: temp.path().join("worktrees"),
+            is_expanded: false,
+        }],
+        slots: vec![
+            SlotRecord {
+                number: 4,
+                worktree_id: "first".into(),
+            },
+            SlotRecord {
+                number: 4,
+                worktree_id: "duplicate".into(),
+            },
+        ],
+        ..State::default()
+    };
+    let replaced = protocol::call(
+        &paths.notify_socket(),
+        &Request::new(
+            "state-1",
+            "state.replace",
+            serde_json::json!({"state": replacement}),
+        ),
+    )
+    .expect("state replacement");
+    assert!(replaced.ok);
+    let saved = state::load(&paths.state_file()).expect("service saved state");
+    assert_eq!(saved.projects[0].id, "project2");
+    assert_eq!(
+        saved.slots.len(),
+        1,
+        "service normalizes state before saving"
+    );
+
+    let mut incompatible = saved.clone();
+    incompatible.version += 1;
+    let rejected = protocol::call(
+        &paths.notify_socket(),
+        &Request::new(
+            "state-2",
+            "state.replace",
+            serde_json::json!({"state": incompatible}),
+        ),
+    )
+    .expect("schema rejection");
+    assert!(!rejected.ok);
+    assert_eq!(rejected.error.expect("error").code, "invalid_params");
+    assert_eq!(
+        state::load(&paths.state_file()).expect("state remains readable"),
+        saved
+    );
+
+    let reconciled = protocol::call_with_timeout(
+        &paths.notify_socket(),
+        &Request::new(
+            "reconcile-1",
+            "state.reconcile",
+            serde_json::json!({"projects": []}),
+        ),
+        Duration::from_secs(5),
+    )
+    .expect("service reconciliation");
+    assert!(reconciled.ok);
+    let result = reconciled.result.expect("reconciliation result");
+    assert_eq!(result["reconciliation"]["projects"], serde_json::json!([]));
+    assert_eq!(result["state"]["project"][0]["id"], "project2");
+
     if Command::new("tmux").arg("-V").output().is_ok() {
         let snapshot = protocol::call(
             &paths.notify_socket(),
@@ -113,9 +185,9 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         .expect("snapshot");
         let result = snapshot.result.expect("result");
         assert_eq!(result["protocol_version"], protocol::VERSION);
-        assert_eq!(result["slots"][0]["number"], 3);
-        assert_eq!(result["agents"][0]["session_id"], "conversation-1");
-        assert_eq!(result["unavailable_projects"][0]["project_id"], "project1");
+        assert_eq!(result["slots"][0]["number"], 4);
+        assert_eq!(result["agents"], serde_json::json!([]));
+        assert_eq!(result["unavailable_projects"][0]["project_id"], "project2");
     }
 
     // An impossible payload is isolated to its own connection and cannot

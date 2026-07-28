@@ -96,8 +96,11 @@ This document records the *resolved* architecture. The full product design
   has bounded read/write timeouts and is handled independently, with at most
   32 client threads, so a slow or malformed local client cannot stall the
   listener, exhaust threads, or affect legacy agent reports. Protocol version
-  1 exposes `ping`, `project.list`, `worktree.list`, `session.list`, and
-  `session.snapshot`. The snapshot is a coherent bootstrap view built from one
+  1 exposes `ping`, `project.list`, `worktree.list`, `session.list`,
+  `session.snapshot`, `state.replace`, and `state.reconcile`. The service is
+  the sole production writer of `state.toml`; mutation and reconciliation
+  requests share one lock and finish with an atomic save. The snapshot is a
+  coherent bootstrap view built from one
   state-file load and one listing each of live tmux sessions and panes; it
   includes registered projects, current Git worktrees, unavailable projects,
   live/stopped session relationships, windows, numbered slots, and known agent
@@ -162,10 +165,12 @@ existence. TOML files are only an index and configuration store.
   first-class; the app writes it only via `toml_edit` (surgical per-key
   changes preserving comments/formatting) on first-run auto-detect and on
   explicit Settings-UI changes — never whole-file serialization.
-- `$XDG_STATE_HOME/grove/state.toml` — app-owned. Registered projects,
+- `$XDG_STATE_HOME/grove/state.toml` — service-owned. Registered projects,
   worktree ↔ session mappings, selection, UI expansion, manual status
-  overrides, last-activity timestamps. Written atomically: serialize to a
-  temp file in the same directory, then `rename(2)`.
+  overrides, last-activity timestamps. GUI workers keep an in-memory mirror
+  but send all mutations through the versioned service API. Reconciliation
+  also runs there, under the same write lock. Saves are atomic: serialize to
+  a temp file in the same directory, then `rename(2)`.
 
 ### Core types (in `grove-core::model`)
 

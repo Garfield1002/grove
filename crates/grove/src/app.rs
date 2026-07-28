@@ -148,8 +148,6 @@ impl GroveApp {
         // user touches anything.
         workers.send(Task::Reconcile {
             projects: project_refs(&projects),
-            recorded: loaded.recorded_session_ids(),
-            ignored: loaded.ignored_sessions.clone(),
         });
 
         Self {
@@ -273,7 +271,9 @@ impl GroveApp {
                     self.windows = windows;
                     self.apply_presence(&presence);
                 }
-                Message::Reconciled(result) => self.apply_reconciliation(*result),
+                Message::Reconciled { result, state } => {
+                    self.apply_reconciliation(*result, *state);
+                }
                 Message::SessionOpened { activation } => {
                     self.status = Some(describe(&activation));
                 }
@@ -726,8 +726,6 @@ impl GroveApp {
     fn reconcile(&mut self) {
         self.workers.send(Task::Reconcile {
             projects: project_refs(&self.projects),
-            recorded: self.state.recorded_session_ids(),
-            ignored: self.state.ignored_sessions.clone(),
         });
         self.status = Some("Reconciling with git and tmux…".to_string());
     }
@@ -737,8 +735,13 @@ impl GroveApp {
     /// It marks and it records; it removes nothing. An unavailable project
     /// keeps its record *and* its last known rows — a project on an unplugged
     /// drive must not look as though its worktrees were deleted.
-    fn apply_reconciliation(&mut self, result: Reconciliation) {
+    fn apply_reconciliation(&mut self, result: Reconciliation, state: State) {
         self.reconciled_once = true;
+        // The service owns state persistence and returns the exact state
+        // snapshot it reconciled and atomically wrote. Keep the GUI mirror in
+        // sync so a later state.replace cannot overwrite service-owned session
+        // records with an older copy.
+        self.state = state;
         let summary = result.summary();
         for status in result.projects {
             let Some(project) = self.projects.iter_mut().find(|p| p.id == status.id) else {
@@ -758,7 +761,6 @@ impl GroveApp {
         {
             self.orphan_armed = None;
         }
-        self.record_live_sessions();
         self.forget_stale_notices();
         self.apply_session_statuses();
         self.apply_session_windows();
@@ -818,45 +820,6 @@ impl GroveApp {
             .flat_map(|project| project.worktrees.iter().map(|w| w.id.as_str()))
             .collect();
         self.notices.retain_ids(|id| live.contains(id));
-    }
-
-    /// Note every worktree that currently has a session, so a session that
-    /// later disappears is reported as *stopped*. Records for sessions that
-    /// have gone are deliberately kept: that is the whole signal.
-    fn record_live_sessions(&mut self) {
-        let live: Vec<SessionRecord> = self
-            .projects
-            .iter()
-            .flat_map(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .filter(|worktree| worktree.session.exists())
-                    .map(|worktree| SessionRecord {
-                        worktree_id: worktree.id.clone(),
-                        project_id: project.id.clone(),
-                        worktree_path: worktree.path.clone(),
-                        session_name: worktree.session_name(),
-                        last_activity_at: grove_core::workflow::now_epoch(),
-                    })
-            })
-            .collect();
-        let before = self.state.sessions.clone();
-        for record in live {
-            self.state.record_session(record);
-        }
-        // Every pass restamps the activity time, so compare the mappings
-        // themselves: an unchanged reconciliation must not rewrite state.toml.
-        let changed = before.len() != self.state.sessions.len()
-            || before.iter().zip(&self.state.sessions).any(|(a, b)| {
-                a.worktree_id != b.worktree_id
-                    || a.project_id != b.project_id
-                    || a.session_name != b.session_name
-                    || a.worktree_path != b.worktree_path
-            });
-        if changed {
-            self.save_state();
-        }
     }
 
     /// Record one worktree's session mapping, by worktree id.

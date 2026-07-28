@@ -1,4 +1,4 @@
-//! `state.toml` — app-owned state.
+//! `state.toml` — service-owned state.
 //!
 //! It holds the registered project list, the worktree ↔ session mappings Grove
 //! has seen, and the orphaned sessions the user asked it to stop mentioning.
@@ -7,6 +7,9 @@
 //! (ARCHITECTURE.md §8.1). Conversely nothing here can resurrect a session:
 //! a mapping whose session tmux no longer reports is shown as *stopped*
 //! (DESIGN.md §11), never recreated behind the user's back.
+//! The `grove serve` process is the sole production writer. GUI workers send
+//! versioned state mutations to it, keeping serialization and reconciliation
+//! behind one lock and one atomic-write boundary.
 //!
 //! The shapes below are deliberately additive (`#[serde(default)]`
 //! everywhere) so a newer field or table can be introduced without
@@ -179,6 +182,16 @@ impl State {
 
     pub fn to_toml(&self) -> Result<String> {
         Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// Normalize state received through the service API exactly as a
+    /// hand-edited TOML file is normalized on load.
+    ///
+    /// The schema version is validated by the caller before this runs; this
+    /// only drops unusable or duplicate index entries.
+    pub fn normalize(&mut self) {
+        self.sanitize_slots();
+        self.sanitize_agents();
     }
 
     pub fn find(&self, id: &str) -> Option<&ProjectRecord> {

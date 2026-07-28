@@ -23,7 +23,8 @@ const SOURCE: &str = "git status --porcelain=v2 --branch";
 pub const STATUS_ARGS: [&str; 3] = ["status", "--porcelain=v2", "--branch"];
 
 /// A multi-step git operation the worktree is in the middle of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Operation {
     Merge,
     Rebase,
@@ -58,7 +59,7 @@ pub const OPERATION_MARKERS: [(&str, Operation); 6] = [
 ];
 
 /// Compact working-tree summary for one worktree.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatusSummary {
     /// Short branch name; `None` when HEAD is detached.
     pub branch: Option<String>,

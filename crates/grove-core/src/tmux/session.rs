@@ -533,7 +533,7 @@ pub struct PaneInfo {
 }
 
 /// A window of a session, as the tree lists it under a worktree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowInfo {
     pub session: String,
     pub index: u32,

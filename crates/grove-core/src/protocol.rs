@@ -257,10 +257,21 @@ pub fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()
 
 /// Send one request and wait for its matching response.
 pub fn call(socket: &Path, request: &Request) -> Result<Response, Error> {
+    call_with_timeout(socket, request, IO_TIMEOUT)
+}
+
+/// Send one request with a caller-selected response timeout. Long-running
+/// service methods such as reconciliation use this without weakening the
+/// short default for interactive probes and list calls.
+pub fn call_with_timeout(
+    socket: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response, Error> {
     request.validate()?;
     let mut stream =
         UnixStream::connect(socket).map_err(|error| io("connect to Grove service", error))?;
-    configure(&stream)?;
+    configure_with_timeout(&stream, timeout)?;
     write_json(&mut stream, request)?;
     let response: Response = read_json(&mut stream)?;
     response.validate()?;

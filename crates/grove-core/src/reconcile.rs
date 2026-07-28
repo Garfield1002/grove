@@ -30,7 +30,7 @@ use crate::model::{SessionPresence, Worktree, worktrees_from_entries};
 use crate::tmux::{SessionInfo, TmuxServer};
 
 /// A project as Grove's index knows it, before git is consulted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectRef {
     pub id: String,
     pub name: String,
@@ -65,7 +65,8 @@ impl ProjectSnapshot {
 }
 
 /// Why a live tmux session has no worktree to belong to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrphanReason {
     /// The session names a repository Grove has registered, but none of that
     /// project's worktrees matches it any more — the worktree was removed
@@ -90,7 +91,7 @@ impl OrphanReason {
 /// Grove offers to open it, associate it with a worktree, close it or ignore
 /// it — four things the user chooses between. Reconciliation itself does none
 /// of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OrphanSession {
     pub name: String,
     /// `@grove_id`, else the id in the `wt-<id>` name.
@@ -123,7 +124,7 @@ impl OrphanSession {
 }
 
 /// One project after reconciliation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectStatus {
     pub id: String,
     pub name: String,
@@ -136,7 +137,7 @@ pub struct ProjectStatus {
 }
 
 /// The result of one reconciliation pass.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reconciliation {
     pub projects: Vec<ProjectStatus>,
     pub orphans: Vec<OrphanSession>,

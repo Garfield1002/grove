@@ -16,6 +16,8 @@ use grove_core::ipc::{self, Command, Notification};
 use grove_core::paths::ensure_private_dir;
 use grove_core::process::Invocation;
 use grove_core::protocol::{self, Request, Response};
+use grove_core::reconcile::{self, ProjectRef, Reconciliation};
+use grove_core::state::{STATE_VERSION, SessionRecord, State};
 use grove_core::{Paths, Result, TmuxServer, query, state};
 use serde_json::json;
 
@@ -120,6 +122,7 @@ fn handle_api(mut stream: UnixStream, first: u8, api: &ApiContext) {
 struct ApiContext {
     state_file: std::path::PathBuf,
     server: TmuxServer,
+    state_gate: Mutex<()>,
 }
 
 impl ApiContext {
@@ -128,8 +131,27 @@ impl ApiContext {
             state_file: paths.state_file(),
             // Read-only API calls must not create tmux configuration files.
             server: TmuxServer::new(paths.tmux_socket()),
+            state_gate: Mutex::new(()),
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceStateParams {
+    state: State,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconcileParams {
+    projects: Vec<ProjectRef>,
+}
+
+#[derive(serde::Serialize)]
+struct ReconcileResult<'a> {
+    reconciliation: &'a Reconciliation,
+    state: &'a State,
 }
 
 fn dispatch_api(request: &Request, api: &ApiContext) -> Response {
@@ -144,7 +166,9 @@ fn dispatch_api(request: &Request, api: &ApiContext) -> Response {
             ),
         );
     }
-    if !matches!(&request.params, serde_json::Value::Null)
+    let accepts_params = matches!(request.method.as_str(), "state.replace" | "state.reconcile");
+    if !accepts_params
+        && !matches!(&request.params, serde_json::Value::Null)
         && !request
             .params
             .as_object()
@@ -179,12 +203,109 @@ fn dispatch_api(request: &Request, api: &ApiContext) -> Response {
         "session.snapshot" => with_state(request, api, |state| {
             Ok(serde_json::to_value(query::snapshot(state, &api.server)?)?)
         }),
+        "state.replace" => replace_state(request, api),
+        "state.reconcile" => reconcile_state(request, api),
         method => Response::error(
             &request.id,
             "method_not_found",
             format!("unknown service method `{method}`"),
         ),
     }
+}
+
+fn replace_state(request: &Request, api: &ApiContext) -> Response {
+    let ReplaceStateParams { mut state } = match serde_json::from_value(request.params.clone()) {
+        Ok(params) => params,
+        Err(error) => {
+            return Response::error(&request.id, "invalid_params", error.to_string());
+        }
+    };
+    if state.version != STATE_VERSION {
+        return Response::error(
+            &request.id,
+            "invalid_params",
+            format!(
+                "state schema {} is unsupported; expected {}",
+                state.version, STATE_VERSION
+            ),
+        );
+    }
+    state.normalize();
+    let _guard = lock_state(api);
+    match state::save(&api.state_file, &state) {
+        Ok(()) => Response::success(&request.id, json!({"saved": true})),
+        Err(error) => Response::error(&request.id, "state_write_failed", error.to_string()),
+    }
+}
+
+fn reconcile_state(request: &Request, api: &ApiContext) -> Response {
+    let ReconcileParams { projects } = match serde_json::from_value(request.params.clone()) {
+        Ok(params) => params,
+        Err(error) => {
+            return Response::error(&request.id, "invalid_params", error.to_string());
+        }
+    };
+    let _guard = lock_state(api);
+    let mut state = match state::load(&api.state_file) {
+        Ok(state) => state,
+        Err(error) => {
+            return Response::error(&request.id, "state_read_failed", error.to_string());
+        }
+    };
+    let result = match reconcile::reconcile_all(
+        &api.server,
+        &projects,
+        &state.recorded_session_ids(),
+        &state.ignored_sessions,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Response::error(&request.id, "reconcile_failed", error.to_string());
+        }
+    };
+    if record_live_sessions(&mut state, &result)
+        && let Err(error) = state::save(&api.state_file, &state)
+    {
+        return Response::error(&request.id, "state_write_failed", error.to_string());
+    }
+    match serde_json::to_value(ReconcileResult {
+        reconciliation: &result,
+        state: &state,
+    }) {
+        Ok(value) => Response::success(&request.id, value),
+        Err(error) => Response::error(&request.id, "internal_error", error.to_string()),
+    }
+}
+
+fn lock_state(api: &ApiContext) -> std::sync::MutexGuard<'_, ()> {
+    api.state_gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn record_live_sessions(state: &mut State, result: &Reconciliation) -> bool {
+    let before = state.sessions.clone();
+    let now = grove_core::workflow::now_epoch();
+    for project in &result.projects {
+        for worktree in &project.worktrees {
+            if worktree.session.exists() {
+                state.record_session(SessionRecord {
+                    worktree_id: worktree.id.clone(),
+                    project_id: project.id.clone(),
+                    worktree_path: worktree.path.clone(),
+                    session_name: worktree.session_name(),
+                    last_activity_at: now,
+                });
+            }
+        }
+    }
+    before.len() != state.sessions.len()
+        || before.iter().zip(&state.sessions).any(|(a, b)| {
+            a.worktree_id != b.worktree_id
+                || a.project_id != b.project_id
+                || a.session_name != b.session_name
+                || a.worktree_path != b.worktree_path
+        })
 }
 
 fn with_state(
