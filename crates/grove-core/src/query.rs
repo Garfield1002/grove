@@ -106,6 +106,10 @@ pub struct WorktreeView {
 /// as `stopped`; it never causes a session to be created.
 pub fn list_worktrees(state: &State, server: &TmuxServer) -> Result<WorktreeList> {
     let live_sessions = tmux::list_sessions(server)?;
+    Ok(worktrees_from_live(state, &live_sessions))
+}
+
+fn worktrees_from_live(state: &State, live_sessions: &[tmux::SessionInfo]) -> WorktreeList {
     let live_by_id: HashMap<&str, &tmux::SessionInfo> = live_sessions
         .iter()
         .filter_map(|session| session.worktree_id().map(|id| (id, session)))
@@ -156,11 +160,11 @@ pub fn list_worktrees(state: &State, server: &TmuxServer) -> Result<WorktreeList
         }
     }
 
-    Ok(WorktreeList {
+    WorktreeList {
         version: API_VERSION,
         worktrees,
         unavailable_projects,
-    })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -186,7 +190,11 @@ pub struct SessionView {
 
 /// List live sessions on Grove's private tmux server.
 pub fn list_sessions(server: &TmuxServer) -> Result<SessionList> {
-    let sessions = tmux::list_sessions(server)?
+    Ok(sessions_from_live(tmux::list_sessions(server)?))
+}
+
+fn sessions_from_live(live: Vec<tmux::SessionInfo>) -> SessionList {
+    let sessions = live
         .into_iter()
         .map(|session| SessionView {
             worktree_id: session.worktree_id().map(str::to_string),
@@ -201,9 +209,101 @@ pub fn list_sessions(server: &TmuxServer) -> Result<SessionList> {
             name: session.name,
         })
         .collect();
-    Ok(SessionList {
+    SessionList {
         version: API_VERSION,
         sessions,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Snapshot {
+    pub version: u32,
+    pub service_version: &'static str,
+    pub protocol_version: u32,
+    pub projects: Vec<ProjectView>,
+    pub worktrees: Vec<WorktreeView>,
+    pub unavailable_projects: Vec<UnavailableProject>,
+    pub sessions: Vec<SessionView>,
+    pub windows: Vec<WindowView>,
+    pub slots: Vec<SlotView>,
+    pub agents: Vec<AgentView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WindowView {
+    pub session_name: String,
+    pub index: u32,
+    pub name: String,
+    pub active: bool,
+    pub bell: bool,
+    pub title: Option<String>,
+    pub last_activity_at: Option<u64>,
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotView {
+    pub number: u8,
+    pub worktree_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentView {
+    pub worktree_id: String,
+    pub session_id: String,
+    pub transcript_path: PathBuf,
+}
+
+/// Collect one coherent service bootstrap view.
+///
+/// State is supplied as one already-loaded snapshot. Live tmux sessions and
+/// panes are each listed exactly once, then reused to derive every public
+/// record in this response.
+pub fn snapshot(state: &State, server: &TmuxServer) -> Result<Snapshot> {
+    let live_sessions = tmux::list_sessions(server)?;
+    let panes = tmux::list_all_panes(server)?;
+    let projects = list_projects(state);
+    let worktrees = worktrees_from_live(state, &live_sessions);
+    let sessions = sessions_from_live(live_sessions);
+    let windows = tmux::windows_of(&panes)
+        .into_iter()
+        .map(|window| WindowView {
+            session_name: window.session,
+            index: window.index,
+            name: window.name,
+            active: window.active,
+            bell: window.bell,
+            title: window.title,
+            last_activity_at: window.activity_epoch,
+            commands: window.commands,
+        })
+        .collect();
+    Ok(Snapshot {
+        version: API_VERSION,
+        service_version: env!("CARGO_PKG_VERSION"),
+        protocol_version: crate::protocol::VERSION,
+        projects: projects.projects,
+        worktrees: worktrees.worktrees,
+        unavailable_projects: worktrees.unavailable_projects,
+        sessions: sessions.sessions,
+        windows,
+        slots: state
+            .slots
+            .iter()
+            .map(|slot| SlotView {
+                number: slot.number,
+                worktree_id: slot.worktree_id.clone(),
+            })
+            .collect(),
+        agents: state
+            .agents
+            .iter()
+            .map(|agent| AgentView {
+                worktree_id: agent.worktree_id.clone(),
+                session_id: agent.session_id.clone(),
+                transcript_path: agent.transcript_path.clone(),
+            })
+            .collect(),
     })
 }
 

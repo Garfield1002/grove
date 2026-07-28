@@ -8,6 +8,6 @@ pub use client::{ClientInfo, list_clients, primary_client, switch_client};
 pub use server::TmuxServer;
 pub use session::{
     PaneInfo, SessionInfo, SessionMetadata, SessionSpec, WindowInfo, associate_session,
-    ensure_session, has_session, kill_session, list_panes, list_sessions, select_window,
-    set_titles, windows_of,
+    ensure_session, has_session, kill_session, list_all_panes, list_panes, list_sessions,
+    select_window, set_titles, windows_of,
 };

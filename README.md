@@ -91,11 +91,16 @@ versioned JSON:
 grove project list
 grove worktree list
 grove session list
+grove snapshot
 ```
 
 These commands are read-only. Worktree discovery reads Git as the source of
 truth, session discovery reads Grove's private tmux server, and an unavailable
 repository is reported without hiding healthy projects from the response.
+They query `grove serve` when it is running and retain direct read-only
+collection as a fallback. `grove snapshot` returns projects, worktrees,
+sessions, windows, numbered slots and known agent conversations from one state
+load and one collection pass.
 
 ### Local service
 

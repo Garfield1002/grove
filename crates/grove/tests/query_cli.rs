@@ -151,6 +151,19 @@ fn session_list_without_a_server_is_an_empty_success() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert_eq!(json, serde_json::json!({"version": 1, "sessions": []}));
+
+    let snapshot = isolated.run(&["snapshot"]);
+    assert!(
+        snapshot.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&snapshot.stdout).expect("valid JSON");
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["protocol_version"], 1);
+    assert_eq!(json["projects"], serde_json::json!([]));
+    assert_eq!(json["sessions"], serde_json::json!([]));
+    assert_eq!(json["windows"], serde_json::json!([]));
 }
 
 #[test]
@@ -159,7 +172,7 @@ fn malformed_query_is_rejected() {
     let output = isolated.run(&["project", "remove"]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("expected `project list`"),
+        String::from_utf8_lossy(&output.stderr).contains("`project list`"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

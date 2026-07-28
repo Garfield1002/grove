@@ -27,6 +27,7 @@ Usage:
   grove project list   list registered projects as JSON
   grove worktree list  list current Git worktrees as JSON
   grove session list   list live Grove tmux sessions as JSON
+  grove snapshot       print one coherent service snapshot as JSON
   grove serve       run Grove's headless local service
   grove --help     show this message
   grove --version  show the version
@@ -47,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hooks::run(&args[1..])?;
             return Ok(());
         }
-        Some("project" | "worktree" | "session") => {
+        Some("project" | "worktree" | "session" | "snapshot") => {
             let paths = Paths::from_process_env()?;
             query::run(&args, &paths)?;
             return Ok(());

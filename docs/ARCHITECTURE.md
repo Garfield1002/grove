@@ -88,6 +88,21 @@ This document records the *resolved* architecture. The full product design
   undelivered notification per worktree, launches the GUI for an undelivered
   toggle, and never owns or inspects terminal contents. Grove starts it on
   demand; invoking `grove serve` directly runs it in the foreground.
+- **Service protocol.** The public socket accepts both the original bounded
+  `grove1` notification lines and versioned API frames. An API frame is a
+  four-byte big-endian length followed by at most 1 MiB of JSON. Requests
+  carry a protocol version, request id, method and parameters; responses echo
+  the id and contain exactly one structured result or error. Every connection
+  has bounded read/write timeouts and is handled independently, with at most
+  32 client threads, so a slow or malformed local client cannot stall the
+  listener, exhaust threads, or affect legacy agent reports. Protocol version
+  1 exposes `ping`, `project.list`, `worktree.list`, `session.list`, and
+  `session.snapshot`. The snapshot is a coherent bootstrap view built from one
+  state-file load and one listing each of live tmux sessions and panes; it
+  includes registered projects, current Git worktrees, unavailable projects,
+  live/stopped session relationships, windows, numbered slots, and known agent
+  conversations. Existing JSON CLI commands prefer these service methods and
+  retain direct read-only collection when no service is running.
 
 ## 3. Workspace layout
 

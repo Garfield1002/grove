@@ -28,7 +28,7 @@
 //! one of them is dropped rather than failing the whole report: none of them
 //! is load-bearing for the status itself.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -415,13 +415,30 @@ pub fn bind(socket: &Path) -> Result<UnixListener> {
 /// Every way of failing collapses to [`ProtocolError::Malformed`]: nothing
 /// usable arrived, and the listener logs it and takes the next connection.
 pub fn read_command(stream: UnixStream) -> std::result::Result<Command, ProtocolError> {
+    read_command_prefixed(stream, None)
+}
+
+/// Read a command after a protocol discriminator already consumed its first
+/// byte from `stream`.
+pub fn read_command_after_first(
+    stream: UnixStream,
+    first: u8,
+) -> std::result::Result<Command, ProtocolError> {
+    read_command_prefixed(stream, Some(first))
+}
+
+fn read_command_prefixed(
+    stream: UnixStream,
+    first: Option<u8>,
+) -> std::result::Result<Command, ProtocolError> {
     // Refuse to read at all rather than read unbounded: an unarmed timeout is
     // exactly the state this function exists to avoid.
     if stream.set_read_timeout(Some(READ_TIMEOUT)).is_err() {
         return Err(ProtocolError::Malformed);
     }
     let mut line = String::new();
-    let mut reader = BufReader::new(stream.take(MAX_LINE_LEN));
+    let prefix = Cursor::new(first.into_iter().collect::<Vec<_>>());
+    let mut reader = BufReader::new(prefix.chain(stream).take(MAX_LINE_LEN));
     match reader.read_line(&mut line) {
         // A timed-out read, a non-UTF-8 byte and a closed connection are all
         // the same answer here.
