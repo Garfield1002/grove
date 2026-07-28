@@ -46,7 +46,7 @@ on first run recording the terminal it detected.
 
 ## Getting started
 
-1. **Open a project** with `+` in the header or the folder in the footer.
+1. **Open a project** with the folder entry in the footer.
    Point it at any directory inside a Git repository; Grove finds the
    repository and lists its worktrees.
 2. **Press Enter on a row.** Grove creates the tmux session if needed, then

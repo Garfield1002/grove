@@ -1414,10 +1414,10 @@ impl GroveApp {
     /// one behind it. The in-window open-project dialog keeps its guard for
     /// the same reason it always had it: it owns the keyboard.
     fn keyboard(&mut self, ctx: &egui::Context) {
-        // The window has no decorations and therefore no close button, so
-        // Grove has to offer the shortcut itself. Ctrl+Q quits from any of
-        // Grove's windows; Ctrl+W on the main window closes it, which for the
-        // only remaining window means quitting too.
+        // The title bar has a close button, but the shortcut is worth keeping
+        // anyway: Ctrl+Q quits from any of Grove's windows, and Ctrl+W on the
+        // main window closes it, which for the only remaining window means
+        // quitting too.
         let close = ctx.input(|i| {
             i.modifiers.command && (i.key_pressed(egui::Key::Q) || i.key_pressed(egui::Key::W))
         });
@@ -1475,50 +1475,14 @@ impl GroveApp {
         }
     }
 
-    /// The header bar: the app title, the Restore placeholder, the open-project
-    /// action, and the filter field — the mockup's top region.
+    /// The header bar: the filter field, and nothing else.
     ///
-    /// The bar doubles as the window's drag handle. The window is undecorated
-    /// (see `main`), so without this there would be no way to move it. The
-    /// drag region is interacted with *first*, which in egui puts it below the
-    /// buttons and the text field: a click on a control is never a drag.
+    /// The window's title, its close button and its drag handle are the
+    /// compositor's now (`main` asks for decorations), so the app name here
+    /// would only repeat the title bar above it. Restore stays on Ctrl+R and
+    /// opening a project on the footer's entry, each of which already had a
+    /// home outside this bar.
     fn header(&mut self, ui: &mut egui::Ui) {
-        let bar = egui::Rect::from_min_size(
-            ui.cursor().min,
-            egui::vec2(ui.available_width(), theme::ICON_BUTTON),
-        );
-        ui::chrome::drag_region(ui, bar, "grove-titlebar");
-
-        ui.horizontal(|ui| {
-            ui.set_min_height(theme::ICON_BUTTON);
-            ui.label(
-                egui::RichText::new("Grove")
-                    .size(theme::FONT_TITLE)
-                    .strong()
-                    .color(theme::TEXT_STRONG),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui::icons::button(ui, true, ui::icons::plus)
-                    .on_hover_text("Open a project")
-                    .clicked()
-                {
-                    self.open_project_path = Some(String::new());
-                }
-                if ui::icons::chip(ui, "Restore", true, ui::icons::refresh)
-                    .on_hover_text(
-                        "Rebuild Grove's view from git and tmux.\n\
-                         Reattaches live sessions, marks missing worktrees and\n\
-                         stopped sessions, and lists orphaned sessions.\n\
-                         Nothing is ever deleted. (Ctrl+R)",
-                    )
-                    .clicked()
-                {
-                    self.reconcile();
-                }
-            });
-        });
-
-        ui.add_space(8.0);
         self.filter_field(ui);
     }
 
@@ -1764,11 +1728,6 @@ impl eframe::App for GroveApp {
         if self.quit_after_kill {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-
-        // First thing in the frame: the window is undecorated, so its resize
-        // edges are Grove's to provide, and registering them here puts every
-        // other widget on top of them (`ui::window_edge`).
-        ui::window_edge::show(ctx);
 
         if let Some(path) = &mut self.open_project_path {
             match ui::dialogs::open_project(ctx, path) {

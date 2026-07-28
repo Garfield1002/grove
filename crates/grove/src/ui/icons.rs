@@ -2,9 +2,9 @@
 //!
 //! **Why not glyphs.** egui's bundled `Proportional` family is
 //! `Ubuntu-Light → NotoEmoji-Regular → emoji-icon-font`. Several characters
-//! the mockup uses are in none of them and rendered as tofu boxes: the
-//! fullwidth plus `＋` (U+FF0B) in the header, `⚯` (U+26AF) for a detached
-//! HEAD, and `✕` (U+2715) in the removal dialog. Others (`●` U+25CF, `▾`
+//! the mockup uses are in none of them and rendered as tofu boxes: `⚯`
+//! (U+26AF) for a detached HEAD and `✕` (U+2715) in the removal dialog.
+//! Others (`●` U+25CF, `▾`
 //! U+25BE, `⋯` U+22EF, `◉` U+25C9) exist only in *Hack*, which is in the
 //! `Monospace` chain but **not** the `Proportional` one, so they were tofu
 //! wherever the code asked for a proportional font.
@@ -52,13 +52,6 @@ fn arc(center: (f32, f32), radius: f32, from: f32, to: f32, steps: usize) -> Vec
 }
 
 // ------------------------------------------------------------------ icons
-
-/// `+` — the open-project action in the header.
-pub fn plus(painter: &egui::Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(line_width(rect).max(1.4), color);
-    path(painter, rect, &[(0.5, 0.18), (0.5, 0.82)], false, stroke);
-    path(painter, rect, &[(0.18, 0.5), (0.82, 0.5)], false, stroke);
-}
 
 /// A magnifying glass, as in the mockup's filter field.
 pub fn magnifier(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -326,54 +319,6 @@ pub fn button(
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(theme::CHIP_RADIUS), fill);
         draw(ui.painter(), rect.shrink(theme::ICON_BUTTON * 0.28), tint);
-    }
-    response
-}
-
-/// A labelled chip: an icon and a word, as the mockup's Restore control.
-pub fn chip(
-    ui: &mut Ui,
-    text: &str,
-    enabled: bool,
-    draw: impl FnOnce(&egui::Painter, Rect, Color32),
-) -> Response {
-    let font = egui::FontId::proportional(theme::FONT_CHIP);
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        font,
-        if enabled {
-            theme::TEXT_DIM
-        } else {
-            theme::TEXT_FAINT
-        },
-    );
-    let height = theme::ICON_BUTTON;
-    let width = 9.0 + 12.0 + 5.0 + galley.size().x + 9.0;
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), sense);
-
-    if ui.is_rect_visible(rect) {
-        let (fill, tint) = match (enabled, response.hovered()) {
-            (false, _) => (theme::CHIP.gamma_multiply(0.5), theme::TEXT_FAINT),
-            (true, false) => (theme::CHIP, theme::TEXT_DIM),
-            (true, true) => (theme::HAIRLINE, theme::TEXT_STRONG),
-        };
-        let painter = ui.painter();
-        painter.rect_filled(rect, egui::CornerRadius::same(theme::CHIP_RADIUS), fill);
-        let icon = Rect::from_center_size(
-            pos2(rect.left() + 9.0 + 6.0, rect.center().y),
-            Vec2::splat(12.0),
-        );
-        draw(painter, icon, tint);
-        painter.galley(
-            pos2(icon.right() + 5.0, rect.center().y - galley.size().y / 2.0),
-            galley,
-            tint,
-        );
     }
     response
 }
