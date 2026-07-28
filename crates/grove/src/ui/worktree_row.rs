@@ -827,21 +827,39 @@ fn resource_line<'a>(worktree: &'a Worktree, selected: bool, stands: Stands) -> 
 /// is genuinely quiet, and saying so beats repeating its neighbour's state on
 /// every row.
 fn row_status(worktree: &Worktree, stands: Stands) -> Option<SessionStatus> {
-    match stands.as_window() {
+    match stood_for_window(worktree, stands) {
         Some(window) if worktree.reports_per_window() => worktree.window_status(window.index),
         _ => worktree.status,
     }
 }
 
+/// The window a row stands for, when it stands for exactly one.
+///
+/// A window row does. So does the leaf row of a worktree with a single window:
+/// `project_list::has_window_rows` gives it no header and no child rows, so that
+/// row *is* the window's row, and it reports and is bordered as one. A worktree
+/// folding two windows stands for neither.
+fn stood_for_window<'a>(worktree: &'a Worktree, stands: Stands<'a>) -> Option<&'a WindowInfo> {
+    stands
+        .as_window()
+        .or(match (worktree.windows.as_slice(), stands) {
+            ([only], Stands::Worktree | Stands::Project(_)) => Some(only),
+            _ => None,
+        })
+}
+
 /// The border a row earns, if any.
 ///
-/// Only window rows: a worktree row folds several windows, and bordering it
-/// would say "everything under here is busy" when one window is. Idle earns
-/// none, for the same reason it earns no edge — it is the resting state, and
-/// outlining every resting row leaves the two that matter nothing to stand out
-/// from.
+/// Rows that stand for one window get one. A worktree row that folds *several*
+/// windows does not: bordering it would say "everything under here is busy"
+/// when one window is. A worktree with a single window has no window rows under
+/// it — it is that window, drawn without a header — so it is bordered like the
+/// window row it stands in for, and a single-shell worktree does not lose the
+/// border the moment its second window closes. Idle earns none, for the same
+/// reason it earns no edge — it is the resting state, and outlining every
+/// resting row leaves the two that matter nothing to stand out from.
 fn row_border(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
-    if stands.as_window().is_none() || !worktree.session.exists() {
+    if stood_for_window(worktree, stands).is_none() || !worktree.session.exists() {
         return None;
     }
     match row_status(worktree, stands)? {
@@ -1318,6 +1336,7 @@ mod tests {
         ];
         let agent = window(1, "agent", false);
         let shell = window(2, "shell", false);
+        worktree.windows = vec![agent.clone(), shell.clone()];
 
         assert_eq!(
             row_border(&worktree, Stands::Window(&agent)),
@@ -1342,6 +1361,64 @@ mod tests {
         worktree.session = SessionPresence::None;
         worktree.window_notes = vec![note(1, SessionStatus::Working, None)];
         assert_eq!(row_border(&worktree, Stands::Window(&agent)), None);
+    }
+
+    /// A worktree with one window *is* that window's row — no header, no child
+    /// row — so it is bordered exactly as the window row would have been.
+    #[test]
+    fn a_single_window_worktree_row_is_bordered_like_a_window_row() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        let shell = window(0, "shell", true);
+        worktree.windows = vec![shell.clone()];
+
+        assert!(
+            !super::super::project_list::has_window_rows(&worktree),
+            "one window is drawn as the worktree's own leaf row"
+        );
+        assert_eq!(
+            row_border(&worktree, Stands::Worktree),
+            Some(theme::STATUS_WORKING)
+        );
+        assert_eq!(
+            row_border(&worktree, Stands::Worktree),
+            row_border(&worktree, Stands::Window(&shell)),
+            "the same row, drawn two ways, earns the same border"
+        );
+
+        // A second window hands the border back to the window rows.
+        worktree.windows.push(window(1, "agent", false));
+        assert_eq!(row_border(&worktree, Stands::Worktree), None);
+    }
+
+    /// The status follows the same rule: with one window the row reports that
+    /// window, so both ways of drawing it say the same thing.
+    #[test]
+    fn a_single_window_worktree_row_reports_its_window() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        let agent = window(0, "agent", true);
+        worktree.windows = vec![agent.clone()];
+        worktree.window_notes = vec![note(0, SessionStatus::Idle, None)];
+
+        assert_eq!(
+            row_status(&worktree, Stands::Worktree),
+            Some(SessionStatus::Idle),
+            "the window's own report, not the session-wide activity above it"
+        );
+        assert_eq!(
+            status_color(&worktree, Stands::Worktree),
+            status_color(&worktree, Stands::Window(&agent))
+        );
+
+        // Two windows, and the row stands for neither: it is the session's again.
+        worktree.windows.push(window(1, "shell", false));
+        assert_eq!(
+            row_status(&worktree, Stands::Worktree),
+            Some(SessionStatus::Working)
+        );
     }
 
     /// A window row cannot keep claiming work after the session it belongs to

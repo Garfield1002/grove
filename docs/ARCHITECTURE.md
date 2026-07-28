@@ -176,6 +176,11 @@ fidelity). Key elements beyond the original spec sketch:
   `@grove_project`) on Grove's private server, so kitty or foot reads
   `acme-web · working on auth` instead of `tmux`. Server-global, private
   socket only — the user's own tmux is untouched;
+- a row that stands for exactly one window — a window row, or the leaf row of
+  a worktree with a single window, which gets no header and no child rows —
+  reports that window and is bordered in its status colour. A worktree row
+  folding two or more windows reports the session and takes no border:
+  outlining it would say "everything under here is busy" when one window is;
 - a filter field as the whole header. The main window wears the compositor's
   title bar, so the app name, the drag handle and the close button are the
   window manager's; Restore is Ctrl+R and the project menus, and opening a
