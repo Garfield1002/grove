@@ -218,6 +218,33 @@ impl Worktree {
         self.window_notes.iter().find(|note| note.index == index)
     }
 
+    /// The status to show for window `index`, if that window reports.
+    ///
+    /// A note refines the session's status; it never contradicts it. A window
+    /// cannot be working while tmux says the whole session — every pane of it —
+    /// has been quiet for longer than the working window, so the note is
+    /// clamped to what the poller sees.
+    ///
+    /// That clamp is what makes a missed hook heal itself. An agent that
+    /// reported starting a turn and never reported ending one — an interrupted
+    /// turn, a crash, a Claude Code release that drops an event — would
+    /// otherwise leave its row claiming work for as long as Grove ran. The
+    /// poller has no such gap: it re-reads tmux every few seconds, and a quiet
+    /// session is quiet whatever was last said about it.
+    /// Attention is exempt: it is the one state Grove never infers and never
+    /// withdraws on its own, and a window whose agent is waiting on the user
+    /// is waiting whether or not anything has printed since.
+    pub fn window_status(&self, index: u32) -> Option<SessionStatus> {
+        let note = self.window_note(index)?;
+        Some(match self.status {
+            // Before the first poll there is nothing to clamp against, and the
+            // report is the only thing known about the window.
+            None => note.status,
+            _ if note.status == SessionStatus::Attention => SessionStatus::Attention,
+            Some(session) => note.status.min(session),
+        })
+    }
+
     /// Does anything about this worktree report per window?
     pub fn reports_per_window(&self) -> bool {
         !self.window_notes.is_empty()
@@ -333,6 +360,62 @@ mod tests {
         let a = worktrees_from_entries(&entries, "p1", Path::new("/home/u/a/.git"));
         let b = worktrees_from_entries(&entries, "p2", Path::new("/home/u/b/.git"));
         assert_ne!(a[0].id, b[0].id);
+    }
+
+    /// A report that work started, with no report that it ended, must not
+    /// outlive what tmux says about the session it came from.
+    #[test]
+    fn a_window_cannot_stay_working_in_a_quiet_session() {
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        worktree.window_notes = vec![WindowNote {
+            index: 1,
+            status: SessionStatus::Working,
+            message: Some("running the tests".into()),
+        }];
+
+        assert_eq!(
+            worktree.window_status(1),
+            Some(SessionStatus::Working),
+            "before the first poll the report is all there is"
+        );
+
+        worktree.status = Some(SessionStatus::Working);
+        assert_eq!(worktree.window_status(1), Some(SessionStatus::Working));
+
+        worktree.status = Some(SessionStatus::Idle);
+        assert_eq!(
+            worktree.window_status(1),
+            Some(SessionStatus::Idle),
+            "the session has been quiet for longer than the working window"
+        );
+
+        assert_eq!(worktree.window_status(0), None, "window 0 never reported");
+    }
+
+    /// The clamp is one-way: it can only quieten a window, never raise one.
+    #[test]
+    fn a_quiet_window_stays_quiet_in_a_busy_session() {
+        let mut worktree = Worktree::from_entry(&entry("/w"), "p", Path::new("/g"), true);
+        worktree.status = Some(SessionStatus::Attention);
+        worktree.window_notes = vec![
+            WindowNote {
+                index: 1,
+                status: SessionStatus::Idle,
+                message: None,
+            },
+            WindowNote {
+                index: 2,
+                status: SessionStatus::Attention,
+                message: Some("needs permission".into()),
+            },
+        ];
+        assert_eq!(worktree.window_status(1), Some(SessionStatus::Idle));
+        assert_eq!(worktree.window_status(2), Some(SessionStatus::Attention));
+
+        // A quiet poll cannot take a window's attention away either: only the
+        // user opening the session does that, and that clears the note too.
+        worktree.status = Some(SessionStatus::Idle);
+        assert_eq!(worktree.window_status(2), Some(SessionStatus::Attention));
     }
 
     #[test]

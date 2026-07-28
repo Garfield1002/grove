@@ -299,6 +299,16 @@ pub fn show(ui: &mut Ui, row: Row) -> Option<RowAction> {
                 .rect_filled(rect, radius, color);
         }
 
+        // A window with a status is bordered rather than merely edged. A window
+        // row is a child row in a tree, and the 3 px slot on its left sits
+        // under its parent's own edge where it is easy to miss; which window
+        // is busy, and which one wants the user, is what this list is scanned
+        // for. The colour is the status's own, so the border says nothing the
+        // edge did not — it says it where it can be seen.
+        if let Some(color) = row_border(worktree, stands) {
+            painter.rect_stroke(rect, radius, Stroke::new(1.0, color), StrokeKind::Inside);
+        }
+
         let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
         match (dot_presence(worktree, stands), row_status(worktree, stands)) {
             // Attention gets its own mark, not just a colour: it is the one
@@ -816,10 +826,26 @@ fn resource_line<'a>(worktree: &'a Worktree, selected: bool, stands: Stands) -> 
 /// every row.
 fn row_status(worktree: &Worktree, stands: Stands) -> Option<SessionStatus> {
     match stands.as_window() {
-        Some(window) if worktree.reports_per_window() => {
-            worktree.window_note(window.index).map(|note| note.status)
-        }
+        Some(window) if worktree.reports_per_window() => worktree.window_status(window.index),
         _ => worktree.status,
+    }
+}
+
+/// The border a row earns, if any.
+///
+/// Only window rows: a worktree row folds several windows, and bordering it
+/// would say "everything under here is busy" when one window is. Idle earns
+/// none, for the same reason it earns no edge — it is the resting state, and
+/// outlining every resting row leaves the two that matter nothing to stand out
+/// from.
+fn row_border(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
+    if stands.as_window().is_none() || !worktree.session.exists() {
+        return None;
+    }
+    match row_status(worktree, stands)? {
+        SessionStatus::Attention => Some(theme::STATUS_ATTENTION),
+        SessionStatus::Working => Some(theme::STATUS_WORKING),
+        SessionStatus::Idle => None,
     }
 }
 
@@ -1260,6 +1286,62 @@ mod tests {
             row_sublabel(&worktree, Stands::Window(&agent), None, false),
             None
         );
+    }
+
+    /// Green for work, amber for attention, nothing for a quiet window.
+    #[test]
+    fn a_window_rows_border_is_its_status() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Working);
+        worktree.window_notes = vec![
+            note(1, SessionStatus::Working, Some("running the tests")),
+            note(2, SessionStatus::Idle, None),
+        ];
+        let agent = window(1, "agent", false);
+        let shell = window(2, "shell", false);
+
+        assert_eq!(
+            row_border(&worktree, Stands::Window(&agent)),
+            Some(theme::STATUS_WORKING)
+        );
+        assert_eq!(row_border(&worktree, Stands::Window(&shell)), None);
+        assert_eq!(
+            row_border(&worktree, Stands::Worktree),
+            None,
+            "a worktree row folds windows that are not all working"
+        );
+
+        worktree.status = Some(SessionStatus::Attention);
+        worktree.window_notes = vec![note(1, SessionStatus::Attention, None)];
+        assert_eq!(
+            row_border(&worktree, Stands::Window(&agent)),
+            Some(theme::STATUS_ATTENTION)
+        );
+
+        // A window of a session that has gone is not working, whatever the
+        // last thing said about it was.
+        worktree.session = SessionPresence::None;
+        worktree.window_notes = vec![note(1, SessionStatus::Working, None)];
+        assert_eq!(row_border(&worktree, Stands::Window(&agent)), None);
+    }
+
+    /// A window row cannot keep claiming work after the session it belongs to
+    /// has gone quiet: the missed `Stop` hook heals on the next poll.
+    #[test]
+    fn a_working_window_row_quietens_with_its_session() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.status = Some(SessionStatus::Idle);
+        worktree.window_notes = vec![note(1, SessionStatus::Working, Some("running the tests"))];
+        let agent = window(1, "agent", false);
+
+        assert_eq!(
+            row_status(&worktree, Stands::Window(&agent)),
+            Some(SessionStatus::Idle)
+        );
+        assert_eq!(status_color(&worktree, Stands::Window(&agent)), None);
+        assert_eq!(row_border(&worktree, Stands::Window(&agent)), None);
     }
 
     /// The figures are the whole session's, so they belong to the row that

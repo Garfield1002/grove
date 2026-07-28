@@ -151,15 +151,44 @@ pub fn activity_age(now_epoch: u64, activity_epoch: u64) -> Duration {
     Duration::from_secs(now_epoch.saturating_sub(activity_epoch))
 }
 
-/// The status implied by one poll, ignoring any latch.
+/// Whether a session's agent speaks for itself through `grove notify`.
+///
+/// This picks which of the two "working" rules applies. The process-name rule
+/// — a running `claude` means work — is a stand-in for an agent that cannot
+/// say what it is doing. It is also permanently true: an agent sitting at its
+/// prompt with nothing to do is the same process as one mid-turn, so a session
+/// judged that way can never be reported as finished. Where the agent does
+/// report, the stand-in is worse than the thing it stands in for and is
+/// dropped: pane activity decides, which a waiting agent stops producing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Reporting {
+    /// Nothing in this session has ever reported.
+    #[default]
+    Silent,
+    /// Its agent has reported at least once, so it will report again.
+    Speaks,
+}
+
+/// The status implied by one poll of a session that has never reported.
 pub fn classify(signals: &SessionSignals, policy: &StatusPolicy) -> SessionStatus {
+    classify_as(signals, policy, Reporting::Silent)
+}
+
+/// The status implied by one poll, ignoring any latch.
+pub fn classify_as(
+    signals: &SessionSignals,
+    policy: &StatusPolicy,
+    reporting: Reporting,
+) -> SessionStatus {
     if signals.attention_flag || (policy.bell_is_attention && signals.bell) {
         return SessionStatus::Attention;
     }
     let recently_active = signals
         .activity_age
         .is_some_and(|age| age <= policy.working_window);
-    if recently_active || policy.agent_running(&signals.pane_commands) {
+    let agent_running =
+        reporting == Reporting::Silent && policy.agent_running(&signals.pane_commands);
+    if recently_active || agent_running {
         return SessionStatus::Working;
     }
     SessionStatus::Idle
@@ -208,6 +237,9 @@ impl SessionReport {
 pub struct StatusEngine {
     policy: StatusPolicy,
     latched: HashSet<String>,
+    /// Worktrees whose agent has reported at least once this run. See
+    /// [`Reporting`]: it decides whether the process-name rule applies.
+    speaks: HashSet<String>,
 }
 
 impl StatusEngine {
@@ -215,6 +247,7 @@ impl StatusEngine {
         Self {
             policy,
             latched: HashSet::new(),
+            speaks: HashSet::new(),
         }
     }
 
@@ -229,7 +262,7 @@ impl StatusEngine {
 
     /// Fold one poll of a session into the engine and return what to display.
     pub fn observe(&mut self, worktree_id: &str, signals: &SessionSignals) -> SessionStatus {
-        let observed = classify(signals, &self.policy);
+        let observed = classify_as(signals, &self.policy, self.reporting(worktree_id));
         if observed == SessionStatus::Attention {
             self.latched.insert(worktree_id.to_string());
             return SessionStatus::Attention;
@@ -247,9 +280,21 @@ impl StatusEngine {
     /// latch: an agent reporting progress while a permission prompt is still
     /// open must not silently drop the user's attention marker. Only opening
     /// the session clears it.
+    /// Any report at all, of any state, also marks the session as one that
+    /// speaks for itself — which is what stops the poller from reading its
+    /// agent's process as work forever after it has said it is finished.
     pub fn notify(&mut self, worktree_id: &str, state: SessionStatus) {
+        self.speaks.insert(worktree_id.to_string());
         if state == SessionStatus::Attention {
             self.latched.insert(worktree_id.to_string());
+        }
+    }
+
+    /// Whether this worktree's agent has reported for itself this run.
+    pub fn reporting(&self, worktree_id: &str) -> Reporting {
+        match self.speaks.contains(worktree_id) {
+            true => Reporting::Speaks,
+            false => Reporting::Silent,
         }
     }
 
@@ -270,12 +315,14 @@ impl StatusEngine {
     /// worktree removed. This is bookkeeping, never a deletion trigger.
     pub fn forget(&mut self, worktree_id: &str) {
         self.latched.remove(worktree_id);
+        self.speaks.remove(worktree_id);
     }
 
     /// Drop latches for worktrees that no longer exist, so the set cannot grow
     /// without bound over a long-running session.
     pub fn retain_ids<F: Fn(&str) -> bool>(&mut self, keep: F) {
         self.latched.retain(|id| keep(id));
+        self.speaks.retain(|id| keep(id));
     }
 }
 
@@ -503,6 +550,84 @@ mod tests {
         assert!(engine.is_latched("aaaaaa"));
     }
 
+    /// The bug this exists to stop: an agent that has said it is finished
+    /// still has its process running, and reading that process as work would
+    /// mean a row that never stops claiming to be busy.
+    #[test]
+    fn a_reporting_agents_process_is_not_taken_as_work() {
+        let quiet_agent = SessionSignals {
+            activity_age: Some(Duration::from_secs(300)),
+            pane_commands: vec!["bash".into(), "claude".into()],
+            ..SessionSignals::default()
+        };
+        let policy = StatusPolicy::default();
+
+        // Nothing reports here, so the process is all there is to go on.
+        assert_eq!(
+            classify_as(&quiet_agent, &policy, Reporting::Silent),
+            SessionStatus::Working
+        );
+        assert_eq!(
+            classify_as(&quiet_agent, &policy, Reporting::Speaks),
+            SessionStatus::Idle,
+            "an agent that reports is waiting for a prompt, not working"
+        );
+    }
+
+    /// Reporting only drops the process rule. A reporting agent that is
+    /// actually doing something keeps its pane busy, and that still counts —
+    /// so does a build the user started in another window of the session.
+    #[test]
+    fn a_reporting_session_is_still_working_while_its_panes_are_busy() {
+        let busy = SessionSignals {
+            activity_age: Some(Duration::from_secs(2)),
+            pane_commands: vec!["claude".into()],
+            ..SessionSignals::default()
+        };
+        assert_eq!(
+            classify_as(&busy, &StatusPolicy::default(), Reporting::Speaks),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn one_report_marks_a_session_as_one_that_speaks() {
+        let mut engine = StatusEngine::default();
+        let quiet_agent = SessionSignals {
+            activity_age: Some(Duration::from_secs(300)),
+            pane_commands: vec!["claude".into()],
+            ..SessionSignals::default()
+        };
+        assert_eq!(engine.reporting("abc123"), Reporting::Silent);
+        assert_eq!(
+            engine.observe("abc123", &quiet_agent),
+            SessionStatus::Working
+        );
+
+        // Any state does it: the point is that this agent talks, not what it
+        // said.
+        engine.notify("abc123", SessionStatus::Working);
+        assert_eq!(engine.reporting("abc123"), Reporting::Speaks);
+        assert_eq!(engine.observe("abc123", &quiet_agent), SessionStatus::Idle);
+        assert_eq!(
+            engine.observe("def456", &quiet_agent),
+            SessionStatus::Working,
+            "a session that has never reported is unaffected"
+        );
+    }
+
+    /// A latch outranks everything, including a session judged idle now that
+    /// its agent's process no longer counts.
+    #[test]
+    fn attention_still_latches_over_a_reporting_session() {
+        let mut engine = StatusEngine::default();
+        engine.notify("abc123", SessionStatus::Attention);
+        assert_eq!(
+            engine.observe("abc123", &signals_idle()),
+            SessionStatus::Attention
+        );
+    }
+
     #[test]
     fn forget_and_retain_drop_stale_latches() {
         let mut engine = StatusEngine::default();
@@ -510,8 +635,10 @@ mod tests {
         engine.notify("bbbbbb", SessionStatus::Attention);
         engine.forget("aaaaaa");
         assert!(!engine.is_latched("aaaaaa"));
+        assert_eq!(engine.reporting("aaaaaa"), Reporting::Silent);
         engine.retain_ids(|_| false);
         assert!(!engine.is_latched("bbbbbb"));
+        assert_eq!(engine.reporting("bbbbbb"), Reporting::Silent);
     }
 
     #[test]
