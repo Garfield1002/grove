@@ -1,15 +1,13 @@
-//! The status poller and the `grove notify` listener.
+//! The status poller and the service-delivery listener.
 //!
 //! Two threads, both feeding the same [`StatusEngine`] and the same UI message
 //! channel (ARCHITECTURE.md §2):
 //!
 //! - the **poller** asks tmux for signals on a fixed cadence and folds them
 //!   into the engine;
-//! - the **listener** accepts connections on the notify socket and folds
-//!   explicit reports in as they arrive, so attention appears immediately
-//!   rather than up to one poll later. The same socket carries `grove toggle`,
-//!   which touches neither the engine nor tmux and is passed straight to the
-//!   UI.
+//! - the **listener** accepts commands forwarded by `grove serve` on the
+//!   GUI-only socket and folds explicit reports in as they arrive. The public
+//!   notify socket belongs to the service and outlives this process.
 //!
 //! The engine is shared behind a mutex because three parties touch it: the two
 //! threads here and the UI, which clears a worktree's attention latch when the
@@ -197,11 +195,19 @@ impl StatusWatch {
         };
         spawn("grove-poller", move || poller.run(control_rx));
 
-        let socket = paths.notify_socket();
+        let socket = paths.gui_socket();
+        let service_socket = paths.notify_socket();
         let listener_engine = Arc::clone(&engine);
         let listener_control = control_tx.clone();
         spawn("grove-notify", move || {
-            listen(socket, listener_engine, out, ctx, listener_control);
+            listen(
+                socket,
+                service_socket,
+                listener_engine,
+                out,
+                ctx,
+                listener_control,
+            );
         });
 
         Self {
@@ -445,6 +451,7 @@ impl Poller {
 /// Accept notifications until the channel to the UI closes.
 fn listen(
     socket: std::path::PathBuf,
+    service_socket: std::path::PathBuf,
     engine: SharedEngine,
     out: Sender<Message>,
     ctx: egui::Context,
@@ -459,6 +466,20 @@ fn listen(
             return;
         }
     };
+
+    // The service may have been spawned moments before this thread. Announce
+    // readiness with a short bounded retry so reports queued during GUI
+    // startup are delivered instead of waiting for another command.
+    for _ in 0..20 {
+        match ipc::send_command(&service_socket, &Command::GuiReady) {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                eprintln!("grove: could not announce the GUI to the service: {error}");
+                break;
+            }
+        }
+    }
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -487,6 +508,10 @@ fn listen(
                 let _ = control.send(Control::PollNow);
                 Message::Notified(Box::new(notification))
             }
+            // These are consumed by the service and should never be
+            // forwarded. Ignore them defensively rather than inventing a UI
+            // action if a malformed client writes to the private socket.
+            Command::Ping | Command::GuiReady => continue,
         };
         if out.send(message).is_err() {
             return;

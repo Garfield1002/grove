@@ -97,6 +97,21 @@ These commands are read-only. Worktree discovery reads Git as the source of
 truth, session discovery reads Grove's private tmux server, and an unavailable
 repository is reported without hiding healthy projects from the response.
 
+### Local service
+
+Grove starts a small local service on demand:
+
+```bash
+grove serve
+```
+
+It owns the public runtime socket independently of the GUI. Agent reports that
+arrive while the GUI is closed are held until the next GUI connects, and
+`grove toggle` can ask the service to launch the GUI. The service never owns
+terminal processes; tmux remains the persistent terminal runtime. Running
+`grove serve` directly keeps it in the foreground, which is useful for service
+managers and diagnostics.
+
 ## Reaching a worktree from anywhere
 
 Grove cannot bind a desktop shortcut itself, so it provides a command to bind:
@@ -214,7 +229,7 @@ pane. To get the status bar back, `set -g status on` in your `tmux.conf`.
 | `~/.config/grove/tmux.conf` | Yours. Written once, then never again. |
 | `~/.config/grove/grove.tmux.conf` | Grove's. Rewritten every start — don't edit. |
 | `~/.local/state/grove/state.toml` | The index: projects, sessions, numbers. |
-| `$XDG_RUNTIME_DIR/grove/` | The tmux and notify sockets. |
+| `$XDG_RUNTIME_DIR/grove/` | The tmux, service, and live-GUI sockets. |
 
 Losing `state.toml` loses nothing important. Worktree IDs are derived from the
 repository and path, so Grove re-derives the same ones and reattaches to the

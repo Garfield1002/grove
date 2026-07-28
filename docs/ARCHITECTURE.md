@@ -19,7 +19,7 @@ This document records the *resolved* architecture. The full product design
 | Status detection | **Interval poller, paced by what is on screen** | Background thread polls tmux every ~2 s and git status every ~10 s per visible project, diffs against cache, sends deltas to the UI. While the UI paints nothing (minimised, another workspace, fully occluded) the tmux poll drops to ~30 s and the git poll stops entirely; the first frame after that gap polls immediately. See §6. tmux hooks are a possible v2 upgrade. |
 | Worktree IDs | **Deterministic hash** | First 6 hex chars of a hash over `(git-common-dir, canonical worktree path)`. Session name = `wt-<id>`. Losing `state.toml` is recoverable: restore re-derives identical IDs and reattaches to live tmux sessions. |
 | Terminal default | **Auto-detect on first run** | Probe PATH in order (`ptyxis`, `foot`, `alacritty`, `kitty`, `gnome-terminal`); write the winning template into `config.toml` so it is visible and editable. |
-| Agent attention | **`grove notify` CLI + IPC** | The `grove` binary doubles as a CLI. Agent wrappers (e.g. Claude Code hooks) call `grove notify --session <id> --state attention`; the GUI receives it over a local IPC socket. Architected from v1, fully wired in Milestone 4. |
+| Agent attention | **`grove notify` CLI + persistent local service** | Agent wrappers call `grove notify --session <id> --state attention`. `grove serve` owns the public runtime socket independently of the GUI, queues the latest report per worktree while no GUI is attached, and forwards live reports to the GUI-only socket. The tmux attention option remains the durable recovery truth. |
 | Claude Code | **`grove notify --hook` + `grove hooks`** | One command on every hook event reads Claude Code's JSON payload on stdin and reports from it: the state, the message, the window, and the conversation id. `grove hooks install` merges that command into `settings.json`, preserving the user's own hooks. See §6.1. |
 | Resource accounting | **systemd scopes (opt-in setting)** | On systemd machines, agent/user commands launched inside panes are wrapped in `systemd-run --user --scope --collect --unit=grove-<wt-id>-<kind>-<nonce>.scope --`. Each agent gets its own cgroup → per-agent/per-project RAM/CPU read from `/sys/fs/cgroup` (`memory.current`, `cpu.stat`), later `MemoryMax`/kill-by-scope. Auto-detected (systemd user manager present), off otherwise. Plain shells stay unwrapped. Implemented in Milestone 4. |
 | Crate layout | **Workspace: `grove-core` + `grove`** | Core (git, tmux, state, reconcile — no UI deps, fully testable) plus the binary crate (egui UI + CLI subcommands). |
@@ -29,14 +29,20 @@ This document records the *resolved* architecture. The full product design
 
 ```text
 ┌─────────────────────────────┐
+│ grove serve                 │◀── grove notify / grove toggle
+│  public IPC socket          │
+│  queue while GUI is absent  │
+└──────────────┬──────────────┘
+               │ GUI-only socket
+               ▼
+┌─────────────────────────────┐
 │ grove (GUI process)         │
 │  egui event loop (main)     │
 │  ├─ worker: git commands    │──▶ git CLI (arg arrays, never shell)
 │  ├─ worker: tmux commands   │──▶ tmux -S $SOCKET … (private server)
 │  ├─ poller thread (2s/10s,  │
 │  │    30s while off screen) │
-│  └─ IPC listener thread     │◀── grove notify (from agent hooks)
-│                             │◀── grove toggle (from a WM shortcut)
+│  └─ IPC delivery thread     │◀── service-forwarded reports and toggles
 └─────────────────────────────┘
          │ launches (detached)
          ▼
@@ -76,6 +82,12 @@ This document records the *resolved* architecture. The full product design
   spawns an additional client without retargeting the primary one.
 - Each session exports `GROVE_SESSION=<id>` so wrappers and hooks can call
   `grove notify` without configuration.
+- **Persistent local service.** `$XDG_RUNTIME_DIR/grove/notify.sock` belongs
+  to `grove serve`, not the GUI. The GUI listens separately on `gui.sock` and
+  announces readiness to the service. The service keeps only the latest
+  undelivered notification per worktree, launches the GUI for an undelivered
+  toggle, and never owns or inspects terminal contents. Grove starts it on
+  demand; invoking `grove serve` directly runs it in the foreground.
 
 ## 3. Workspace layout
 

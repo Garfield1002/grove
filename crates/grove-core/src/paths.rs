@@ -117,6 +117,12 @@ impl Paths {
         crate::ipc::socket_path(&self.runtime_dir)
     }
 
+    /// Private delivery socket owned by the GUI. The public notify socket is
+    /// owned by `grove serve`; the service forwards live UI commands here.
+    pub fn gui_socket(&self) -> PathBuf {
+        crate::ipc::gui_socket_path(&self.runtime_dir)
+    }
+
     /// Grove's own tmux configuration, passed as `-f`. Without it a private
     /// server would still read `~/.tmux.conf`.
     pub fn tmux_config_file(&self) -> PathBuf {
@@ -197,6 +203,10 @@ mod tests {
         assert_eq!(
             paths.notify_socket(),
             PathBuf::from("/run/user/1000/grove/notify.sock")
+        );
+        assert_eq!(
+            paths.gui_socket(),
+            PathBuf::from("/run/user/1000/grove/gui.sock")
         );
         assert_eq!(
             paths.tmux_config_file(),

@@ -82,6 +82,10 @@ pub struct GroveApp {
     /// The number `grove toggle <n>` started this process for, opened as soon
     /// as the first reconciliation says what that number points at.
     pending_toggle: Option<u8>,
+    /// Whether Git/tmux reconciliation has produced the rows a numbered
+    /// toggle resolves against. Service-delivered toggles can arrive during
+    /// GUI startup and must wait just like a toggle that launched the process.
+    reconciled_once: bool,
     /// Whether this launch has already asked to bring its agents back. One
     /// pass per process: reconciliation also runs on refresh, on adopting an
     /// orphan and on closing one, and none of those is a restart.
@@ -104,6 +108,12 @@ const OPEN_PROJECT_VIEWPORT: &str = "grove-open-project-window";
 impl GroveApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, pending_toggle: Option<u8>) -> Self {
         theme::apply(&cc.egui_ctx);
+        if let Err(error) = crate::service::ensure_running(&paths) {
+            // The GUI and tmux sessions remain usable. Agent attention still
+            // has its durable tmux marker, but live reports and toggles will
+            // not be relayed until a service can start.
+            eprintln!("grove: could not start the local service: {error}");
+        }
         let (workers, messages) = Workers::start(paths.clone(), cc.egui_ctx.clone());
         let watch = StatusWatch::start(&paths, workers.message_sender(), cc.egui_ctx.clone());
 
@@ -167,6 +177,7 @@ impl GroveApp {
             quit_after_kill: false,
             pending_selection: None,
             pending_toggle,
+            reconciled_once: false,
             agents_resumed: false,
             open_project: Detached::default(),
             create: Detached::default(),
@@ -316,7 +327,16 @@ impl GroveApp {
                     self.windows = windows;
                     self.apply_session_windows();
                 }
-                Message::Toggled { slot } => self.apply_toggle(ctx, slot),
+                Message::Toggled { slot } => {
+                    if let Some(slot) = slot
+                        && !self.reconciled_once
+                    {
+                        self.pending_toggle = Some(slot);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    } else {
+                        self.apply_toggle(ctx, slot);
+                    }
+                }
                 Message::Notified(notification) => self.apply_notification(&notification),
                 Message::ClaudeHooks { op, change } => self.apply_hook_change(op, *change),
                 Message::BaseRefsLoaded {
@@ -718,6 +738,7 @@ impl GroveApp {
     /// keeps its record *and* its last known rows — a project on an unplugged
     /// drive must not look as though its worktrees were deleted.
     fn apply_reconciliation(&mut self, result: Reconciliation) {
+        self.reconciled_once = true;
         let summary = result.summary();
         for status in result.projects {
             let Some(project) = self.projects.iter_mut().find(|p| p.id == status.id) else {

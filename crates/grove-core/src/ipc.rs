@@ -38,6 +38,9 @@ use crate::status::SessionStatus;
 
 /// File name of the notify socket, inside the runtime directory.
 pub const SOCKET_FILE: &str = "notify.sock";
+/// GUI-only delivery socket. `grove serve` owns [`SOCKET_FILE`] and forwards
+/// commands here while the GUI is running.
+pub const GUI_SOCKET_FILE: &str = "gui.sock";
 
 /// Protocol version tag; the first field of every line.
 pub const VERSION: &str = "grove1";
@@ -45,6 +48,8 @@ pub const VERSION: &str = "grove1";
 const SEP: char = '\u{1}';
 const KIND_NOTIFY: &str = "notify";
 const KIND_TOGGLE: &str = "toggle";
+const KIND_PING: &str = "ping";
+const KIND_GUI_READY: &str = "gui-ready";
 
 /// How long `grove notify` waits on a GUI that has stopped reading. Short on
 /// purpose: the notification is best-effort and must not stall an agent.
@@ -84,6 +89,10 @@ pub enum Command {
     /// `grove toggle`: with a number, select the worktree carrying it and open
     /// its session; without one, the window itself is the subject.
     Toggle { slot: Option<u8> },
+    /// Liveness probe consumed by the headless service.
+    Ping,
+    /// The GUI has bound its private socket; flush queued commands to it.
+    GuiReady,
 }
 
 impl Command {
@@ -95,6 +104,8 @@ impl Command {
                 let slot = slot.map(|n| n.to_string()).unwrap_or_default();
                 format!("{VERSION}{SEP}{KIND_TOGGLE}{SEP}{slot}")
             }
+            Command::Ping => format!("{VERSION}{SEP}{KIND_PING}"),
+            Command::GuiReady => format!("{VERSION}{SEP}{KIND_GUI_READY}"),
         }
     }
 
@@ -142,6 +153,8 @@ impl Command {
                 };
                 Ok(Command::Toggle { slot })
             }
+            KIND_PING => Ok(Command::Ping),
+            KIND_GUI_READY => Ok(Command::GuiReady),
             other => Err(ProtocolError::Kind(other.to_string())),
         }
     }
@@ -232,7 +245,9 @@ impl Notification {
     pub fn decode(line: &str) -> std::result::Result<Self, ProtocolError> {
         match Command::decode(line)? {
             Command::Notify(notification) => Ok(notification),
-            Command::Toggle { .. } => Err(ProtocolError::Kind(KIND_TOGGLE.to_string())),
+            Command::Toggle { .. } | Command::Ping | Command::GuiReady => {
+                Err(ProtocolError::Kind(KIND_TOGGLE.to_string()))
+            }
         }
     }
 }
@@ -306,6 +321,10 @@ pub enum ProtocolError {
 /// The notify socket path inside a runtime directory.
 pub fn socket_path(runtime_dir: &Path) -> std::path::PathBuf {
     runtime_dir.join(SOCKET_FILE)
+}
+
+pub fn gui_socket_path(runtime_dir: &Path) -> std::path::PathBuf {
+    runtime_dir.join(GUI_SOCKET_FILE)
 }
 
 /// Send one notification to a running GUI.

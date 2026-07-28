@@ -6,6 +6,7 @@ mod app;
 mod hooks;
 mod notify;
 mod query;
+mod service;
 mod status_watch;
 mod toggle;
 mod ui;
@@ -26,6 +27,7 @@ Usage:
   grove project list   list registered projects as JSON
   grove worktree list  list current Git worktrees as JSON
   grove session list   list live Grove tmux sessions as JSON
+  grove serve       run Grove's headless local service
   grove --help     show this message
   grove --version  show the version
 ";
@@ -48,6 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("project" | "worktree" | "session") => {
             let paths = Paths::from_process_env()?;
             query::run(&args, &paths)?;
+            return Ok(());
+        }
+        Some("serve") => {
+            let paths = Paths::from_process_env()?;
+            service::run(&args[1..], &paths)?;
             return Ok(());
         }
         // Falls through to the GUI when nothing was listening: starting Grove
