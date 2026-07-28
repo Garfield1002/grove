@@ -203,6 +203,15 @@ pub fn hint(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).color(TEXT_FAINT)
 }
 
+/// A menu entry with its keyboard shortcut greyed out at the right edge.
+///
+/// The shortcut gets an explicit colour rather than egui's own weak tint, for
+/// the same reason [`hint`] does: `apply` sets `override_text_color`, and a
+/// `RichText` that names its colour is the only kind that survives it.
+pub fn menu_item(text: impl Into<egui::RichText>, shortcut: &str) -> egui::Button<'static> {
+    egui::Button::new(text.into()).shortcut_text(label(shortcut, FONT_SMALL, TEXT_FAINT))
+}
+
 /// A section caption: small, uppercase-weight, muted.
 pub fn caption(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).size(FONT_CHIP).color(TEXT_MUTED)

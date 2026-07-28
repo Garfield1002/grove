@@ -459,7 +459,10 @@ fn header(ui: &mut Ui, project: &Project, count: usize, openness: f32) -> Option
             *action = Some(Action::RefreshProject(project.id.clone()));
             ui.close();
         }
-        if ui.button("Create worktree…").clicked() {
+        if ui
+            .add(theme::menu_item("Create worktree…", "Ctrl+N"))
+            .clicked()
+        {
             *action = Some(Action::CreateWorktree(project.id.clone()));
             ui.close();
         }

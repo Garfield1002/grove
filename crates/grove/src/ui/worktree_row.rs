@@ -593,7 +593,7 @@ fn menu(
         Stands::Window(_) => "Open or switch to this window",
         _ => "Open or switch to session",
     };
-    if ui.button(open).clicked() {
+    if ui.add(theme::menu_item(open, "Enter")).clicked() {
         *action = Some(RowAction::Activate);
         ui.close();
     }
@@ -654,7 +654,10 @@ fn menu(
             } else {
                 number.to_string()
             };
-            if ui.button(label).clicked() {
+            if ui
+                .add(theme::menu_item(label, &format!("Alt+{number}")))
+                .clicked()
+            {
                 // Choosing the number it already carries takes it off, which
                 // is what Alt+<digit> does too.
                 *action = Some(RowAction::SetSlot((!held).then_some(number)));
@@ -673,7 +676,10 @@ fn menu(
     // project's own actions.
     if let Some(project) = stands.as_project() {
         ui.separator();
-        if ui.button("Create worktree…").clicked() {
+        if ui
+            .add(theme::menu_item("Create worktree…", "Ctrl+N"))
+            .clicked()
+        {
             *action = Some(RowAction::CreateWorktree);
             ui.close();
         }
@@ -702,7 +708,10 @@ fn menu(
     }
     ui.separator();
     if ui
-        .button(theme::label("Remove…", theme::FONT_BODY, theme::DANGER))
+        .add(theme::menu_item(
+            theme::label("Remove…", theme::FONT_BODY, theme::DANGER),
+            "Del",
+        ))
         .clicked()
     {
         *action = Some(RowAction::Remove);
