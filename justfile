@@ -62,6 +62,12 @@ print-claude-hook:
 
 # ------------------------------------------------------------------ install
 
+# Both halves stay separate recipes too: `install-desktop` alone refreshes the
+# entry and icon without a rebuild, `install` alone skips the desktop files.
+
+# The binary and the launcher entry: what a first install wants.
+install-all: install install-desktop
+
 # Install the grove binary into ~/.cargo/bin.
 install:
     cargo install --path crates/grove --locked

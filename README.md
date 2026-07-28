@@ -31,8 +31,15 @@ scrollback. Once set, attention stays until you open that session.
 ## Install
 
 ```bash
+just install-all
+```
+
+That installs the binary into `~/.cargo/bin` and adds the launcher entry and
+icon. `just install` does the binary alone; `just install-desktop` does the
+launcher entry alone. Without `just`:
+
+```bash
 cargo install --path crates/grove --locked
-just install-desktop     # launcher entry and icon; optional
 ```
 
 Then run it:
