@@ -97,7 +97,16 @@ This document records the *resolved* architecture. The full product design
   32 client threads, so a slow or malformed local client cannot stall the
   listener, exhaust threads, or affect legacy agent reports. Protocol version
   1 exposes `ping`, `project.list`, `worktree.list`, `session.list`,
-  `session.snapshot`, `state.replace`, and `state.reconcile`. The service is
+  `session.snapshot`, `state.replace`, `state.reconcile`, `event.subscribe`
+  and `event.unsubscribe`. A subscription receives one normal response and
+  then a stream of typed, monotonically revisioned events for the requested
+  state, reconciliation and notification topics. Each subscriber has a
+  bounded non-blocking queue; a full queue or failed write drops only that
+  subscriber. The GUI reconnects and requests an authoritative poll after a
+  gap, so this stream lowers latency without becoming a source of truth.
+  During migration, a healthy GUI notification subscription replaces legacy
+  forwarding; when it is absent or full, the existing `gui.sock` queue path
+  resumes automatically. The service is
   the sole production writer of `state.toml`; mutation and reconciliation
   requests share one lock and finish with an atomic save. The snapshot is a
   coherent bootstrap view built from one

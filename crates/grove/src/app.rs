@@ -11,6 +11,7 @@ use grove_core::git::StatusSummary;
 use grove_core::ipc::Notification;
 use grove_core::model::{Project, SessionPresence};
 use grove_core::notice::Notices;
+use grove_core::protocol::{Event, EventKind};
 use grove_core::reconcile::{OrphanSession, ProjectRef, Reconciliation};
 use grove_core::state::{AgentRecord, ProjectRecord, SessionRecord, State};
 use grove_core::status::{SessionReport, SessionStatus};
@@ -46,6 +47,9 @@ pub struct GroveApp {
     /// Grove's hooks in Claude Code's settings, as the last check found them.
     /// `None` until one has run.
     claude_hooks: Option<HookChange>,
+    /// Highest service event revision applied on this connection history.
+    /// Replayed or reordered frames are ignored; a gap is healed by polling.
+    last_service_revision: u64,
 
     config: Option<Config>,
     state: State,
@@ -160,6 +164,7 @@ impl GroveApp {
             windows: HashMap::new(),
             notices: Notices::default(),
             claude_hooks: None,
+            last_service_revision: 0,
             config: None,
             state: loaded,
             projects,
@@ -338,6 +343,11 @@ impl GroveApp {
                     }
                 }
                 Message::Notified(notification) => self.apply_notification(&notification),
+                Message::ServiceEvent(event) => self.apply_service_event(*event),
+                Message::ServiceEventsStarted { revision } => {
+                    self.last_service_revision = revision;
+                }
+                Message::ServiceEventsUnavailable => self.watch.send(Control::PollNow),
                 Message::ClaudeHooks { op, change } => self.apply_hook_change(op, *change),
                 Message::BaseRefsLoaded {
                     project_id,
@@ -620,6 +630,54 @@ impl GroveApp {
         }
         self.apply_window_notes();
         self.record_agent(notification);
+    }
+
+    fn apply_service_event(&mut self, event: Event) {
+        if event.revision <= self.last_service_revision {
+            return;
+        }
+        if event.revision > self.last_service_revision.saturating_add(1) {
+            // The bounded queue deliberately drops a slow subscriber. If a
+            // future transport replays across that gap, polling still makes
+            // git and tmux authoritative rather than trusting a partial log.
+            self.watch.send(Control::PollNow);
+        }
+        self.last_service_revision = event.revision;
+        match event.kind {
+            EventKind::StateChanged => {
+                #[derive(serde::Deserialize)]
+                struct Payload {
+                    state: State,
+                }
+                match serde_json::from_value::<Payload>(event.payload) {
+                    Ok(payload) => self.state = payload.state,
+                    Err(error) => eprintln!("grove: invalid state event: {error}"),
+                }
+            }
+            EventKind::ReconciliationCompleted => {
+                #[derive(serde::Deserialize)]
+                struct Payload {
+                    reconciliation: Reconciliation,
+                    state: State,
+                }
+                match serde_json::from_value::<Payload>(event.payload) {
+                    Ok(payload) => {
+                        self.apply_reconciliation(payload.reconciliation, payload.state);
+                    }
+                    Err(error) => eprintln!("grove: invalid reconciliation event: {error}"),
+                }
+            }
+            EventKind::NotificationReceived => {
+                #[derive(serde::Deserialize)]
+                struct Payload {
+                    notification: Notification,
+                }
+                match serde_json::from_value::<Payload>(event.payload) {
+                    Ok(payload) => self.apply_notification(&payload.notification),
+                    Err(error) => eprintln!("grove: invalid notification event: {error}"),
+                }
+            }
+        }
     }
 
     /// Remember the conversation an agent reported, so Grove can offer to

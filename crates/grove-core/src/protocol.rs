@@ -136,6 +136,36 @@ pub struct ResponseError {
     pub message: String,
 }
 
+/// Events a long-lived service subscription can request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    StateChanged,
+    ReconciliationCompleted,
+    NotificationReceived,
+}
+
+/// One revisioned event on a subscription connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Event {
+    pub protocol: u32,
+    pub revision: u64,
+    pub kind: EventKind,
+    pub payload: Value,
+}
+
+impl Event {
+    pub fn new(revision: u64, kind: EventKind, payload: Value) -> Self {
+        Self {
+            protocol: VERSION,
+            revision,
+            kind,
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("service message payload is empty")]
@@ -255,6 +285,17 @@ pub fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()
     write_json(stream, response)
 }
 
+pub fn read_event(stream: &mut UnixStream) -> Result<Event, Error> {
+    let event: Event = read_json(stream)?;
+    if event.protocol != VERSION {
+        return Err(Error::ProtocolVersion {
+            actual: event.protocol,
+            expected: VERSION,
+        });
+    }
+    Ok(event)
+}
+
 /// Send one request and wait for its matching response.
 pub fn call(socket: &Path, request: &Request) -> Result<Response, Error> {
     call_with_timeout(socket, request, IO_TIMEOUT)
@@ -294,6 +335,42 @@ pub fn call_with_timeout(
         });
     }
     Ok(response)
+}
+
+/// Open a long-lived event subscription. The request receives one normal
+/// response, after which the returned stream carries [`Event`] frames until
+/// either side disconnects. Reads have no timeout after the acknowledgement;
+/// service events are intentionally allowed to be quiet indefinitely.
+pub fn open_subscription(
+    socket: &Path,
+    request: &Request,
+) -> Result<(UnixStream, Response), Error> {
+    request.validate()?;
+    let mut stream =
+        UnixStream::connect(socket).map_err(|error| io("connect to Grove service", error))?;
+    configure(&stream)?;
+    write_json(&mut stream, request)?;
+    let response: Response = read_json(&mut stream)?;
+    response.validate()?;
+    if response.protocol != VERSION {
+        return Err(Error::ProtocolVersion {
+            actual: response.protocol,
+            expected: VERSION,
+        });
+    }
+    if response.id != request.id {
+        return Err(Error::Io {
+            context: "match service response",
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "subscription response id does not match request",
+            ),
+        });
+    }
+    stream
+        .set_read_timeout(None)
+        .map_err(|error| io("clear subscription read timeout", error))?;
+    Ok((stream, response))
 }
 
 #[cfg(test)]
@@ -374,6 +451,14 @@ mod tests {
             stream.write_timeout().expect("write timeout"),
             Some(IO_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn revisioned_events_round_trip() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        let event = Event::new(7, EventKind::StateChanged, json!({"state": {"version": 1}}));
+        write_json(&mut writer, &event).expect("write");
+        assert_eq!(read_event(&mut reader).expect("read"), event);
     }
 
     #[test]

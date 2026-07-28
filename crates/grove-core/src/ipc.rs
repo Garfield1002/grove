@@ -161,7 +161,7 @@ impl Command {
 }
 
 /// A status report from an agent wrapper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Notification {
     /// The worktree id, i.e. `$GROVE_SESSION` inside a Grove session.
     pub worktree_id: String,

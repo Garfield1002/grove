@@ -24,6 +24,7 @@ use grove_core::cgroup::Usage;
 use grove_core::config::StatusConfig;
 use grove_core::desktop::{self, Attention};
 use grove_core::ipc::{self, Command, Notification};
+use grove_core::protocol::{self, EventKind, Request};
 use grove_core::status::{SessionReport, SessionStatus, StatusEngine};
 use grove_core::{Error, Paths, TmuxServer, workflow};
 
@@ -199,14 +200,30 @@ impl StatusWatch {
         let service_socket = paths.notify_socket();
         let listener_engine = Arc::clone(&engine);
         let listener_control = control_tx.clone();
+        let listener_out = out.clone();
+        let listener_ctx = ctx.clone();
         spawn("grove-notify", move || {
             listen(
                 socket,
                 service_socket,
                 listener_engine,
-                out,
-                ctx,
+                listener_out,
+                listener_ctx,
                 listener_control,
+            );
+        });
+        let event_socket = paths.notify_socket();
+        let event_engine = Arc::clone(&engine);
+        let event_control = control_tx.clone();
+        let event_out = out.clone();
+        let event_ctx = ctx.clone();
+        spawn("grove-events", move || {
+            subscribe(
+                event_socket,
+                event_engine,
+                event_out,
+                event_ctx,
+                event_control,
             );
         });
 
@@ -445,6 +462,84 @@ impl Poller {
         if self.out.send(message).is_ok() {
             self.ctx.request_repaint();
         }
+    }
+}
+
+/// Keep one service event stream open for the life of the GUI. A disconnect
+/// is recoverable: the existing poller remains authoritative and this thread
+/// retries until the UI channel closes.
+fn subscribe(
+    socket: std::path::PathBuf,
+    engine: SharedEngine,
+    out: Sender<Message>,
+    ctx: egui::Context,
+    control: Sender<Control>,
+) {
+    let request = Request::new(
+        "gui-events",
+        "event.subscribe",
+        serde_json::json!({
+            "client": "gui",
+            "topics": [
+                EventKind::StateChanged,
+                EventKind::ReconciliationCompleted,
+                EventKind::NotificationReceived,
+            ]
+        }),
+    );
+    loop {
+        let (mut stream, response) = match protocol::open_subscription(&socket, &request) {
+            Ok(opened) => opened,
+            Err(error) => {
+                if out.send(Message::ServiceEventsUnavailable).is_err() {
+                    return;
+                }
+                eprintln!("grove: service event stream unavailable: {error}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        if !response.ok {
+            let detail = response
+                .error
+                .map(|error| format!("{}: {}", error.code, error.message))
+                .unwrap_or_else(|| "invalid subscription response".to_string());
+            eprintln!("grove: service rejected event subscription: {detail}");
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        let revision = response
+            .result
+            .as_ref()
+            .and_then(|value| value.get("revision"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if out
+            .send(Message::ServiceEventsStarted { revision })
+            .is_err()
+        {
+            return;
+        }
+        while let Ok(event) = protocol::read_event(&mut stream) {
+            if event.kind == EventKind::NotificationReceived {
+                #[derive(serde::Deserialize)]
+                struct Payload {
+                    notification: Notification,
+                }
+                if let Ok(payload) = serde_json::from_value::<Payload>(event.payload.clone()) {
+                    fold(&engine, &payload.notification);
+                    let _ = control.send(Control::PollNow);
+                }
+            }
+            if out.send(Message::ServiceEvent(Box::new(event))).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+        if out.send(Message::ServiceEventsUnavailable).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

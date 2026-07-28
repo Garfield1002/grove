@@ -114,7 +114,10 @@ It owns the public runtime socket independently of the GUI. Agent reports that
 arrive while the GUI is closed are held until the next GUI connects, and
 `grove toggle` can ask the service to launch the GUI. It is also the sole
 writer of `state.toml`: GUI changes and reconciliation pass through its
-versioned API and are serialized into atomic writes. The service never owns
+versioned API and are serialized into atomic writes. Connected clients can
+subscribe to revisioned state, reconciliation and notification events; the
+GUI uses that stream for immediate updates and keeps polling as recovery. The
+service never owns
 terminal processes; tmux remains the persistent terminal runtime. Running
 `grove serve` directly keeps it in the foreground, which is useful for service
 managers and diagnostics.

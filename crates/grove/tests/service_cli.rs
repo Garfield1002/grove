@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use grove_core::Paths;
 use grove_core::ipc::{self, Command as IpcCommand, Notification};
-use grove_core::protocol::{self, Request};
+use grove_core::protocol::{self, EventKind, Request};
 use grove_core::state::{self, AgentRecord, ProjectRecord, SlotRecord, State};
 use grove_core::status::SessionStatus;
 
@@ -105,6 +105,25 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         "project1"
     );
 
+    let subscription = Request::new(
+        "subscribe-1",
+        "event.subscribe",
+        serde_json::json!({
+            "topics": [
+                EventKind::StateChanged,
+                EventKind::ReconciliationCompleted,
+            ]
+        }),
+    );
+    let (mut event_stream, subscribed) =
+        protocol::open_subscription(&paths.notify_socket(), &subscription)
+            .expect("opens subscription");
+    assert!(subscribed.ok);
+    let subscription_id = subscribed.result.expect("subscription result")["subscription_id"]
+        .as_str()
+        .expect("subscription id")
+        .to_string();
+
     let replacement = State {
         projects: vec![ProjectRecord {
             id: "project2".into(),
@@ -136,6 +155,9 @@ fn service_queues_a_report_until_the_gui_is_ready() {
     )
     .expect("state replacement");
     assert!(replaced.ok);
+    let changed = protocol::read_event(&mut event_stream).expect("state event");
+    assert_eq!(changed.kind, EventKind::StateChanged);
+    assert_eq!(changed.payload["state"]["project"][0]["id"], "project2");
     let saved = state::load(&paths.state_file()).expect("service saved state");
     assert_eq!(saved.projects[0].id, "project2");
     assert_eq!(
@@ -176,6 +198,21 @@ fn service_queues_a_report_until_the_gui_is_ready() {
     let result = reconciled.result.expect("reconciliation result");
     assert_eq!(result["reconciliation"]["projects"], serde_json::json!([]));
     assert_eq!(result["state"]["project"][0]["id"], "project2");
+    let reconciliation = protocol::read_event(&mut event_stream).expect("reconciliation event");
+    assert_eq!(reconciliation.kind, EventKind::ReconciliationCompleted);
+    assert!(reconciliation.revision > changed.revision);
+
+    let unsubscribed = protocol::call(
+        &paths.notify_socket(),
+        &Request::new(
+            "unsubscribe-1",
+            "event.unsubscribe",
+            serde_json::json!({"subscription_id": subscription_id}),
+        ),
+    )
+    .expect("unsubscribe");
+    assert_eq!(unsubscribed.result.expect("result")["unsubscribed"], true);
+    drop(event_stream);
 
     if Command::new("tmux").arg("-V").output().is_ok() {
         let snapshot = protocol::call(

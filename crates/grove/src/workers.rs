@@ -315,6 +315,19 @@ pub enum Message {
     },
     /// An explicit `grove notify` report arrived over the socket.
     Notified(Box<Notification>),
+    /// A revisioned update streamed by the persistent service. Polling and
+    /// direct task responses remain the recovery path if this connection is
+    /// interrupted or a bounded subscriber queue overflows.
+    ServiceEvent(Box<protocol::Event>),
+    /// Baseline revision returned when a subscription is established. Events
+    /// begin after this point, and a reconnect may belong to a restarted
+    /// service whose counter starts over.
+    ServiceEventsStarted {
+        revision: u64,
+    },
+    /// The subscription disconnected or could not start. This is not a user
+    /// error: request an authoritative poll while the listener reconnects.
+    ServiceEventsUnavailable,
     /// Claude Code's hook configuration, after a check, an install or a
     /// removal.
     ClaudeHooks {

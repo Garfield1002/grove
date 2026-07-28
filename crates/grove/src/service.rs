@@ -5,17 +5,18 @@
 //! separate socket owned by the GUI, and useful commands are queued while the
 //! GUI is absent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use grove_core::ipc::{self, Command, Notification};
 use grove_core::paths::ensure_private_dir;
 use grove_core::process::Invocation;
-use grove_core::protocol::{self, Request, Response};
+use grove_core::protocol::{self, Event, EventKind, Request, Response};
 use grove_core::reconcile::{self, ProjectRef, Reconciliation};
 use grove_core::state::{STATE_VERSION, SessionRecord, State};
 use grove_core::{Paths, Result, TmuxServer, query, state};
@@ -30,6 +31,7 @@ Usage:
 
 const GUI_LAUNCH_GRACE: Duration = Duration::from_secs(5);
 const MAX_CLIENTS: usize = 32;
+const SUBSCRIBER_QUEUE: usize = 32;
 
 pub fn run(args: &[String], paths: &Paths) -> Result<()> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -45,8 +47,9 @@ pub fn run(args: &[String], paths: &Paths) -> Result<()> {
 
     ensure_private_dir(&paths.runtime_dir)?;
     let listener = ipc::bind(&paths.notify_socket())?;
-    let service = Arc::new(Mutex::new(Service::new(paths)));
-    let api = Arc::new(ApiContext::new(paths));
+    let events = Arc::new(EventHub::default());
+    let service = Arc::new(Mutex::new(Service::new(paths, Arc::clone(&events))));
+    let api = Arc::new(ApiContext::new(paths, events));
     let active_clients = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -113,6 +116,10 @@ fn handle_api(mut stream: UnixStream, first: u8, api: &ApiContext) {
             return;
         }
     };
+    if request.method == "event.subscribe" {
+        serve_subscription(stream, &request, api);
+        return;
+    }
     let response = dispatch_api(&request, api);
     if let Err(error) = protocol::write_response(&mut stream, &response) {
         eprintln!("grove serve: could not write an API response: {error}");
@@ -123,17 +130,97 @@ struct ApiContext {
     state_file: std::path::PathBuf,
     server: TmuxServer,
     state_gate: Mutex<()>,
+    events: Arc<EventHub>,
 }
 
 impl ApiContext {
-    fn new(paths: &Paths) -> Self {
+    fn new(paths: &Paths, events: Arc<EventHub>) -> Self {
         Self {
             state_file: paths.state_file(),
             // Read-only API calls must not create tmux configuration files.
             server: TmuxServer::new(paths.tmux_socket()),
             state_gate: Mutex::new(()),
+            events,
         }
     }
+}
+
+#[derive(Default)]
+struct EventHub {
+    revision: AtomicU64,
+    next_subscriber: AtomicU64,
+    subscribers: Mutex<HashMap<String, Subscriber>>,
+}
+
+struct Subscriber {
+    topics: HashSet<EventKind>,
+    sender: SyncSender<Event>,
+    replaces_legacy_gui_delivery: bool,
+}
+
+#[derive(Default)]
+struct PublishOutcome {
+    delivered: bool,
+    delivered_to_gui: bool,
+}
+
+impl EventHub {
+    fn subscribe(
+        &self,
+        topics: HashSet<EventKind>,
+        replaces_legacy_gui_delivery: bool,
+    ) -> (String, Receiver<Event>, u64) {
+        let id = format!(
+            "sub-{}",
+            self.next_subscriber.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let (sender, receiver) = sync_channel(SUBSCRIBER_QUEUE);
+        let mut subscribers = lock_subscribers(self);
+        let revision = self.revision.load(Ordering::Relaxed);
+        subscribers.insert(
+            id.clone(),
+            Subscriber {
+                topics,
+                sender,
+                replaces_legacy_gui_delivery,
+            },
+        );
+        (id, receiver, revision)
+    }
+
+    fn unsubscribe(&self, id: &str) -> bool {
+        lock_subscribers(self).remove(id).is_some()
+    }
+
+    fn publish(&self, kind: EventKind, payload: serde_json::Value) -> PublishOutcome {
+        let mut subscribers = lock_subscribers(self);
+        // Registration and revision assignment share this lock, giving the
+        // acknowledgement baseline and subsequent events one total order.
+        let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let event = Event::new(revision, kind, payload);
+        let mut outcome = PublishOutcome::default();
+        subscribers.retain(|_, subscriber| {
+            if !subscriber.topics.contains(&kind) {
+                return true;
+            }
+            match subscriber.sender.try_send(event.clone()) {
+                Ok(()) => {
+                    outcome.delivered = true;
+                    outcome.delivered_to_gui |= subscriber.replaces_legacy_gui_delivery;
+                    true
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            }
+        });
+        outcome
+    }
+}
+
+fn lock_subscribers(events: &EventHub) -> std::sync::MutexGuard<'_, HashMap<String, Subscriber>> {
+    events
+        .subscribers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(serde::Deserialize)]
@@ -146,6 +233,20 @@ struct ReplaceStateParams {
 #[serde(deny_unknown_fields)]
 struct ReconcileParams {
     projects: Vec<ProjectRef>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscribeParams {
+    topics: HashSet<EventKind>,
+    #[serde(default)]
+    client: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnsubscribeParams {
+    subscription_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -166,7 +267,10 @@ fn dispatch_api(request: &Request, api: &ApiContext) -> Response {
             ),
         );
     }
-    let accepts_params = matches!(request.method.as_str(), "state.replace" | "state.reconcile");
+    let accepts_params = matches!(
+        request.method.as_str(),
+        "state.replace" | "state.reconcile" | "event.unsubscribe"
+    );
     if !accepts_params
         && !matches!(&request.params, serde_json::Value::Null)
         && !request
@@ -205,12 +309,94 @@ fn dispatch_api(request: &Request, api: &ApiContext) -> Response {
         }),
         "state.replace" => replace_state(request, api),
         "state.reconcile" => reconcile_state(request, api),
+        "event.unsubscribe" => unsubscribe(request, api),
+        "event.subscribe" => Response::error(
+            &request.id,
+            "invalid_subscription",
+            "event.subscribe must use a streaming connection",
+        ),
         method => Response::error(
             &request.id,
             "method_not_found",
             format!("unknown service method `{method}`"),
         ),
     }
+}
+
+fn serve_subscription(mut stream: UnixStream, request: &Request, api: &ApiContext) {
+    if request.protocol != protocol::VERSION {
+        let response = Response::error(
+            &request.id,
+            "unsupported_protocol",
+            format!(
+                "protocol {} is unsupported; this service speaks {}",
+                request.protocol,
+                protocol::VERSION
+            ),
+        );
+        let _ = protocol::write_response(&mut stream, &response);
+        return;
+    }
+    let SubscribeParams { topics, client } = match serde_json::from_value(request.params.clone()) {
+        Ok(params) => params,
+        Err(error) => {
+            let response = Response::error(&request.id, "invalid_params", error.to_string());
+            let _ = protocol::write_response(&mut stream, &response);
+            return;
+        }
+    };
+    if topics.is_empty() {
+        let response = Response::error(
+            &request.id,
+            "invalid_params",
+            "at least one event topic is required",
+        );
+        let _ = protocol::write_response(&mut stream, &response);
+        return;
+    }
+    if client.as_deref().is_some_and(|client| client != "gui") {
+        let response = Response::error(
+            &request.id,
+            "invalid_params",
+            "subscription client must be `gui` when present",
+        );
+        let _ = protocol::write_response(&mut stream, &response);
+        return;
+    }
+    let (subscription_id, events, revision) = api
+        .events
+        .subscribe(topics, client.as_deref() == Some("gui"));
+    let response = Response::success(
+        &request.id,
+        json!({
+            "subscription_id": subscription_id,
+            "revision": revision,
+        }),
+    );
+    if protocol::write_response(&mut stream, &response).is_err() {
+        api.events.unsubscribe(&subscription_id);
+        return;
+    }
+    while let Ok(event) = events.recv() {
+        if protocol::write_json(&mut stream, &event).is_err() {
+            break;
+        }
+    }
+    api.events.unsubscribe(&subscription_id);
+}
+
+fn unsubscribe(request: &Request, api: &ApiContext) -> Response {
+    let UnsubscribeParams { subscription_id } = match serde_json::from_value(request.params.clone())
+    {
+        Ok(params) => params,
+        Err(error) => {
+            return Response::error(&request.id, "invalid_params", error.to_string());
+        }
+    };
+    Response::success(
+        &request.id,
+        json!({"unsubscribed": api.events.unsubscribe(&subscription_id)}),
+    )
 }
 
 fn replace_state(request: &Request, api: &ApiContext) -> Response {
@@ -233,7 +419,11 @@ fn replace_state(request: &Request, api: &ApiContext) -> Response {
     state.normalize();
     let _guard = lock_state(api);
     match state::save(&api.state_file, &state) {
-        Ok(()) => Response::success(&request.id, json!({"saved": true})),
+        Ok(()) => {
+            api.events
+                .publish(EventKind::StateChanged, json!({"state": state}));
+            Response::success(&request.id, json!({"saved": true}))
+        }
         Err(error) => Response::error(&request.id, "state_write_failed", error.to_string()),
     }
 }
@@ -263,11 +453,18 @@ fn reconcile_state(request: &Request, api: &ApiContext) -> Response {
             return Response::error(&request.id, "reconcile_failed", error.to_string());
         }
     };
-    if record_live_sessions(&mut state, &result)
-        && let Err(error) = state::save(&api.state_file, &state)
-    {
-        return Response::error(&request.id, "state_write_failed", error.to_string());
+    let state_changed = record_live_sessions(&mut state, &result);
+    if state_changed {
+        if let Err(error) = state::save(&api.state_file, &state) {
+            return Response::error(&request.id, "state_write_failed", error.to_string());
+        }
+        api.events
+            .publish(EventKind::StateChanged, json!({"state": state.clone()}));
     }
+    api.events.publish(
+        EventKind::ReconciliationCompleted,
+        json!({"reconciliation": result.clone(), "state": state.clone()}),
+    );
     match serde_json::to_value(ReconcileResult {
         reconciliation: &result,
         state: &state,
@@ -354,15 +551,17 @@ struct Service {
     pending_notifications: HashMap<String, Notification>,
     pending_slot: Option<u8>,
     gui_launching_since: Option<Instant>,
+    events: Arc<EventHub>,
 }
 
 impl Service {
-    fn new(paths: &Paths) -> Self {
+    fn new(paths: &Paths, events: Arc<EventHub>) -> Self {
         Self {
             gui_socket: paths.gui_socket(),
             pending_notifications: HashMap::new(),
             pending_slot: None,
             gui_launching_since: None,
+            events,
         }
     }
 
@@ -374,6 +573,13 @@ impl Service {
                 self.flush();
             }
             Command::Notify(notification) => {
+                let delivered = self.events.publish(
+                    EventKind::NotificationReceived,
+                    json!({"notification": notification.clone()}),
+                );
+                if delivered.delivered_to_gui {
+                    return;
+                }
                 if !self.forward(&Command::Notify(notification.clone())) {
                     // Only the latest report per worktree matters. Attention
                     // itself is additionally durable in tmux.
@@ -450,7 +656,7 @@ mod tests {
     #[test]
     fn notifications_queue_by_worktree_and_latest_wins() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut service = Service::new(&paths(temp.path()));
+        let mut service = Service::new(&paths(temp.path()), Arc::new(EventHub::default()));
         service.handle(Command::Notify(Notification::new(
             "abc123",
             SessionStatus::Working,
@@ -472,7 +678,7 @@ mod tests {
         let paths = paths(temp.path());
         std::fs::create_dir_all(&paths.runtime_dir).expect("mkdir");
         let listener = ipc::bind(&paths.gui_socket()).expect("bind");
-        let mut service = Service::new(&paths);
+        let mut service = Service::new(&paths, Arc::new(EventHub::default()));
         service.pending_notifications.insert(
             "abc123".into(),
             Notification::new("abc123", SessionStatus::Attention),
@@ -490,7 +696,7 @@ mod tests {
     #[test]
     fn api_dispatch_reports_versions_and_unknown_methods() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let api = ApiContext::new(&paths(temp.path()));
+        let api = ApiContext::new(&paths(temp.path()), Arc::new(EventHub::default()));
         let ping = dispatch_api(&Request::new("one", "ping", json!({})), &api);
         assert!(ping.ok);
         assert_eq!(ping.result.expect("result")["protocol"], protocol::VERSION);
@@ -514,5 +720,37 @@ mod tests {
             unsupported.error.expect("error").code,
             "unsupported_protocol"
         );
+    }
+
+    #[test]
+    fn a_slow_subscriber_is_dropped_without_blocking_publishers() {
+        let events = EventHub::default();
+        let (id, _receiver, _) = events.subscribe(HashSet::from([EventKind::StateChanged]), false);
+        for revision in 0..SUBSCRIBER_QUEUE {
+            let outcome = events.publish(EventKind::StateChanged, json!({"n": revision}));
+            assert!(outcome.delivered);
+        }
+        let overflow = events.publish(EventKind::StateChanged, json!({"n": "overflow"}));
+        assert!(!overflow.delivered);
+        assert!(
+            !events.unsubscribe(&id),
+            "the full subscriber was already isolated"
+        );
+    }
+
+    #[test]
+    fn only_a_gui_subscription_replaces_legacy_notification_delivery() {
+        let events = EventHub::default();
+        let (_observer, observer_events, _) =
+            events.subscribe(HashSet::from([EventKind::NotificationReceived]), false);
+        let observed = events.publish(EventKind::NotificationReceived, json!({}));
+        assert!(observed.delivered);
+        assert!(!observed.delivered_to_gui);
+        drop(observer_events);
+
+        let (_gui, _gui_events, _) =
+            events.subscribe(HashSet::from([EventKind::NotificationReceived]), true);
+        let delivered = events.publish(EventKind::NotificationReceived, json!({}));
+        assert!(delivered.delivered_to_gui);
     }
 }
