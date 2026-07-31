@@ -8,7 +8,6 @@ use grove_core::Paths;
 use grove_core::claude::HookChange;
 use grove_core::config::Config;
 use grove_core::ipc::Notification;
-use grove_core::model::Project;
 use grove_core::protocol::Event;
 use grove_core::reconcile::{OrphanSession, Reconciliation};
 use grove_core::state::State;
@@ -23,9 +22,11 @@ use crate::ui::{self, Action, theme};
 use crate::workers::{ErrorReport, Message, PickTarget, Task, Workers};
 
 mod rows;
+mod selection;
 mod service_events;
 
 use rows::Rows;
+use selection::{Selection, pressed_digit};
 use service_events::{ServiceEventAction, ServiceUpdate, classify_service_event};
 
 pub struct GroveApp {
@@ -47,12 +48,9 @@ pub struct GroveApp {
 
     config: Option<Config>,
 
-    selected: Option<String>,
-    /// The window row the user last opened, as (worktree id, window index).
-    /// Cleared when the selection moves to another worktree, so only one row
-    /// in the tree is ever drawn as selected.
-    selected_window: Option<(String, u32)>,
-    filter: String,
+    /// What the list has selected, and the filter that decides what it can
+    /// walk.
+    selection: Selection,
     status: Option<String>,
     errors: Vec<ErrorReport>,
 
@@ -129,9 +127,7 @@ impl GroveApp {
             claude_hooks: None,
             last_service_revision: 0,
             config: None,
-            selected: None,
-            selected_window: None,
-            filter: String::new(),
+            selection: Selection::default(),
             status: None,
             errors: Vec::new(),
             orphans: Vec::new(),
@@ -230,7 +226,7 @@ impl GroveApp {
                         && let Some(project) = self.rows.project(&project_id)
                         && let Some(worktree) = project.worktrees.iter().find(|w| &w.path == path)
                     {
-                        self.selected = Some(worktree.id.clone());
+                        self.selection.select(worktree.id.clone());
                         self.pending_selection = None;
                     }
                     self.describe_worktrees();
@@ -254,7 +250,7 @@ impl GroveApp {
                     session,
                 } => {
                     self.status = Some(format!("{session} is now this worktree's session."));
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                     self.orphan_armed = None;
                     self.reconcile();
                 }
@@ -278,12 +274,12 @@ impl GroveApp {
                         n => format!("Resumed {n} agent conversations."),
                     });
                     if let Some(first) = worktree_ids.first() {
-                        self.selected = Some(first.clone());
+                        self.selection.select(first.clone());
                     }
                     self.watch.send(Control::PollNow);
                 }
                 Message::AgentStarted { worktree_id, unit } => {
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                     self.status = Some(match unit {
                         Some(unit) => format!("Started the agent in {unit}"),
                         None => "Started the agent".to_string(),
@@ -385,13 +381,13 @@ impl GroveApp {
                     activation,
                 } => {
                     self.status = Some(describe(&activation));
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                 }
                 Message::WindowOpened {
                     worktree_id,
                     window,
                 } => {
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                     self.status = Some(format!(
                         "Opened window {} in {}",
                         window.window, window.session
@@ -665,7 +661,7 @@ impl GroveApp {
                 resume,
                 idempotency_key: format!("gui-agent-start-{}", grove_core::agent::nonce()),
             });
-            self.selected = Some(worktree_id.to_string());
+            self.selection.select(worktree_id.to_string());
         }
     }
 
@@ -700,7 +696,7 @@ impl GroveApp {
                         idempotency_key: format!("gui-session-open-{}", grove_core::agent::nonce()),
                     });
                     self.clear_attention(&worktree_id);
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                 }
             }
             Action::StartAgent {
@@ -736,7 +732,7 @@ impl GroveApp {
                     }
                 }
             }
-            Action::SelectWorktree { worktree_id, .. } => self.selected = Some(worktree_id),
+            Action::SelectWorktree { worktree_id, .. } => self.selection.select(worktree_id),
             Action::SetWorktreeSlot { worktree_id, slot } => match slot {
                 Some(slot) => self.set_slot(&worktree_id, slot),
                 None => {
@@ -751,7 +747,7 @@ impl GroveApp {
             } => {
                 if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
                     let target = worktree.id.clone();
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                     self.workers.send(Task::OpenInNewTerminal {
                         worktree_id: target,
                         idempotency_key: format!(
@@ -767,7 +763,7 @@ impl GroveApp {
             } => {
                 if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
                     let target = worktree.id.clone();
-                    self.selected = Some(worktree_id);
+                    self.selection.select(worktree_id);
                     self.workers.send(Task::OpenNewWindow {
                         worktree_id: target,
                         idempotency_key: format!(
@@ -795,8 +791,7 @@ impl GroveApp {
                         ),
                     });
                     self.clear_attention(&worktree_id);
-                    self.selected_window = Some((worktree_id.clone(), window_index));
-                    self.selected = Some(worktree_id);
+                    self.selection.select_window(worktree_id, window_index);
                 }
             }
             Action::RemoveWorktree {
@@ -815,15 +810,6 @@ impl GroveApp {
                     self.status = Some(format!("Point Grove at {name} where it lives now."));
                 }
             }
-        }
-        // Exactly one row in the tree is selected: a window's highlight only
-        // survives while its own worktree is the selected one.
-        if self
-            .selected_window
-            .as_ref()
-            .is_some_and(|(id, _)| Some(id.as_str()) != self.selected.as_deref())
-        {
-            self.selected_window = None;
         }
     }
 
@@ -913,7 +899,7 @@ impl GroveApp {
         let Some(worktree) = project.worktree(worktree_id) else {
             return;
         };
-        self.selected = Some(worktree_id.to_string());
+        self.selection.select(worktree_id.to_string());
         let gather = Task::GatherRemoval {
             worktree_id: worktree.id.clone(),
         };
@@ -1194,35 +1180,8 @@ impl GroveApp {
         }
     }
 
-    /// The rows the keyboard walks: every visible worktree, in list order.
-    fn visible_rows(&self) -> Vec<(String, String)> {
-        visible_rows(self.rows.projects(), &self.filter)
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        let rows = self.visible_rows();
-        if let Some(next) = next_selection(&rows, self.selected.as_deref(), delta) {
-            self.selected = Some(next);
-        }
-    }
-
     fn selected_row(&self) -> Option<(String, String)> {
-        let selected = self.selected.as_ref()?;
-        self.visible_rows()
-            .into_iter()
-            .find(|(_, worktree_id)| worktree_id == selected)
-    }
-
-    /// The project a keyboard shortcut acts on: the selected row's project,
-    /// else the only project, else nothing.
-    fn context_project(&self) -> Option<String> {
-        if let Some((project_id, _)) = self.selected_row() {
-            return Some(project_id);
-        }
-        match self.rows.projects() {
-            [only] => Some(only.id.clone()),
-            _ => None,
-        }
+        self.selection.row(self.rows.projects())
     }
 
     /// Keyboard navigation for the main window (DESIGN.md §16).
@@ -1262,10 +1221,10 @@ impl GroveApp {
         });
 
         if down {
-            self.move_selection(1);
+            self.selection.move_by(self.rows.projects(), 1);
         }
         if up {
-            self.move_selection(-1);
+            self.selection.move_by(self.rows.projects(), -1);
         }
         if enter && let Some((project_id, worktree_id)) = self.selected_row() {
             self.apply_action(Action::ActivateWorktree {
@@ -1276,7 +1235,7 @@ impl GroveApp {
         if remove && let Some((project_id, worktree_id)) = self.selected_row() {
             self.open_removal_dialog(&project_id, &worktree_id);
         }
-        if new && let Some(project_id) = self.context_project() {
+        if new && let Some(project_id) = self.selection.context_project(self.rows.projects()) {
             self.open_create_dialog(&project_id);
         }
         // Ctrl+R is the Restore chip: a full reconciliation against git and
@@ -1360,7 +1319,7 @@ impl GroveApp {
                     ui::icons::magnifier(ui.painter(), glass, theme::TEXT_FAINT);
                     ui.add_space(2.0);
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
+                        egui::TextEdit::singleline(&mut self.selection.filter)
                             .frame(false)
                             .font(egui::FontId::proportional(theme::FONT_BODY))
                             .hint_text(theme::hint("Filter worktrees…"))
@@ -1598,12 +1557,9 @@ impl eframe::App for GroveApp {
                             ui,
                             self.rows.projects(),
                             ui::project_list::Tree {
-                                selected: self.selected.as_deref(),
-                                selected_window: self
-                                    .selected_window
-                                    .as_ref()
-                                    .map(|(id, index)| (id.as_str(), *index)),
-                                filter: &self.filter,
+                                selected: self.selection.worktree(),
+                                selected_window: self.selection.window(),
+                                filter: &self.selection.filter,
                                 home: self.home.as_deref(),
                                 slots: &self.rows.state().slots,
                                 agents: &self.rows.state().agents,
@@ -1656,74 +1612,11 @@ fn hairline(ctx: &egui::Context, at: egui::Pos2, width: f32) {
     );
 }
 
-/// The worktree rows the user can see, as (project id, worktree id) pairs, in
-/// list order. Collapsed projects and filtered-out rows are not walkable.
-fn visible_rows(projects: &[Project], filter: &str) -> Vec<(String, String)> {
-    let needle = filter.trim().to_ascii_lowercase();
-    let mut rows = Vec::new();
-    for project in projects {
-        if !project.is_expanded {
-            continue;
-        }
-        for worktree in &project.worktrees {
-            if ui::project_list::matches_filter(project, worktree, &needle) {
-                rows.push((project.id.clone(), worktree.id.clone()));
-            }
-        }
-    }
-    rows
-}
-
-/// The 1..=9 digit pressed with Alt this frame, if any.
-///
-/// Zero is not among them: the numbers are 1–9 (`state::MAX_SLOT`), and Alt+0
-/// meaning nothing is better than it quietly meaning something else.
-fn pressed_digit(input: &egui::InputState) -> Option<u8> {
-    if !input.modifiers.alt {
-        return None;
-    }
-    const DIGITS: [(egui::Key, u8); 9] = [
-        (egui::Key::Num1, 1),
-        (egui::Key::Num2, 2),
-        (egui::Key::Num3, 3),
-        (egui::Key::Num4, 4),
-        (egui::Key::Num5, 5),
-        (egui::Key::Num6, 6),
-        (egui::Key::Num7, 7),
-        (egui::Key::Num8, 8),
-        (egui::Key::Num9, 9),
-    ];
-    DIGITS
-        .iter()
-        .find(|(key, _)| input.key_pressed(*key))
-        .map(|(_, digit)| *digit)
-}
-
-/// The worktree id Up/Down should move to. `None` when there is nothing to
-/// select. The ends do not wrap: a held arrow key stops at the list edge.
-fn next_selection(
-    rows: &[(String, String)],
-    selected: Option<&str>,
-    delta: isize,
-) -> Option<String> {
-    if rows.is_empty() {
-        return None;
-    }
-    let current = selected.and_then(|id| rows.iter().position(|(_, w)| w == id));
-    let next = match current {
-        Some(index) => (index as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
-        // Nothing selected yet: Down starts at the top, Up at the bottom.
-        None if delta < 0 => rows.len() - 1,
-        None => 0,
-    };
-    Some(rows[next].1.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use grove_core::git::WorktreeEntry;
-    use grove_core::model::Worktree;
+    use grove_core::model::{Project, Worktree};
 
     fn project(id: &str, name: &str, branches: &[&str]) -> Project {
         let git_common_dir = PathBuf::from(format!("/home/u/{name}/.git"));
@@ -1751,132 +1644,6 @@ mod tests {
                 .collect(),
             unavailable: None,
         }
-    }
-
-    fn ids(rows: &[(String, String)]) -> Vec<String> {
-        rows.iter().map(|(_, w)| w.clone()).collect()
-    }
-
-    #[test]
-    fn alt_and_a_digit_is_what_assigns_a_number() {
-        assert_eq!(digit_press(egui::Key::Num3, egui::Modifiers::ALT), Some(3));
-        assert_eq!(digit_press(egui::Key::Num9, egui::Modifiers::ALT), Some(9));
-        // Without Alt the digits belong to the filter field.
-        assert_eq!(digit_press(egui::Key::Num3, egui::Modifiers::NONE), None);
-        assert_eq!(digit_press(egui::Key::Num3, egui::Modifiers::COMMAND), None);
-        // Zero is not a number a worktree can carry.
-        assert_eq!(digit_press(egui::Key::Num0, egui::Modifiers::ALT), None);
-    }
-
-    /// Run one headless frame carrying a single key press, and ask what
-    /// `pressed_digit` made of it.
-    fn digit_press(key: egui::Key, modifiers: egui::Modifiers) -> Option<u8> {
-        let ctx = egui::Context::default();
-        let mut digit = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                // `InputState::modifiers` comes from here, not from the events.
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
-                ..Default::default()
-            },
-            |ctx| digit = ctx.input(pressed_digit),
-        );
-        digit
-    }
-
-    #[test]
-    fn visible_rows_follow_the_list_order_across_projects() {
-        let projects = vec![
-            project("p1", "acme", &["main", "feature"]),
-            project("p2", "design", &["main"]),
-        ];
-        let rows = visible_rows(&projects, "");
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].0, "p1");
-        assert_eq!(rows[2].0, "p2");
-    }
-
-    #[test]
-    fn a_collapsed_project_is_not_walkable() {
-        let mut projects = vec![
-            project("p1", "acme", &["main", "feature"]),
-            project("p2", "design", &["main"]),
-        ];
-        projects[0].is_expanded = false;
-        let rows = visible_rows(&projects, "");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "p2");
-    }
-
-    #[test]
-    fn the_filter_narrows_what_the_keyboard_walks() {
-        let projects = vec![project("p1", "acme", &["main", "feature/auth"])];
-        let rows = visible_rows(&projects, "auth");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].1, projects[0].worktrees[1].id,
-            "only the matching row is selectable"
-        );
-    }
-
-    #[test]
-    fn selection_moves_one_row_at_a_time_and_stops_at_the_ends() {
-        let projects = vec![project("p1", "acme", &["a", "b", "c"])];
-        let rows = visible_rows(&projects, "");
-        let all = ids(&rows);
-
-        assert_eq!(
-            next_selection(&rows, Some(&all[0]), 1).as_ref(),
-            Some(&all[1])
-        );
-        assert_eq!(
-            next_selection(&rows, Some(&all[1]), -1).as_ref(),
-            Some(&all[0])
-        );
-        assert_eq!(
-            next_selection(&rows, Some(&all[0]), -1).as_ref(),
-            Some(&all[0]),
-            "the top does not wrap to the bottom"
-        );
-        assert_eq!(
-            next_selection(&rows, Some(&all[2]), 1).as_ref(),
-            Some(&all[2]),
-            "the bottom does not wrap to the top"
-        );
-    }
-
-    #[test]
-    fn with_nothing_selected_down_starts_at_the_top_and_up_at_the_bottom() {
-        let projects = vec![project("p1", "acme", &["a", "b", "c"])];
-        let rows = visible_rows(&projects, "");
-        let all = ids(&rows);
-        assert_eq!(next_selection(&rows, None, 1).as_ref(), Some(&all[0]));
-        assert_eq!(next_selection(&rows, None, -1).as_ref(), Some(&all[2]));
-    }
-
-    #[test]
-    fn a_selection_that_is_no_longer_visible_restarts_from_the_edge() {
-        let projects = vec![project("p1", "acme", &["a", "b"])];
-        let rows = visible_rows(&projects, "");
-        let all = ids(&rows);
-        assert_eq!(
-            next_selection(&rows, Some("gone"), 1).as_ref(),
-            Some(&all[0])
-        );
-    }
-
-    #[test]
-    fn an_empty_list_selects_nothing() {
-        assert_eq!(next_selection(&[], None, 1), None);
-        assert_eq!(next_selection(&[], Some("a1b2c3"), -1), None);
-        assert!(visible_rows(&[], "").is_empty());
     }
 
     #[test]
