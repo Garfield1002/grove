@@ -16,9 +16,11 @@ use grove_core::agent::Accounting;
 use grove_core::config::Config;
 use grove_core::config_write::{self, Edit};
 use grove_core::{Paths, terminal};
+#[cfg(feature = "agents")]
 use grove_harness::claude::HookChange;
 
 use super::{icons, theme};
+#[cfg(feature = "agents")]
 use crate::workers::HookOp;
 
 /// Sample values used for the live command preview. Real socket, illustrative
@@ -44,6 +46,7 @@ pub enum Action {
     /// Pick the default worktree parent with the native directory picker.
     BrowseWorktreeParent,
     /// Read, write or remove Grove's hooks in Claude Code's settings.
+    #[cfg(feature = "agents")]
     ClaudeHooks(HookOp),
 }
 
@@ -299,7 +302,7 @@ pub fn body(
     form: &mut Form,
     paths: &Paths,
     home: Option<&Path>,
-    hooks: Option<&HookChange>,
+    #[cfg(feature = "agents")] hooks: Option<&HookChange>,
 ) -> Option<Action> {
     let mut action = None;
     let fields = (ui.available_width() - LABEL_COLUMN - 12.0).max(200.0);
@@ -649,11 +652,18 @@ pub fn body(
         });
 
     // ------------------------------------------------------- Claude Code hooks
-    ui.add_space(14.0);
-    ui.separator();
-    ui.add_space(8.0);
-    if let Some(hook_action) = claude_hooks(ui, hooks) {
-        action = Some(hook_action);
+    //
+    // The pane's one agent-specific section. Without the feature there is
+    // nothing to install hooks into, so the section is absent rather than
+    // present and inert.
+    #[cfg(feature = "agents")]
+    {
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        if let Some(hook_action) = claude_hooks(ui, hooks) {
+            action = Some(hook_action);
+        }
     }
 
     // ------------------------------------------------------------------ paths
@@ -728,6 +738,7 @@ pub fn body(
 /// thing Grove refuses to infer for itself — so this says plainly whether that
 /// path is wired up, rather than leaving a silent row to be explained by a
 /// worktree that never lights up.
+#[cfg(feature = "agents")]
 fn claude_hooks(ui: &mut egui::Ui, hooks: Option<&HookChange>) -> Option<Action> {
     let mut action = None;
     ui.horizontal(|ui| {

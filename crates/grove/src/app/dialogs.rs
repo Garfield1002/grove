@@ -152,6 +152,7 @@ impl GroveApp {
             ui::settings::Action::OpenConfigFile => self
                 .workers
                 .send(Task::OpenWithDesktop(self.paths.config_file())),
+            #[cfg(feature = "agents")]
             ui::settings::Action::ClaudeHooks(op) => self.workers.send(Task::ClaudeHooks(op)),
             ui::settings::Action::BrowseWorktreeParent => {
                 let start = pick_start(&form.default_parent, self.home.as_deref());
@@ -313,6 +314,7 @@ impl GroveApp {
             return;
         };
         let (paths, home) = (&self.paths, self.home.as_deref());
+        #[cfg(feature = "agents")]
         let hooks = self.claude_hooks.as_ref();
 
         let mut action = None;
@@ -322,7 +324,14 @@ impl GroveApp {
             ui::chrome::viewport("Settings", ui::settings::SIZE, ui::settings::MIN_SIZE),
             |ctx, class| {
                 let dialog = ui::chrome::show(ctx, class, "Settings", |ui| {
-                    ui::settings::body(ui, &mut *form, paths, home, hooks)
+                    ui::settings::body(
+                        ui,
+                        &mut *form,
+                        paths,
+                        home,
+                        #[cfg(feature = "agents")]
+                        hooks,
+                    )
                 });
                 action = dialog.inner;
                 close |= dialog.close;

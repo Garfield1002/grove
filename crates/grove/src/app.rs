@@ -23,6 +23,7 @@ use grove_core::protocol::Event;
 use grove_core::reconcile::{OrphanSession, Reconciliation};
 use grove_core::state::State;
 use grove_core::workflow::Activation;
+#[cfg(feature = "agents")]
 use grove_harness::claude::HookChange;
 
 use crate::status_watch::{Control, StatusWatch};
@@ -55,6 +56,7 @@ pub struct GroveApp {
     rows: Rows,
     /// Grove's hooks in Claude Code's settings, as the last check found them.
     /// `None` until one has run.
+    #[cfg(feature = "agents")]
     claude_hooks: Option<HookChange>,
     /// Highest service event revision applied on this connection history.
     /// Replayed or reordered frames are ignored; a gap is healed by polling.
@@ -131,6 +133,7 @@ impl GroveApp {
             watch,
             messages,
             rows: Rows::default(),
+            #[cfg(feature = "agents")]
             claude_hooks: None,
             last_service_revision: 0,
             config: None,
@@ -312,6 +315,7 @@ impl GroveApp {
                     self.last_service_revision = revision;
                 }
                 Message::ServiceEventsUnavailable => self.watch.send(Control::PollNow),
+                #[cfg(feature = "agents")]
                 Message::ClaudeHooks { op, change } => self.apply_hook_change(op, *change),
                 Message::BaseRefsLoaded {
                     project_id,
@@ -524,6 +528,7 @@ impl GroveApp {
     }
 
     /// What Claude Code's settings say after a check, an install or a removal.
+    #[cfg(feature = "agents")]
     fn apply_hook_change(&mut self, op: crate::workers::HookOp, change: HookChange) {
         use crate::workers::HookOp;
         // A check is how the Settings pane finds out where things stand; only
@@ -1055,6 +1060,7 @@ impl GroveApp {
                         // Same reasoning for Claude Code's settings: reading
                         // that file is the worker's job, and the pane should
                         // open already knowing what it says.
+                        #[cfg(feature = "agents")]
                         self.workers
                             .send(Task::ClaudeHooks(crate::workers::HookOp::Check));
                         self.settings.open(form);

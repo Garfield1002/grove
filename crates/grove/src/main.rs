@@ -4,6 +4,7 @@
 
 mod app;
 mod control;
+#[cfg(feature = "agents")]
 mod hooks;
 mod notify;
 mod query;
@@ -24,7 +25,7 @@ Usage:
                    (see `grove toggle --help`)
   grove notify     report a session's status (see `grove notify --help`)
   grove hooks      install Grove's hooks into Claude Code's settings
-                   (see `grove hooks --help`)
+                   (see `grove hooks --help`; needs the `agents` feature)
   grove project list   list registered projects as JSON
   grove worktree list  list current Git worktrees as JSON
   grove session list   list live Grove tmux sessions as JSON
@@ -50,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             notify::run(&args[1..])?;
             return Ok(());
         }
+        #[cfg(feature = "agents")]
         Some("hooks") => {
             hooks::run(&args[1..])?;
             return Ok(());

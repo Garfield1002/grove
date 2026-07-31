@@ -10,15 +10,21 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-default = ["native-file-picker"]
+default = ["native-file-picker", "agents"]
 # The native directory picker. On Wayland `rfd` talks to xdg-desktop-portal,
 # so the dialog is the desktop's own. Building without it leaves every path
 # field typed by hand, which is the fallback in any case.
 native-file-picker = ["dep:rfd"]
+# Coding-agent support: starting an agent, resuming the conversation it
+# reported, and the Claude Code hook integration. Without it Grove is a Git
+# worktree and tmux session manager, and its sessions still report their own
+# status — `grove notify` and the whole attention/done vocabulary are Grove's,
+# not the harness's.
+agents = ["dep:grove-harness"]
 
 [dependencies]
 grove-core = { workspace = true }
-grove-harness = { workspace = true }
+grove-harness = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

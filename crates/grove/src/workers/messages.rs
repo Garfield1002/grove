@@ -21,6 +21,7 @@ use grove_core::state::State;
 use grove_core::status::SessionReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{Activation, NewWindow};
+#[cfg(feature = "agents")]
 use grove_harness::claude::HookChange;
 
 /// Work requested by the UI.
@@ -122,6 +123,7 @@ pub enum Task {
     },
     /// Install or remove Grove's hooks in Claude Code's `settings.json`, or
     /// just look at what is there. File work, so never the UI thread.
+    #[cfg(feature = "agents")]
     ClaudeHooks(HookOp),
     /// Local and remote-tracking branches for the create-worktree dialog.
     LoadBaseRefs {
@@ -204,6 +206,7 @@ pub enum Task {
 
 /// What to do about Grove's hooks in Claude Code's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "agents")]
 pub enum HookOp {
     /// Read the file and report what is installed. Writes nothing.
     Check,
@@ -350,6 +353,7 @@ pub enum Message {
     ServiceEventsUnavailable,
     /// Claude Code's hook configuration, after a check, an install or a
     /// removal.
+    #[cfg(feature = "agents")]
     ClaudeHooks {
         op: HookOp,
         change: Box<HookChange>,

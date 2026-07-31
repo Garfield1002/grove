@@ -22,12 +22,15 @@ use grove_core::removal::RemovalReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{Activation, NewWindow};
 use grove_core::{Error, Paths, TmuxServer, config, terminal};
+#[cfg(feature = "agents")]
 use grove_harness::claude::{self, HookChange};
 
 mod messages;
 mod service_call;
 
-pub use messages::{ErrorReport, HookOp, Message, PickTarget, RemovalOp, Task};
+#[cfg(feature = "agents")]
+pub use messages::HookOp;
+pub use messages::{ErrorReport, Message, PickTarget, RemovalOp, Task};
 use service_call::{
     NoReply, Removal, load_state_through_service, reconcile_through_service, removal_result,
     service_result, state_intent_messages,
@@ -38,6 +41,7 @@ use service_call::{
 /// The settings file is the user's, exactly as `config.toml` is: a copy is
 /// taken before it is replaced, their own hooks survive, and a file Grove
 /// cannot parse is reported rather than overwritten.
+#[cfg(feature = "agents")]
 fn claude_hooks(op: HookOp) -> Result<HookChange, Error> {
     let path = claude::settings_path_from_env()?;
     match op {
@@ -335,6 +339,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             )
         }
 
+        #[cfg(feature = "agents")]
         Task::ClaudeHooks(op) => match claude_hooks(op) {
             Ok(change) => vec![Message::ClaudeHooks {
                 op,

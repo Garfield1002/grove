@@ -15,12 +15,14 @@
 //! agent: a missing GUI, a missing tmux server and a missing session are all
 //! normal states that exit 0. Only a usage error is worth a non-zero exit.
 
+#[cfg(feature = "agents")]
 use std::io::{IsTerminal, Read};
 
 use grove_core::ipc::{self, Notification};
 use grove_core::status::{AttentionReason, SessionStatus};
 use grove_core::tmux::session;
 use grove_core::{Paths, TmuxServer, ids};
+#[cfg(feature = "agents")]
 use grove_harness::claude::HookPayload;
 
 pub const USAGE: &str = "\
@@ -111,6 +113,7 @@ pub enum ArgsError {
     MissingValue(String),
     #[error("unknown option `{0}`")]
     Unknown(String),
+    #[cfg(feature = "agents")]
     #[error("--hook reads a JSON payload on stdin; it is not meant to be run by hand")]
     HookNeedsStdin,
 }
@@ -182,6 +185,32 @@ fn parse_window(raw: &str) -> Result<u32, ArgsError> {
         .map_err(|_| ArgsError::BadWindow(raw.to_string()))
 }
 
+/// The four things a hook payload can fill in, with no vendor in the shape.
+///
+/// [`resolve`] takes this rather than a `HookPayload` so the resolution rules —
+/// a flag always beats the payload, a hook may be silent, a hand-run notify may
+/// not — are one implementation that compiles with or without the `agents`
+/// feature. Only the step that *produces* one of these knows about Claude Code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookFields {
+    pub state: Option<SessionStatus>,
+    pub summary: Option<String>,
+    pub agent_session: Option<String>,
+    pub transcript: Option<String>,
+}
+
+#[cfg(feature = "agents")]
+impl From<&HookPayload> for HookFields {
+    fn from(payload: &HookPayload) -> Self {
+        Self {
+            state: payload.state(),
+            summary: payload.summary(),
+            agent_session: payload.session_id.clone(),
+            transcript: payload.transcript_path.clone(),
+        }
+    }
+}
+
 /// Fill the gaps in a command line from `$GROVE_SESSION` and, when `--hook`
 /// was passed, the payload Claude Code delivered.
 ///
@@ -195,12 +224,9 @@ fn parse_window(raw: &str) -> Result<u32, ArgsError> {
 pub fn resolve(
     options: Options,
     env_session: Option<&str>,
-    payload: Option<&HookPayload>,
+    payload: Option<&HookFields>,
 ) -> Result<Option<NotifyArgs>, ArgsError> {
-    let state = match options
-        .state
-        .or_else(|| payload.and_then(HookPayload::state))
-    {
+    let state = match options.state.or_else(|| payload.and_then(|p| p.state)) {
         Some(state) => state,
         // Only a hook may be silent; a hand-run `notify` still has to say what
         // it is reporting.
@@ -239,14 +265,14 @@ pub fn resolve(
         reason: options.reason,
         message: options
             .message
-            .or_else(|| payload.and_then(HookPayload::summary)),
+            .or_else(|| payload.and_then(|p| p.summary.clone())),
         window: options.window,
         agent_session: options
             .agent_session
-            .or_else(|| payload.and_then(|p| p.session_id.clone())),
+            .or_else(|| payload.and_then(|p| p.agent_session.clone())),
         transcript: options
             .transcript
-            .or_else(|| payload.and_then(|p| p.transcript_path.clone())),
+            .or_else(|| payload.and_then(|p| p.transcript.clone())),
     }))
 }
 
@@ -275,6 +301,7 @@ pub struct Delivery {
 /// The most stdin a hook payload may be. Claude Code's payloads are a few
 /// hundred bytes; this is only here so a mistaken pipe cannot make a hook read
 /// forever.
+#[cfg(feature = "agents")]
 const MAX_PAYLOAD_LEN: u64 = 256 * 1024;
 
 /// Read the hook payload from stdin.
@@ -282,6 +309,7 @@ const MAX_PAYLOAD_LEN: u64 = 256 * 1024;
 /// `None` for anything that is not a payload. Running `grove notify --hook` by
 /// hand is the one case worth an error instead: it would otherwise sit there
 /// waiting on a terminal that is never going to produce JSON.
+#[cfg(feature = "agents")]
 fn read_payload() -> Result<Option<HookPayload>, ArgsError> {
     if std::io::stdin().is_terminal() {
         return Err(ArgsError::HookNeedsStdin);
@@ -295,6 +323,25 @@ fn read_payload() -> Result<Option<HookPayload>, ArgsError> {
         return Ok(None);
     }
     Ok(HookPayload::parse(&input))
+}
+
+/// The hook payload for this run, if one was asked for and understood.
+///
+/// The only place in `notify` that knows which agent's hooks these are. Without
+/// the `agents` feature there is no vendor to read a payload from, so `--hook`
+/// is a flag with nothing behind it and every field stays unfilled — the run
+/// then stands or falls on its own flags, exactly like a hand-run report.
+#[cfg(feature = "agents")]
+fn hook_fields(options: &Options) -> Result<Option<HookFields>, ArgsError> {
+    if !options.hook {
+        return Ok(None);
+    }
+    Ok(read_payload()?.as_ref().map(HookFields::from))
+}
+
+#[cfg(not(feature = "agents"))]
+fn hook_fields(_options: &Options) -> Result<Option<HookFields>, ArgsError> {
+    Ok(None)
 }
 
 /// Which window this report is about.
@@ -320,7 +367,7 @@ pub fn run(args: &[String]) -> Result<Delivery, Box<dyn std::error::Error>> {
     }
     let env_session = std::env::var(session::SESSION_ENV_VAR).ok();
     let parsed = match parse_options(args).and_then(|options| {
-        let payload = if options.hook { read_payload()? } else { None };
+        let payload = hook_fields(&options)?;
         resolve(options, env_session.as_deref(), payload.as_ref())
     }) {
         // An event Grove has no opinion about. Nothing to send, nothing wrong.
@@ -375,8 +422,9 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
-    fn payload(json: &str) -> HookPayload {
-        HookPayload::parse(json).expect("valid payload")
+    #[cfg(feature = "agents")]
+    fn payload(json: &str) -> HookFields {
+        HookFields::from(&HookPayload::parse(json).expect("valid payload"))
     }
 
     #[test]
@@ -475,6 +523,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn a_hook_payload_supplies_the_whole_report() {
         let payload = payload(
@@ -496,6 +545,7 @@ mod tests {
 
     /// Someone who spelled a flag out in their own hook configuration meant
     /// it; the payload fills gaps, it does not overrule.
+    #[cfg(feature = "agents")]
     #[test]
     fn an_explicit_flag_beats_the_payload() {
         let payload = payload(
@@ -525,6 +575,7 @@ mod tests {
 
     /// A newer Claude Code will send events this Grove has never heard of.
     /// Saying nothing is success: a hook must not fail inside an agent.
+    #[cfg(feature = "agents")]
     #[test]
     fn a_hook_event_with_no_meaning_reports_nothing() {
         let payload = payload("{\"hook_event_name\": \"SomethingNew\", \"session_id\": \"0f3a\"}");
@@ -539,6 +590,7 @@ mod tests {
 
     /// Claude Code started in a plain terminal has no Grove session to report
     /// about. That is not an error either — there is simply no row.
+    #[cfg(feature = "agents")]
     #[test]
     fn a_hook_outside_a_grove_session_reports_nothing() {
         let payload = payload("{\"hook_event_name\": \"Stop\"}");
