@@ -1,0 +1,159 @@
+//! Talking to the daemon.
+//!
+//! Every worker path that needs the service goes through here, so the retry
+//! window while a just-spawned `grove serve` is still binding its socket, and
+//! the way a protocol error becomes a reportable one, are decided once rather
+//! than at each call site.
+
+use grove_core::Error;
+use grove_core::protocol::{self, Request};
+use grove_core::reconcile::{ProjectRef, Reconciliation};
+use grove_core::state::State;
+
+use super::{ErrorReport, Message, WorkerState};
+
+pub(super) const SERVICE_OPERATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+pub(super) fn call_service(
+    worker: &WorkerState,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let request = Request::new(id, method, params);
+    let mut attempts = 0;
+    let response = loop {
+        match protocol::call_with_timeout(
+            &worker.paths.notify_socket(),
+            &request,
+            SERVICE_OPERATION_TIMEOUT,
+        ) {
+            Ok(response) => break response,
+            Err(error) if service_is_starting(&error) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(service_error(method, error)),
+        }
+    };
+    match (response.result, response.error) {
+        (Some(result), None) if response.ok => Ok(result),
+        (None, Some(error)) if !response.ok => Err(Error::io(
+            format!("service method {method}"),
+            std::io::Error::other(format!("{}: {}", error.code, error.message)),
+        )),
+        _ => Err(Error::io(
+            format!("service method {method}"),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "service returned an invalid response shape",
+            ),
+        )),
+    }
+}
+
+pub(super) fn service_is_starting(error: &protocol::Error) -> bool {
+    matches!(
+        error,
+        protocol::Error::Io { context, source }
+            if *context == "connect to Grove service"
+                && matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+    )
+}
+
+pub(super) fn service_error(method: &str, error: protocol::Error) -> Error {
+    Error::io(
+        format!("service method {method}"),
+        std::io::Error::other(error.to_string()),
+    )
+}
+
+pub(super) fn load_state_through_service(worker: &WorkerState) -> Result<State, Error> {
+    let value = call_service(
+        worker,
+        "gui-state-get",
+        "state.get",
+        serde_json::Value::Null,
+    )?;
+    serde_json::from_value(value).map_err(|error| {
+        Error::io(
+            "decode service state",
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })
+}
+
+pub(super) fn apply_state_intent(
+    worker: &WorkerState,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<State, Error> {
+    let value = call_service(worker, "gui-state-intent", method, params)?;
+    value
+        .get("state")
+        .cloned()
+        .ok_or_else(|| {
+            Error::io(
+                "decode service mutation",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "service mutation response has no state",
+                ),
+            )
+        })
+        .and_then(|state| {
+            serde_json::from_value(state).map_err(|error| {
+                Error::io(
+                    "decode service mutation state",
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                )
+            })
+        })
+}
+
+pub(super) fn state_intent_messages(
+    worker: &WorkerState,
+    method: &str,
+    params: serde_json::Value,
+    context: &str,
+    success: &str,
+    reconcile: bool,
+) -> Vec<Message> {
+    match apply_state_intent(worker, method, params) {
+        Ok(state) => vec![Message::StateUpdated {
+            state: Box::new(state),
+            status: success.to_string(),
+            reconcile,
+        }],
+        Err(error) => vec![Message::Failed(ErrorReport::new(context, &error))],
+    }
+}
+
+pub(super) fn reconcile_through_service(
+    worker: &WorkerState,
+    projects: Vec<ProjectRef>,
+) -> Result<(Reconciliation, State), Error> {
+    let value = call_service(
+        worker,
+        "gui-reconcile",
+        "state.reconcile",
+        serde_json::json!({"projects": projects}),
+    )?;
+    #[derive(serde::Deserialize)]
+    struct ServiceResult {
+        reconciliation: Reconciliation,
+        state: State,
+    }
+    serde_json::from_value::<ServiceResult>(value)
+        .map(|result| (result.reconciliation, result.state))
+        .map_err(|error| {
+            Error::io(
+                "decode service reconciliation",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            )
+        })
+}
