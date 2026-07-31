@@ -110,9 +110,16 @@ impl HookPayload {
             "Notification" => Some(SessionStatus::Attention),
             // A turn beginning, and the compaction that can interrupt one.
             "UserPromptSubmit" | "PreCompact" => Some(SessionStatus::Working),
-            // A turn ending. Not "finished": the poller decides that, and an
-            // idle report deliberately does not clear a raised attention.
-            "Stop" | "SessionEnd" => Some(SessionStatus::Idle),
+            // A turn ending, which is the one thing the poller could never
+            // work out: it sees a quiet session, and a quiet session that just
+            // finished looks exactly like one that never began. Claude says
+            // which, so the row can say "done" rather than the "idle" this
+            // reported for as long as there was no truer word for it.
+            //
+            // It does not clear a raised attention. An agent that asked a
+            // question and then ended its turn is still waiting for the answer,
+            // and the latch outranks this by design.
+            "Stop" | "SessionEnd" => Some(SessionStatus::Done),
             // Claude has attached to this worktree but is not doing anything
             // yet. Worth reporting for the conversation id it carries.
             "SessionStart" => Some(SessionStatus::Idle),
@@ -438,17 +445,19 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_beginning_and_ending_are_working_and_idle() {
+    fn a_turn_beginning_is_working_and_a_turn_ending_is_done() {
         assert_eq!(
             payload("UserPromptSubmit", "").state(),
             Some(SessionStatus::Working)
         );
-        assert_eq!(payload("Stop", "").state(), Some(SessionStatus::Idle));
-        assert_eq!(payload("SessionEnd", "").state(), Some(SessionStatus::Idle));
+        // The distinction the poller cannot draw: both of these leave a quiet
+        // session, and only Claude can say the quiet means "finished".
+        assert_eq!(payload("Stop", "").state(), Some(SessionStatus::Done));
+        assert_eq!(payload("SessionEnd", "").state(), Some(SessionStatus::Done));
         assert_eq!(
             payload("SessionStart", "").state(),
             Some(SessionStatus::Idle),
-            "attached, but nothing running yet"
+            "attached, but nothing has run yet — that is not finished"
         );
     }
 

@@ -75,6 +75,14 @@ pub const WARNING: Color32 = Color32::from_rgb(0xe0, 0xa4, 0x4a);
 pub const STATUS_WORKING: Color32 = Color32::from_rgb(0x4b, 0xc0, 0x7d);
 /// The `ACTION` state — the same amber as [`WARNING`].
 pub const STATUS_ATTENTION: Color32 = WARNING;
+/// The `done` state: work that finished and is waiting to be looked at.
+///
+/// A violet rather than a second green. Done and working are adjacent ideas
+/// and would be easy to draw as two shades of one hue, but the list is scanned
+/// at thirty rows and two greens a shade apart is precisely the pair an eye
+/// stops separating. It also has to stay clear of [`ACCENT`], since a selected
+/// row and a finished one can be the same row.
+pub const STATUS_DONE: Color32 = Color32::from_rgb(0x9d, 0x8b, 0xdc);
 // There is deliberately no STATUS_IDLE: idle is the resting state and keeps
 // the neutral DOT_IDLE, so the two states that matter can stand out.
 

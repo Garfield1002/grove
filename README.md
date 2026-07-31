@@ -11,12 +11,16 @@ private tmux server. Closing Grove leaves every session running.
 ## What it does
 
 Grove lists every worktree in one window, each with a status: **idle**,
-**working**, or **attention**. Clicking a row switches your attached terminal
-to that session, or launches a terminal if none is attached.
+**working**, **done**, or **attention**. Clicking a row switches your attached
+terminal to that session, or launches a terminal if none is attached.
 
 A worktree shows **attention** only when a program reports it (see
 [Agents](#agents)) — Grove never guesses from process names or reads
 scrollback. Once set, attention stays until you open that session.
+
+**done** is reported the same way, and answers the question **idle** cannot:
+a quiet session that has finished its work and one that never started look
+identical from the outside. It lasts until the session is active again.
 
 ## Requirements
 
@@ -115,7 +119,8 @@ grove wait <worktree-id> --status attention --timeout 300
 `--idempotency-key <key>`, which makes a retry return the first structured
 result without performing the action twice. `wait` wakes on service events
 and periodically rechecks Grove's semantic status, so a dropped event cannot
-strand it. Valid states are `working`, `idle`, `attention`, and `stopped`.
+strand it. Valid states are `working`, `idle`, `done`, `attention`, and
+`stopped`.
 These commands resolve paths from Grove's own index and live Git data—callers
 never supply shell commands or repository paths. They do not expose terminal
 contents.
@@ -163,11 +168,23 @@ Any program can report a session's status:
 
 ```bash
 grove notify --state attention --message "needs permission to run tests"
+grove notify --state attention --reason blocked --message "no registry access"
+grove notify --state done
 ```
 
 Inside a Grove session `$GROVE_SESSION` is already set, so there is nothing to
 pass. `attention` is sticky and clears when you open the session; `working`
 and `idle` are hints the next poll confirms.
+
+`--reason` says *why* the user is wanted — `waiting`, `permission`, `blocked`
+or `failed` — and only goes with `--state attention`; anything else is a usage
+error rather than a value that would be recorded and never shown. Grove never
+infers a reason, so a report without one shows attention and no explanation.
+
+`--state done` says the work here finished and wants nobody. Like attention it
+is durable, recorded on the session itself rather than in Grove's memory, so
+`grove wait --status done` answers correctly from another process and a
+restarted Grove still knows. Reporting any other state retracts it.
 
 ### Claude Code
 

@@ -207,7 +207,10 @@ fn wait_options(args: &[String]) -> Result<(String, Duration), Box<dyn std::erro
         match args[index].as_str() {
             "--status" if index + 1 < args.len() => {
                 let value = args[index + 1].to_ascii_lowercase();
-                if !matches!(value.as_str(), "working" | "idle" | "attention" | "stopped") {
+                if !matches!(
+                    value.as_str(),
+                    "working" | "idle" | "done" | "attention" | "stopped"
+                ) {
                     return Err(format!("unknown Grove status `{value}`").into());
                 }
                 status = Some(value);
@@ -221,7 +224,7 @@ fn wait_options(args: &[String]) -> Result<(String, Duration), Box<dyn std::erro
         }
     }
     Ok((
-        status.ok_or("wait requires `--status <working|idle|attention|stopped>`")?,
+        status.ok_or("wait requires `--status <working|idle|done|attention|stopped>`")?,
         timeout,
     ))
 }
@@ -280,6 +283,14 @@ mod tests {
                 .expect("default timeout")
                 .1,
             DEFAULT_WAIT_TIMEOUT
+        );
+        // The state an agent waits on most: another line of work reporting that
+        // it finished.
+        assert_eq!(
+            wait_options(&strings(&["--status", "done"]))
+                .expect("done is waitable")
+                .0,
+            "done"
         );
 
         for args in [

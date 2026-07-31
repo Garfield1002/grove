@@ -775,12 +775,23 @@ fn hover_lines(worktree: &Worktree, slot: Option<u8>) -> Vec<String> {
     let mut lines = Vec::new();
     // What an agent said about itself comes first: it is the only line here
     // the user could not have worked out from the row.
-    if let Some(message) = worktree
-        .status_message
-        .as_deref()
-        .filter(|_| worktree.session.exists())
-    {
-        lines.push(message.to_string());
+    //
+    // The reason leads the message when there is one. A row already shows
+    // *that* it wants the user; this is the promise that Grove can say what
+    // for, and the structured word is the half that is always the same shape,
+    // so it reads first and the agent's own sentence qualifies it.
+    if worktree.session.exists() {
+        let reason = worktree.attention_reason.map(|reason| reason.label());
+        let message = worktree.status_message.as_deref();
+        let line = match (reason, message) {
+            (Some(reason), Some(message)) => Some(format!("{reason} — {message}")),
+            (Some(reason), None) => Some(reason.to_string()),
+            (None, Some(message)) => Some(message.to_string()),
+            (None, None) => None,
+        };
+        if let Some(line) = line {
+            lines.push(line);
+        }
     }
     // What the agent's own cgroup reports, when it has one.
     if let Some(resources) = worktree.resources.as_deref() {
@@ -892,7 +903,13 @@ fn row_border(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
     match row_status(worktree, stands)? {
         SessionStatus::Attention => Some(theme::STATUS_ATTENTION),
         SessionStatus::Working => Some(theme::STATUS_WORKING),
-        SessionStatus::Idle => None,
+        // Done earns a colour but not a border. A border is for a row that is
+        // live — something is moving, or someone is wanted — and finished work
+        // is neither. It is also the state a busy developer accumulates most
+        // of: bordering it would put an outline round most of the list on the
+        // day the list is longest, which is the day the outline has to mean
+        // something. Its dot carries the distinction instead.
+        SessionStatus::Done | SessionStatus::Idle => None,
     }
 }
 
@@ -900,6 +917,9 @@ fn row_border(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
 ///
 /// Idle earns none: an idle session is the resting state, and colouring every
 /// resting row would leave nothing for the two that matter to stand out from.
+/// Done does, because it is a claim rather than an absence — the difference
+/// between "nothing has happened here" and "this is ready for you" is the one
+/// a row of a finished agent exists to draw.
 fn status_color(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
     if !worktree.session.exists() {
         return None;
@@ -907,6 +927,7 @@ fn status_color(worktree: &Worktree, stands: Stands) -> Option<egui::Color32> {
     match row_status(worktree, stands)? {
         SessionStatus::Attention => Some(theme::STATUS_ATTENTION),
         SessionStatus::Working => Some(theme::STATUS_WORKING),
+        SessionStatus::Done => Some(theme::STATUS_DONE),
         SessionStatus::Idle => None,
     }
 }
@@ -1071,7 +1092,32 @@ mod tests {
         let mut worktree = worktree();
         worktree.session = SessionPresence::None;
         worktree.status_message = Some("stale".into());
+        worktree.attention_reason = Some(grove_core::status::AttentionReason::Blocked);
         assert!(!hover_lines(&worktree, None).iter().any(|l| l == "stale"));
+        assert!(
+            !hover_lines(&worktree, None).iter().any(|l| l == "blocked"),
+            "a worktree with no session explains nothing"
+        );
+    }
+
+    #[test]
+    fn a_reason_leads_the_message_it_qualifies() {
+        let mut worktree = worktree();
+        worktree.session = SessionPresence::Detached;
+        worktree.attention_reason = Some(grove_core::status::AttentionReason::Blocked);
+        worktree.status_message = Some("cannot reach the registry".into());
+        assert_eq!(
+            hover_lines(&worktree, None).first().map(String::as_str),
+            Some("blocked — cannot reach the registry")
+        );
+
+        // A reason with nothing else to say still stands on its own: this is
+        // the promise that an attention can always explain itself.
+        worktree.status_message = None;
+        assert_eq!(
+            hover_lines(&worktree, None).first().map(String::as_str),
+            Some("blocked")
+        );
     }
 
     /// The row shows the number as a badge; the tooltip is where the badge is

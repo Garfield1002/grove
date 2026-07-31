@@ -247,7 +247,11 @@ impl StatusWatch {
     /// exactly once when it applies the same report to presentation state,
     /// keeping one ownership path for both legacy and service delivery.
     pub fn notified(&self, notification: &Notification) {
-        lock(&self.engine).notify(&notification.worktree_id, notification.state);
+        lock(&self.engine).notify(
+            &notification.worktree_id,
+            notification.state,
+            notification.reason,
+        );
         self.send(Control::PollNow);
     }
 
@@ -714,7 +718,7 @@ mod tests {
         .join();
 
         assert!(engine.is_poisoned());
-        lock(&engine).notify("a1b2c3", SessionStatus::Attention);
+        lock(&engine).notify("a1b2c3", SessionStatus::Attention, None);
         assert!(
             lock(&engine).is_latched("a1b2c3"),
             "status must survive a panic elsewhere"
@@ -828,6 +832,7 @@ mod tests {
                 activity_age: Some(Duration::from_secs(3)),
                 pane_commands: vec!["claude".into()],
                 attention_flag: true,
+                done_flag: false,
                 bell: false,
                 usage: Some(Usage {
                     memory_bytes: 4096,
@@ -969,7 +974,7 @@ mod tests {
         let paint = PaintClock::new();
         paint.mark();
         let engine: SharedEngine = Arc::new(Mutex::new(StatusEngine::default()));
-        lock(&engine).notify("gone", SessionStatus::Attention);
+        lock(&engine).notify("gone", SessionStatus::Attention, None);
         let mut poller = poller(socket, out, paint, Arc::clone(&engine));
 
         poller.tick();

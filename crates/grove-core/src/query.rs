@@ -360,6 +360,7 @@ mod tests {
                 repo: Some("/repo/.git".into()),
             },
             attention: true,
+            done: false,
             activity_epoch: Some(1234),
             bell: true,
         }]);

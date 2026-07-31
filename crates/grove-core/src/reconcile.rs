@@ -431,6 +431,7 @@ mod tests {
                 repo: Some(PathBuf::from(REPO)),
             },
             attention: false,
+            done: false,
             activity_epoch: None,
             bell: false,
         }

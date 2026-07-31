@@ -2,8 +2,12 @@
 //!
 //! Two deliveries, both best-effort, neither sufficient alone:
 //!
-//! 1. The durable `@grove_attention` tmux option, so a signal raised while the
-//!    GUI is closed is still there when it opens.
+//! 1. The durable `@grove_attention` and `@grove_done` tmux options, so a
+//!    signal raised while the GUI is closed is still there when it opens, and
+//!    so a reader in another process — `grove wait`, the service — can learn
+//!    it at all. The done marker is written on *every* report, because nothing
+//!    else retracts it: an agent that finishes and then starts again says
+//!    `working`, and that has to take the marker down.
 //! 2. A line on the notify socket, so a running GUI reacts immediately instead
 //!    of at the next poll.
 //!
@@ -15,7 +19,7 @@ use std::io::{IsTerminal, Read};
 
 use grove_core::claude::HookPayload;
 use grove_core::ipc::{self, Notification};
-use grove_core::status::SessionStatus;
+use grove_core::status::{AttentionReason, SessionStatus};
 use grove_core::tmux::session;
 use grove_core::{Paths, TmuxServer, ids};
 
@@ -27,7 +31,10 @@ Usage:
   grove notify --hook [options]
 
 Options:
-  --state <state>       one of: idle, working, attention
+  --state <state>       one of: idle, done, working, attention
+  --reason <reason>     why the user is wanted: waiting, permission, blocked
+                        or failed. Only meaningful with --state attention,
+                        and rejected with any other state.
   --hook                read a Claude Code hook payload (JSON) on stdin and
                         take the state, message, conversation id and
                         transcript path from it. Explicit flags win.
@@ -44,6 +51,11 @@ Options:
 Attention is sticky: it stays until you open the session. Reporting `idle`
 or `working` does not clear it.
 
+`done` is sticky too, but against silence rather than against you: it says
+the work here finished and wants nobody, and it lasts until the session is
+active again. It is the one thing Grove cannot work out for itself — a quiet
+session that finished and one that never started look identical from tmux.
+
 `grove hooks install` writes the Claude Code configuration for --hook.
 ";
 
@@ -53,6 +65,7 @@ or `working` does not clear it.
 pub struct NotifyArgs {
     pub worktree_id: String,
     pub state: SessionStatus,
+    pub reason: Option<AttentionReason>,
     pub message: Option<String>,
     pub window: Option<u32>,
     pub agent_session: Option<String>,
@@ -65,6 +78,7 @@ pub struct Options {
     /// Read a hook payload from stdin.
     pub hook: bool,
     pub state: Option<SessionStatus>,
+    pub reason: Option<AttentionReason>,
     pub session: Option<String>,
     pub message: Option<String>,
     pub window: Option<u32>,
@@ -81,8 +95,12 @@ pub struct Options {
 pub enum ArgsError {
     #[error("--state is required")]
     MissingState,
-    #[error("`{0}` is not a state: expected idle, working or attention")]
+    #[error("`{0}` is not a state: expected idle, done, working or attention")]
     BadState(String),
+    #[error("`{0}` is not a reason: expected waiting, permission, blocked or failed")]
+    BadReason(String),
+    #[error("--reason explains why the user is wanted; it needs --state attention, not `{0}`")]
+    ReasonWithoutAttention(&'static str),
     #[error("no session: pass --session <id> or run inside a Grove tmux session")]
     MissingSession,
     #[error("`{0}` is not a worktree id: expected 6 hex characters")]
@@ -115,6 +133,11 @@ pub fn parse_options(args: &[String]) -> Result<Options, ArgsError> {
                 let raw = value("--state")?;
                 options.state = Some(SessionStatus::parse(&raw).ok_or(ArgsError::BadState(raw))?);
             }
+            "--reason" | "-r" => {
+                let raw = value("--reason")?;
+                options.reason =
+                    Some(AttentionReason::parse(&raw).ok_or(ArgsError::BadReason(raw))?);
+            }
             "--session" => options.session = Some(value("--session")?),
             "--message" | "-m" => options.message = Some(value("--message")?),
             "--window" | "-w" => {
@@ -128,6 +151,11 @@ pub fn parse_options(args: &[String]) -> Result<Options, ArgsError> {
                 if let Some(raw) = other.strip_prefix("--state=") {
                     options.state = Some(
                         SessionStatus::parse(raw).ok_or_else(|| ArgsError::BadState(raw.into()))?,
+                    );
+                } else if let Some(raw) = other.strip_prefix("--reason=") {
+                    options.reason = Some(
+                        AttentionReason::parse(raw)
+                            .ok_or_else(|| ArgsError::BadReason(raw.into()))?,
                     );
                 } else if let Some(raw) = other.strip_prefix("--session=") {
                     options.session = Some(raw.to_string());
@@ -197,10 +225,18 @@ pub fn resolve(
     if !ids::is_worktree_id(&worktree_id) {
         return Err(ArgsError::BadSession(worktree_id));
     }
+    // Checked once the state is settled, so `--hook --reason blocked` is judged
+    // against the state the payload actually produced rather than the flag's
+    // absence. A reason only ever qualifies an attention: attached to anything
+    // else it would be recorded, never shown, and quietly mean nothing.
+    if options.reason.is_some() && state != SessionStatus::Attention {
+        return Err(ArgsError::ReasonWithoutAttention(state.label()));
+    }
 
     Ok(Some(NotifyArgs {
         worktree_id,
         state,
+        reason: options.reason,
         message: options
             .message
             .or_else(|| payload.and_then(HookPayload::summary)),
@@ -228,6 +264,10 @@ pub fn parse_args(args: &[String], env_session: Option<&str>) -> Result<NotifyAr
 pub struct Delivery {
     /// The durable tmux option was written.
     pub marked: bool,
+    /// The durable done marker was written or taken down. False covers both
+    /// "no such session" and "nothing to change", which are the same to a
+    /// caller: there is no session carrying a claim about being finished.
+    pub marked_done: bool,
     /// A running GUI accepted the notification.
     pub delivered: bool,
 }
@@ -304,12 +344,25 @@ pub fn run(args: &[String]) -> Result<Delivery, Box<dyn std::error::Error>> {
         let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
         delivery.marked = session::set_attention(&server, &ids::session_name(&parsed.worktree_id))?;
     }
+    // The done marker is the durable half of `done`, and unlike attention it is
+    // written on every state: nothing else retracts it. An agent that finished
+    // and then started again says `working`, and that has to take the marker
+    // down, or the row would keep reporting a finish that has been overtaken.
+    {
+        let server = TmuxServer::new(paths.tmux_socket()).with_config(paths.tmux_config_file());
+        let session = ids::session_name(&parsed.worktree_id);
+        delivery.marked_done = match parsed.state {
+            SessionStatus::Done => session::set_done(&server, &session)?,
+            _ => session::clear_done(&server, &session)?,
+        };
+    }
 
     let notification = Notification::new(parsed.worktree_id, parsed.state)
         .with_message(parsed.message)
         .with_window(resolve_window(&paths, parsed.window))
         .with_agent_session(parsed.agent_session)
-        .with_transcript(parsed.transcript);
+        .with_transcript(parsed.transcript)
+        .with_reason(parsed.reason);
     delivery.delivered = ipc::send(&paths.notify_socket(), &notification)?;
     Ok(delivery)
 }
@@ -327,11 +380,73 @@ mod tests {
     }
 
     #[test]
+    fn a_reason_needs_an_attention_to_explain() {
+        // Recorded but never shown would be the silent-degradation case: the
+        // caller believes it said something and Grove believes nothing was said.
+        for state in ["done", "working", "idle"] {
+            let err = parse_args(
+                &args(&[
+                    "--state",
+                    state,
+                    "--reason",
+                    "blocked",
+                    "--session",
+                    "a1b2c3",
+                ]),
+                None,
+            )
+            .expect_err("a reason on a non-attention state is a usage error");
+            assert!(
+                matches!(err, ArgsError::ReasonWithoutAttention(_)),
+                "{state} with a reason should be rejected, got {err:?}"
+            );
+        }
+        parse_args(
+            &args(&[
+                "--state",
+                "attention",
+                "--reason",
+                "blocked",
+                "--session",
+                "a1b2c3",
+            ]),
+            None,
+        )
+        .expect("attention carries a reason");
+    }
+
+    #[test]
+    fn a_reason_is_accepted_joined_or_separate_and_rejected_when_unknown() {
+        let joined = parse_args(
+            &args(&["--state=attention", "--reason=failed", "--session=a1b2c3"]),
+            None,
+        )
+        .expect("valid");
+        assert_eq!(joined.reason, Some(AttentionReason::Failed));
+
+        let err = parse_args(
+            &args(&["--state", "attention", "--reason", "sideways"]),
+            Some("a1b2c3"),
+        )
+        .expect_err("unknown reason");
+        assert!(matches!(err, ArgsError::BadReason(value) if value == "sideways"));
+    }
+
+    #[test]
+    fn done_is_a_state_the_command_line_accepts() {
+        let parsed = parse_args(&args(&["--state", "done"]), Some("a1b2c3")).expect("valid");
+        assert_eq!(parsed.state, SessionStatus::Done);
+        assert_eq!(parsed.reason, None);
+    }
+
+    #[test]
     fn parses_a_full_command_line() {
         let parsed = parse_args(
             &args(&[
                 "--state",
                 "attention",
+                "--reason",
+                "permission",
                 "--session",
                 "a1b2c3",
                 "--message",
@@ -351,6 +466,7 @@ mod tests {
             NotifyArgs {
                 worktree_id: "a1b2c3".into(),
                 state: SessionStatus::Attention,
+                reason: Some(AttentionReason::Permission),
                 message: Some("needs permission".into()),
                 window: Some(2),
                 agent_session: Some("0f3a".into()),

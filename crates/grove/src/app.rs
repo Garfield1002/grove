@@ -660,18 +660,34 @@ impl GroveApp {
         self.watch.notified(notification);
         let worktree_id = notification.worktree_id.as_str();
         let state = notification.state;
+        let reason = notification.reason;
         self.notices.record(notification);
-        if state == SessionStatus::Attention {
+        if state == SessionStatus::Attention || state == SessionStatus::Done {
             // Keep any resource figures the last poll produced; only the
             // status is being overridden here.
             let report = self.statuses.entry(worktree_id.to_string()).or_default();
-            report.status = SessionStatus::Attention;
+            // Attention outranks a "done" that arrives while it is raised: the
+            // agent finishing a turn does not answer the question it asked.
+            if !(state == SessionStatus::Done && report.status == SessionStatus::Attention) {
+                report.status = state;
+            }
         }
         for project in &mut self.projects {
             if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
                 worktree.status_message = notification.message.clone();
                 if state == SessionStatus::Attention && worktree.session.exists() {
                     worktree.status = Some(SessionStatus::Attention);
+                    worktree.attention_reason = reason;
+                }
+                // Applied here as well as at the next poll so a row says
+                // "done" the moment the agent says so. Waiting for the poller
+                // would leave up to a full interval where the thing the user
+                // is watching for has happened and the list does not show it.
+                if state == SessionStatus::Done
+                    && worktree.session.exists()
+                    && worktree.status != Some(SessionStatus::Attention)
+                {
+                    worktree.status = Some(SessionStatus::Done);
                 }
             }
         }
@@ -760,6 +776,7 @@ impl GroveApp {
             if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
                 worktree.status = None;
                 worktree.status_message = None;
+                worktree.attention_reason = None;
                 worktree.window_notes.clear();
             }
         }

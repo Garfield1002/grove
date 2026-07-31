@@ -12,7 +12,7 @@
 //! The wire format is one newline-terminated line per message:
 //!
 //! ```text
-//! grove1<SEP>notify<SEP><worktree-id><SEP><state><SEP><message><SEP><window><SEP><agent><SEP><transcript>
+//! grove1<SEP>notify<SEP><worktree-id><SEP><state><SEP><message><SEP><window><SEP><agent><SEP><transcript><SEP><reason>
 //! grove1<SEP>toggle<SEP><slot>
 //! ```
 //!
@@ -20,7 +20,7 @@
 //! from messages. The leading version tag lets a future format change be
 //! rejected cleanly by an older binary instead of being misread.
 //!
-//! Everything after the state is optional and *additive*: the three trailing
+//! Everything after the state is optional and *additive*: the four trailing
 //! fields were added after `grove1` shipped, so a line written by an older
 //! `grove notify` simply stops early and decodes with them unset, and a line
 //! written by a newer one is read up to whatever the reader understands. That
@@ -140,6 +140,13 @@ impl Command {
                     window: fields.next().and_then(parse_window),
                     agent_session: fields.next().and_then(sanitize_agent_session),
                     transcript: fields.next().and_then(sanitize_transcript),
+                    // Dropped rather than rejected when it is not a reason
+                    // Grove knows, for the same cause as the window field: a
+                    // reason is a detail about an attention, and losing it must
+                    // never cost the report that carries it.
+                    reason: fields
+                        .next()
+                        .and_then(crate::status::AttentionReason::parse),
                 }))
             }
             KIND_TOGGLE => {
@@ -180,6 +187,10 @@ pub struct Notification {
     /// Where the agent keeps this session's transcript. An index entry Grove
     /// hands to the desktop on request — never read, never parsed.
     pub transcript: Option<PathBuf>,
+    /// Why the agent wants the user, when it said. Meaningful only alongside
+    /// `attention`; a reason on any other state is carried but says nothing,
+    /// because the engine only keeps one that belongs to a live latch.
+    pub reason: Option<crate::status::AttentionReason>,
 }
 
 impl Notification {
@@ -191,6 +202,7 @@ impl Notification {
             window: None,
             agent_session: None,
             transcript: None,
+            reason: None,
         }
     }
 
@@ -216,6 +228,11 @@ impl Notification {
         self
     }
 
+    pub fn with_reason(mut self, reason: Option<crate::status::AttentionReason>) -> Self {
+        self.reason = reason;
+        self
+    }
+
     /// Does this report carry anything worth remembering across restarts?
     pub fn has_agent_record(&self) -> bool {
         self.agent_session.is_some() || self.transcript.is_some()
@@ -234,8 +251,13 @@ impl Notification {
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Appended last, and read with the same `next()`-returns-`None` rule as
+        // the fields before it, so a caller built before this field existed
+        // still decodes and a caller that sends it still reaches an older
+        // reader — which stops at the fields it knows.
+        let reason = self.reason.map(|r| r.label()).unwrap_or_default();
         format!(
-            "{VERSION}{SEP}{KIND_NOTIFY}{SEP}{}{SEP}{}{SEP}{message}{SEP}{window}{SEP}{agent}{SEP}{transcript}",
+            "{VERSION}{SEP}{KIND_NOTIFY}{SEP}{}{SEP}{}{SEP}{message}{SEP}{window}{SEP}{agent}{SEP}{transcript}{SEP}{reason}",
             self.worktree_id,
             self.state.label(),
         )
@@ -586,7 +608,48 @@ mod tests {
             notification.transcript.as_deref(),
             Some(Path::new("/tmp/abc.jsonl"))
         );
-        assert_eq!(notification.encode().matches(SEP).count(), 7);
+        assert_eq!(notification.encode().matches(SEP).count(), 8);
+    }
+
+    #[test]
+    fn a_reason_round_trips_beside_its_attention() {
+        let notification = Notification::new("a1b2c3", SessionStatus::Attention)
+            .with_message(Some("cannot reach the registry".into()))
+            .with_reason(Some(crate::status::AttentionReason::Blocked));
+        let decoded = Notification::decode(&notification.encode()).expect("valid");
+        assert_eq!(decoded, notification);
+        assert_eq!(
+            decoded.reason,
+            Some(crate::status::AttentionReason::Blocked)
+        );
+    }
+
+    /// The field was appended, so a caller built before it existed still parses.
+    #[test]
+    fn a_line_from_before_the_reason_field_still_decodes() {
+        let old = "grove1\u{1}notify\u{1}a1b2c3\u{1}attention\u{1}needs permission\u{1}2\u{1}0f3a\u{1}/tmp/0f3a.jsonl";
+        let decoded = Notification::decode(old).expect("valid");
+        assert_eq!(decoded.state, SessionStatus::Attention);
+        assert_eq!(decoded.window, Some(2));
+        assert_eq!(decoded.agent_session.as_deref(), Some("0f3a"));
+        assert_eq!(decoded.reason, None, "absent, not guessed");
+    }
+
+    /// A reason Grove does not know costs the reason, never the report.
+    #[test]
+    fn an_unknown_reason_is_dropped_and_the_report_survives() {
+        let line = "grove1\u{1}notify\u{1}a1b2c3\u{1}attention\u{1}hi\u{1}\u{1}\u{1}\u{1}exploded";
+        let decoded = Notification::decode(line).expect("valid");
+        assert_eq!(decoded.state, SessionStatus::Attention);
+        assert_eq!(decoded.message.as_deref(), Some("hi"));
+        assert_eq!(decoded.reason, None);
+    }
+
+    #[test]
+    fn done_crosses_the_wire_as_its_own_state() {
+        let notification = Notification::new("a1b2c3", SessionStatus::Done);
+        let decoded = Notification::decode(&notification.encode()).expect("valid");
+        assert_eq!(decoded.state, SessionStatus::Done);
     }
 
     #[test]
@@ -699,7 +762,7 @@ mod tests {
         // And the encoded line therefore stays a single well-formed record:
         // one separator before each field after the version tag.
         let encoded = notification.encode();
-        assert_eq!(encoded.matches(SEP).count(), 7);
+        assert_eq!(encoded.matches(SEP).count(), 8);
         assert!(!encoded.contains('\n'));
         assert_eq!(Notification::decode(&encoded).expect("valid"), notification);
     }

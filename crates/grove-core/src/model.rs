@@ -166,6 +166,10 @@ pub struct Worktree {
     /// The message from the last `grove notify` for this worktree, shown while
     /// its status is still the one that message reported.
     pub status_message: Option<String>,
+    /// Why this worktree's live attention says it wants the user, when its
+    /// report said. `None` on a row that is not asking, and equally on one that
+    /// asked without saying why — a reason is never filled in by inference.
+    pub attention_reason: Option<crate::status::AttentionReason>,
     /// What individual windows last reported about themselves, in index order.
     /// Empty means no window of this worktree has ever named itself, which is
     /// not the same as every window being quiet — see [`WindowNote`].
@@ -204,6 +208,7 @@ impl Worktree {
             git_status: None,
             status: None,
             status_message: None,
+            attention_reason: None,
             window_notes: Vec::new(),
             resources: None,
         }

@@ -284,11 +284,29 @@ Three states, evaluated by `grove-core::status` from poller + IPC inputs:
 - **Working `◉`** — tmux pane activity within the last 10 s (configurable),
   or a known agent process found in the session's process tree.
 - **Idle `●`** — session exists, no recent activity. Idle ≠ finished.
+- **Done `●`** — an explicit report says the work here finished and wants
+  nobody. This is the state idle could not express: from tmux, a session that
+  just finished and one that never started are the same quiet session, so it
+  can only ever be reported, never inferred.
 - **Attention `!`** — tmux bell/activity flag, non-zero process exit,
-  a `grove notify` message, or a manual user override.
+  a `grove notify` message, or a manual user override. An attention may carry
+  a **reason** (`waiting`, `permission`, `blocked`, `failed`), which is the
+  promise that Grove can say *what for* and not merely *that*. A reason is
+  never inferred; a report that names none shows attention with no
+  explanation. It is a qualifier rather than a status of its own: blocked,
+  failed and waiting are one condition — work stopped, only a person restarts
+  it — and peer states would be several names for it to disagree over.
 
-Precedence: attention > working > idle. Attention latches until the user
-opens the session.
+Precedence: attention > working > done > idle. Attention latches until the
+user opens the session; done lasts until the session is active again, since
+activity is a fact about now and outranks what was last said.
+
+Both are durable in a session user option — `@grove_attention` and
+`@grove_done` — rather than in any process's memory. For done that is not
+only about surviving a restart: `grove wait --status done` runs in another
+process with no memory of the report, so a component holding it privately
+would be the only component that knew. The reason stays in memory, being
+presentation detail: losing it to a restart costs a row a word, not a state.
 
 **Activity is measured per window, not per session.** `#{session_activity}`
 follows the session's *current* window only, so leaning on it both painted
@@ -330,7 +348,10 @@ the same code.
 would otherwise have to carry:
 
 - **state** — `Notification` is attention (the one signal Grove refuses to
-  infer for itself), a prompt is working, a turn or session ending is idle.
+  infer for itself), a prompt is working, and a turn or session ending is
+  **done**: Claude is reporting the one thing the poller could never work out,
+  which is that the quiet it is about to see means finished. A session merely
+  starting stays idle — attached, but nothing has run.
   An event this Grove has no opinion about reports *nothing at all*: a hook
   runs inside someone's agent, so an unknown event, an unparseable payload
   and a Claude Code started outside Grove all exit 0 in silence.

@@ -7,17 +7,23 @@
 //!
 //! Two rules from CLAUDE.md are load-bearing and encoded in the tests:
 //!
-//! - Precedence is `attention > working > idle`.
+//! - Precedence is `attention > working > done > idle`.
 //! - Attention **latches**: once raised it survives later polls until the user
 //!   opens the session. Activity does not clear it — an agent that keeps
 //!   printing while waiting for a permission answer still needs attention.
+//!
+//! [`SessionStatus::Done`] is the one other state an agent must say out loud.
+//! It is not inferred either: quiet is quiet, and the poller cannot tell a
+//! session that finished from one that never started. It latches only against
+//! silence — real activity replaces it, because work resuming is exactly the
+//! thing that makes "finished" untrue.
 //!
 //! Attention is never inferred from a process name or from terminal contents.
 //! It comes from an explicit signal only: a `grove notify` call (durable in
 //! the `@grove_attention` session option), or a tmux bell when the user has
 //! opted into that.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// How long a session stays "working" after its last pane activity.
@@ -32,8 +38,13 @@ pub const DEFAULT_AGENT_COMMANDS: &[&str] = &["claude", "aider", "codex", "goose
 /// A worktree with no session has no status at all; that case is
 /// [`crate::model::SessionPresence::None`], not a variant here.
 ///
-/// The `Ord` derive is the precedence rule: `Idle < Working < Attention`, so
-/// merging two observations is `max`. Keep the variants in this order.
+/// The `Ord` derive is the precedence rule: `Idle < Done < Working <
+/// Attention`, so merging two observations is `max`. Keep the variants in this
+/// order.
+///
+/// `Done` sits below `Working` deliberately. Merging is what a session does to
+/// its windows, and a session with one finished window and one busy one is
+/// busy: the work that is still moving is the more urgent fact about the row.
 #[derive(
     Debug,
     Clone,
@@ -50,9 +61,17 @@ pub const DEFAULT_AGENT_COMMANDS: &[&str] = &["claude", "aider", "codex", "goose
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// The session exists but nothing has happened recently. Idle does not
-    /// mean "finished" — only that Grove saw no activity.
+    /// mean "finished" — only that Grove saw no activity. The state that does
+    /// mean finished is [`SessionStatus::Done`], and only a report can set it.
     #[default]
     Idle,
+    /// An explicit signal says the work here is finished and wants nobody.
+    ///
+    /// The difference from `Idle` is the whole point: idle is what Grove
+    /// concludes from silence, done is what an agent said about itself. A row
+    /// that is done is one the user can look at when they choose to, which is
+    /// the question `Idle` could never answer.
+    Done,
     /// Recent pane activity, or a known agent process is running.
     Working,
     /// An explicit signal says the user is needed.
@@ -64,6 +83,7 @@ impl SessionStatus {
     pub fn label(self) -> &'static str {
         match self {
             SessionStatus::Idle => "idle",
+            SessionStatus::Done => "done",
             SessionStatus::Working => "working",
             SessionStatus::Attention => "attention",
         }
@@ -73,8 +93,61 @@ impl SessionStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "idle" => Some(SessionStatus::Idle),
+            "done" => Some(SessionStatus::Done),
             "working" => Some(SessionStatus::Working),
             "attention" => Some(SessionStatus::Attention),
+            _ => None,
+        }
+    }
+}
+
+/// Why a session says it wants the user.
+///
+/// Attention answers "does this row need me?"; this answers "for what?", which
+/// is what decides whether the user goes there now or after the thing they are
+/// doing. It rides alongside [`SessionStatus::Attention`] rather than being a
+/// state of its own: blocked, failed and waiting are all one condition — the
+/// work has stopped and only a person can restart it — and making them peers
+/// would give Grove several names for one thing to disagree about.
+///
+/// Grove never infers one. A report that names no reason keeps `None`, and a
+/// row shows attention without a reason rather than a guessed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionReason {
+    /// The agent asked something and is holding until it is answered.
+    WaitingInput,
+    /// The agent wants permission to do something it will not do unasked.
+    Permission,
+    /// Work cannot continue for a reason the agent cannot resolve itself: a
+    /// missing credential, a conflict, a dependency on another line of work.
+    Blocked,
+    /// Something the agent ran came back failing, and it stopped rather than
+    /// carrying on over the top of it.
+    Failed,
+}
+
+impl AttentionReason {
+    /// Short label for a row, shown beside the attention pill.
+    pub fn label(self) -> &'static str {
+        match self {
+            AttentionReason::WaitingInput => "waiting",
+            AttentionReason::Permission => "permission",
+            AttentionReason::Blocked => "blocked",
+            AttentionReason::Failed => "failed",
+        }
+    }
+
+    /// Parse the `--reason` value of `grove notify`.
+    ///
+    /// `waiting_input` and `waiting-input` both work: the wire form is snake
+    /// case, but a shell caller typing a flag reaches for a hyphen.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "waiting_input" | "waiting" => Some(AttentionReason::WaitingInput),
+            "permission" => Some(AttentionReason::Permission),
+            "blocked" => Some(AttentionReason::Blocked),
+            "failed" => Some(AttentionReason::Failed),
             _ => None,
         }
     }
@@ -144,6 +217,9 @@ pub struct SessionSignals {
     pub pane_commands: Vec<String>,
     /// The durable `@grove_attention` option is set on the session.
     pub attention_flag: bool,
+    /// The durable `@grove_done` option is set on the session: the last thing
+    /// its agent said about itself was that the work here finished.
+    pub done_flag: bool,
     /// tmux is flagging a bell for this session.
     pub bell: bool,
     /// RAM and CPU of the session's scoped agents, when resource accounting
@@ -225,6 +301,12 @@ pub fn classify_as(
         reporting == Reporting::Silent && policy.agent_running(&signals.pane_commands);
     if recently_active || agent_running {
         return SessionStatus::Working;
+    }
+    // Activity is checked first on purpose. The marker records what the agent
+    // last said; movement since then is a fact about now, and a session someone
+    // has picked back up is working whatever was said before they did.
+    if signals.done_flag {
+        return SessionStatus::Done;
     }
     SessionStatus::Idle
 }
@@ -316,6 +398,13 @@ pub struct StatusEngine {
     /// Worktrees whose agent has reported at least once this run. See
     /// [`Reporting`]: it decides whether the process-name rule applies.
     speaks: HashSet<String>,
+    /// The reason carried by each worktree's live attention, when its report
+    /// gave one. Cleared with the latch it belongs to.
+    ///
+    /// Held here and not on the server because, unlike the two markers, it is
+    /// presentation detail: it explains a status rather than being one, and a
+    /// reason lost to a restart costs a row a word, not a state.
+    reasons: HashMap<String, AttentionReason>,
 }
 
 impl StatusEngine {
@@ -324,6 +413,7 @@ impl StatusEngine {
             policy,
             latched: HashSet::new(),
             speaks: HashSet::new(),
+            reasons: HashMap::new(),
         }
     }
 
@@ -337,6 +427,12 @@ impl StatusEngine {
     }
 
     /// Fold one poll of a session into the engine and return what to display.
+    ///
+    /// The engine remembers the latch and nothing else. `Done` is not held
+    /// here: it lives in the session's own `@grove_done` option, so
+    /// [`classify_as`] already returns it and every reader — this engine, the
+    /// service answering `grove wait`, a poll after a restart — reaches the
+    /// same answer from the same place rather than from private memory.
     pub fn observe(&mut self, worktree_id: &str, signals: &SessionSignals) -> SessionStatus {
         let observed = classify_as(signals, &self.policy, self.reporting(worktree_id));
         if observed == SessionStatus::Attention {
@@ -375,11 +471,41 @@ impl StatusEngine {
     /// Any report at all, of any state, also marks the session as one that
     /// speaks for itself — which is what stops the poller from reading its
     /// agent's process as work forever after it has said it is finished.
-    pub fn notify(&mut self, worktree_id: &str, state: SessionStatus) {
+    ///
+    /// A `done` report needs nothing here: the CLI that sent it also set the
+    /// session's durable marker, and the next poll reads the state back from
+    /// there. Recording it a second time in this map would be the second owner
+    /// of one fact, and the two would eventually disagree.
+    ///
+    /// The reason belongs to the attention it arrived with and is replaced
+    /// wholesale by each attention report, including by one that names none.
+    /// The alternative — keeping the previous reason when a new report omits
+    /// it — would let a row explain a live attention with a stale sentence.
+    pub fn notify(
+        &mut self,
+        worktree_id: &str,
+        state: SessionStatus,
+        reason: Option<AttentionReason>,
+    ) {
         self.speaks.insert(worktree_id.to_string());
         if state == SessionStatus::Attention {
             self.latched.insert(worktree_id.to_string());
+            match reason {
+                Some(reason) => self.reasons.insert(worktree_id.to_string(), reason),
+                None => self.reasons.remove(worktree_id),
+            };
         }
+    }
+
+    /// Why this worktree wants the user, when its live attention said why.
+    ///
+    /// `None` covers both "not asking for the user" and "asking without
+    /// saying what for". A caller must not turn the second into a guess.
+    pub fn reason(&self, worktree_id: &str) -> Option<AttentionReason> {
+        if !self.latched.contains(worktree_id) {
+            return None;
+        }
+        self.reasons.get(worktree_id).copied()
     }
 
     /// Whether this worktree's agent has reported for itself this run.
@@ -394,7 +520,13 @@ impl StatusEngine {
     ///
     /// Returns true when a latch was actually cleared, which is the caller's
     /// signal to also unset the durable `@grove_attention` tmux option.
+    ///
+    /// The reason goes with it: it explains an attention, and outliving one
+    /// would leave a row able to say why about something it is no longer
+    /// saying. The done marker is untouched — the user having looked does not
+    /// make finished work unfinished, and only the agent retracts that.
     pub fn opened(&mut self, worktree_id: &str) -> bool {
+        self.reasons.remove(worktree_id);
         self.latched.remove(worktree_id)
     }
 
@@ -547,13 +679,165 @@ mod tests {
     }
 
     #[test]
-    fn precedence_is_attention_over_working_over_idle() {
+    fn precedence_is_attention_over_working_over_done_over_idle() {
         assert!(SessionStatus::Attention > SessionStatus::Working);
-        assert!(SessionStatus::Working > SessionStatus::Idle);
+        assert!(SessionStatus::Working > SessionStatus::Done);
+        assert!(SessionStatus::Done > SessionStatus::Idle);
         assert_eq!(
             SessionStatus::Idle.max(SessionStatus::Attention),
             SessionStatus::Attention
         );
+        // Merging windows into their session: one finished window does not make
+        // a session with a busy one finished.
+        assert_eq!(
+            SessionStatus::Done.max(SessionStatus::Working),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn every_state_survives_its_own_label() {
+        for state in [
+            SessionStatus::Idle,
+            SessionStatus::Done,
+            SessionStatus::Working,
+            SessionStatus::Attention,
+        ] {
+            assert_eq!(SessionStatus::parse(state.label()), Some(state));
+        }
+        assert_eq!(SessionStatus::parse("  DONE "), Some(SessionStatus::Done));
+        assert_eq!(SessionStatus::parse("finished"), None);
+    }
+
+    #[test]
+    fn every_reason_survives_its_own_label() {
+        for reason in [
+            AttentionReason::WaitingInput,
+            AttentionReason::Permission,
+            AttentionReason::Blocked,
+            AttentionReason::Failed,
+        ] {
+            assert_eq!(AttentionReason::parse(reason.label()), Some(reason));
+        }
+    }
+
+    #[test]
+    fn a_reason_is_read_in_the_spellings_a_caller_reaches_for() {
+        // The wire form is snake case; a hand-typed flag uses a hyphen; and a
+        // hook writer may shout. All three name the same reason.
+        for spelling in [
+            "waiting_input",
+            "waiting-input",
+            "WAITING_INPUT",
+            " waiting ",
+        ] {
+            assert_eq!(
+                AttentionReason::parse(spelling),
+                Some(AttentionReason::WaitingInput),
+                "{spelling} should be waiting-input"
+            );
+        }
+        assert_eq!(AttentionReason::parse("stuck"), None);
+        assert_eq!(AttentionReason::parse(""), None);
+    }
+
+    #[test]
+    fn a_quiet_session_carrying_the_done_marker_is_done() {
+        let signals = SessionSignals {
+            done_flag: true,
+            ..signals_idle()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Done
+        );
+    }
+
+    #[test]
+    fn activity_beats_the_done_marker() {
+        // Someone picked the session back up. What the agent last said is now
+        // out of date, and the row must not keep claiming the work is over.
+        let signals = SessionSignals {
+            activity_age: Some(Duration::from_secs(1)),
+            done_flag: true,
+            ..signals_idle()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn attention_beats_the_done_marker() {
+        // An agent that finished a turn by asking a question is waiting for an
+        // answer, not finished.
+        let signals = SessionSignals {
+            attention_flag: true,
+            done_flag: true,
+            ..signals_idle()
+        };
+        assert_eq!(
+            classify(&signals, &StatusPolicy::default()),
+            SessionStatus::Attention
+        );
+    }
+
+    #[test]
+    fn done_is_read_from_the_session_not_from_the_engines_memory() {
+        // The engine is told nothing here. A `done` report leaves its evidence
+        // on the session, so a fresh engine — a restarted GUI, or the service
+        // answering `grove wait` — reaches the same answer.
+        let mut engine = StatusEngine::default();
+        let signals = SessionSignals {
+            done_flag: true,
+            ..signals_idle()
+        };
+        assert_eq!(engine.observe("abc123", &signals), SessionStatus::Done);
+    }
+
+    #[test]
+    fn an_attention_reason_lives_and_dies_with_its_latch() {
+        let mut engine = StatusEngine::default();
+        assert_eq!(engine.reason("abc123"), None, "nothing is asking yet");
+
+        engine.notify(
+            "abc123",
+            SessionStatus::Attention,
+            Some(AttentionReason::Blocked),
+        );
+        assert_eq!(engine.reason("abc123"), Some(AttentionReason::Blocked));
+
+        // A later attention that names no reason replaces the old one rather
+        // than letting a stale sentence explain a fresh ask.
+        engine.notify("abc123", SessionStatus::Attention, None);
+        assert_eq!(engine.reason("abc123"), None);
+
+        engine.notify(
+            "abc123",
+            SessionStatus::Attention,
+            Some(AttentionReason::Failed),
+        );
+        assert_eq!(engine.reason("abc123"), Some(AttentionReason::Failed));
+        engine.opened("abc123");
+        assert_eq!(
+            engine.reason("abc123"),
+            None,
+            "the user looked; there is no live attention left to explain"
+        );
+    }
+
+    #[test]
+    fn a_reason_without_a_latch_is_never_reported() {
+        // A reason arriving on a non-attention report is carried by the wire
+        // but must never surface: there is no ask for it to explain.
+        let mut engine = StatusEngine::default();
+        engine.notify(
+            "abc123",
+            SessionStatus::Done,
+            Some(AttentionReason::Permission),
+        );
+        assert_eq!(engine.reason("abc123"), None);
     }
 
     #[test]
@@ -652,6 +936,7 @@ mod tests {
             activity_age: Some(Duration::from_secs(1)),
             pane_commands: vec!["claude".into()],
             attention_flag: true,
+            done_flag: false,
             bell: false,
             usage: None,
             windows: Vec::new(),
@@ -704,6 +989,7 @@ mod tests {
         let mut engine = StatusEngine::default();
         let raised = SessionSignals {
             attention_flag: true,
+            done_flag: false,
             ..SessionSignals::default()
         };
         assert_eq!(engine.observe("abc123", &raised), SessionStatus::Attention);
@@ -718,7 +1004,7 @@ mod tests {
     #[test]
     fn new_activity_does_not_clear_the_latch() {
         let mut engine = StatusEngine::default();
-        engine.notify("abc123", SessionStatus::Attention);
+        engine.notify("abc123", SessionStatus::Attention, None);
         let busy = SessionSignals {
             activity_age: Some(Duration::from_secs(1)),
             ..SessionSignals::default()
@@ -729,7 +1015,7 @@ mod tests {
     #[test]
     fn opening_the_session_clears_the_latch() {
         let mut engine = StatusEngine::default();
-        engine.notify("abc123", SessionStatus::Attention);
+        engine.notify("abc123", SessionStatus::Attention, None);
         assert!(engine.opened("abc123"));
         assert_eq!(
             engine.observe("abc123", &signals_idle()),
@@ -742,16 +1028,16 @@ mod tests {
     #[test]
     fn a_working_report_does_not_clear_a_latch() {
         let mut engine = StatusEngine::default();
-        engine.notify("abc123", SessionStatus::Attention);
-        engine.notify("abc123", SessionStatus::Working);
-        engine.notify("abc123", SessionStatus::Idle);
+        engine.notify("abc123", SessionStatus::Attention, None);
+        engine.notify("abc123", SessionStatus::Working, None);
+        engine.notify("abc123", SessionStatus::Idle, None);
         assert!(engine.is_latched("abc123"));
     }
 
     #[test]
     fn latches_are_per_worktree() {
         let mut engine = StatusEngine::default();
-        engine.notify("aaaaaa", SessionStatus::Attention);
+        engine.notify("aaaaaa", SessionStatus::Attention, None);
         assert_eq!(
             engine.observe("bbbbbb", &signals_idle()),
             SessionStatus::Idle
@@ -815,7 +1101,7 @@ mod tests {
 
         // Any state does it: the point is that this agent talks, not what it
         // said.
-        engine.notify("abc123", SessionStatus::Working);
+        engine.notify("abc123", SessionStatus::Working, None);
         assert_eq!(engine.reporting("abc123"), Reporting::Speaks);
         assert_eq!(engine.observe("abc123", &quiet_agent), SessionStatus::Idle);
         assert_eq!(
@@ -830,7 +1116,7 @@ mod tests {
     #[test]
     fn attention_still_latches_over_a_reporting_session() {
         let mut engine = StatusEngine::default();
-        engine.notify("abc123", SessionStatus::Attention);
+        engine.notify("abc123", SessionStatus::Attention, None);
         assert_eq!(
             engine.observe("abc123", &signals_idle()),
             SessionStatus::Attention
@@ -840,8 +1126,8 @@ mod tests {
     #[test]
     fn forget_and_retain_drop_stale_latches() {
         let mut engine = StatusEngine::default();
-        engine.notify("aaaaaa", SessionStatus::Attention);
-        engine.notify("bbbbbb", SessionStatus::Attention);
+        engine.notify("aaaaaa", SessionStatus::Attention, None);
+        engine.notify("bbbbbb", SessionStatus::Attention, None);
         engine.forget("aaaaaa");
         assert!(!engine.is_latched("aaaaaa"));
         assert_eq!(engine.reporting("aaaaaa"), Reporting::Silent);

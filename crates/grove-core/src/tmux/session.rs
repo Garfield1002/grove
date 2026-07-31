@@ -20,6 +20,7 @@ const SESSION_FORMAT: &str = concat!(
     "#{session_name}\u{1}#{session_path}\u{1}#{session_attached}",
     "\u{1}#{@grove_id}\u{1}#{@grove_project}\u{1}#{@grove_worktree}\u{1}#{@grove_repo}",
     "\u{1}#{@grove_attention}\u{1}#{session_activity}\u{1}#{session_alerts}",
+    "\u{1}#{@grove_done}",
 );
 
 /// Name of window 0 in a Grove session.
@@ -39,6 +40,17 @@ pub const OPT_REPO: &str = "@grove_repo";
 pub const OPT_ATTENTION: &str = "@grove_attention";
 /// Value written to [`OPT_ATTENTION`] when attention is raised.
 pub const ATTENTION_SET: &str = "1";
+/// Durable "the work here finished" marker, set by `grove notify --state done`.
+///
+/// On the server for the same reason as [`OPT_ATTENTION`], and for one more:
+/// it is the only place a stateless reader can learn it. Done cannot be
+/// derived from a poll — a quiet session that finished and one that never
+/// started are the same session to tmux — so a component holding it in memory
+/// would be the only component that knew, and `grove wait --status done` asks
+/// from a different process entirely.
+pub const OPT_DONE: &str = "@grove_done";
+/// Value written to [`OPT_DONE`] when an agent reports finishing.
+pub const DONE_SET: &str = "1";
 
 /// Everything needed to create a session for a worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +103,8 @@ pub struct SessionInfo {
     pub activity_epoch: Option<u64>,
     /// tmux is flagging a bell for this session (`#{session_alerts}`).
     pub bell: bool,
+    /// The durable `@grove_done` marker is set on this session.
+    pub done: bool,
 }
 
 impl SessionInfo {
@@ -112,6 +126,7 @@ impl SessionInfo {
                 .map(|epoch| status::activity_age(now_epoch, epoch)),
             pane_commands,
             attention_flag: self.attention,
+            done_flag: self.done,
             bell: self.bell,
             // Both filled in by the poller, which has the pane listing.
             usage: None,
@@ -172,6 +187,10 @@ pub fn parse_sessions(output: &str) -> std::result::Result<Vec<SessionInfo>, Par
         // that failed the whole list over it would show nothing at all.
         let activity_epoch = next().and_then(|v| v.trim().parse::<u64>().ok());
         let bell = next().is_some_and(|v| v.split(',').any(|a| a.trim() == "bell"));
+        // Last in the format, so a line from a tmux that predates the option —
+        // or from a server whose sessions were made before Grove asked for it —
+        // simply reads as "not done" rather than failing the whole listing.
+        let done = next().is_some_and(|v| option_is_set(&v));
         sessions.push(SessionInfo {
             name: name.to_string(),
             path: PathBuf::from(path),
@@ -180,6 +199,7 @@ pub fn parse_sessions(output: &str) -> std::result::Result<Vec<SessionInfo>, Par
             attention,
             activity_epoch,
             bell,
+            done,
         });
     }
     Ok(sessions)
@@ -363,6 +383,39 @@ pub fn set_attention(server: &TmuxServer, session: &str) -> Result<bool> {
 /// Clear the durable attention marker, when the user opens the session.
 pub fn clear_attention(server: &TmuxServer, session: &str) -> Result<bool> {
     let out = server.run_allow_failure(unset_option_args(session, OPT_ATTENTION))?;
+    if out.success {
+        return Ok(true);
+    }
+    if TmuxServer::is_missing_target(&out.stderr) {
+        return Ok(false);
+    }
+    Err(out.failure.into())
+}
+
+/// Raise the durable done marker on a session.
+///
+/// Set by `grove notify --state done`, and read back by anything that polls —
+/// including a `grove wait` in another process, which has no memory of the
+/// report and could not otherwise know. Missing session or server is not an
+/// error, for the same reason as [`set_attention`].
+pub fn set_done(server: &TmuxServer, session: &str) -> Result<bool> {
+    let out = server.run_allow_failure(set_option_args(session, OPT_DONE, OsStr::new(DONE_SET)))?;
+    if out.success {
+        return Ok(true);
+    }
+    if TmuxServer::is_missing_target(&out.stderr) {
+        return Ok(false);
+    }
+    Err(out.failure.into())
+}
+
+/// Clear the durable done marker.
+///
+/// Sent by `grove notify` for every state that is not `done`: an agent saying
+/// anything else about itself has retracted finishing, and leaving the marker
+/// would let a row claim work is over while the agent reports otherwise.
+pub fn clear_done(server: &TmuxServer, session: &str) -> Result<bool> {
+    let out = server.run_allow_failure(unset_option_args(session, OPT_DONE))?;
     if out.success {
         return Ok(true);
     }
@@ -888,6 +941,32 @@ mod tests {
         assert_eq!(signals.pane_commands, vec!["claude".to_string()]);
         assert!(signals.attention_flag);
         assert!(signals.bell);
+    }
+
+    #[test]
+    fn done_option_args_set_and_unset_the_same_key() {
+        let set = set_option_args("wt-a1b2c3", OPT_DONE, OsStr::new(DONE_SET));
+        assert_eq!(set, ["set-option", "-t", "wt-a1b2c3", "@grove_done", "1"]);
+        let unset = unset_option_args("wt-a1b2c3", OPT_DONE);
+        assert_eq!(
+            unset,
+            ["set-option", "-t", "wt-a1b2c3", "-u", "@grove_done"]
+        );
+    }
+
+    #[test]
+    fn the_done_marker_is_read_back_off_a_session_line() {
+        let set = "wt-a1b2c3\u{1}/work/tree\u{1}0\u{1}a1b2c3\u{1}Grove\u{1}/work/tree\u{1}/repo/.git\
+                   \u{1}\u{1}100\u{1}\u{1}1";
+        let sessions = parse_sessions(set).expect("valid");
+        assert!(sessions[0].done);
+        assert!(sessions[0].signals(100, Vec::new()).done_flag);
+
+        // The same line without the trailing field: a session made before Grove
+        // asked for the option reads as "not done" rather than failing.
+        let older = "wt-a1b2c3\u{1}/work/tree\u{1}0\u{1}a1b2c3\u{1}Grove\u{1}/work/tree\u{1}/repo/.git\u{1}\u{1}100\u{1}";
+        let sessions = parse_sessions(older).expect("valid");
+        assert!(!sessions[0].done);
     }
 
     #[test]

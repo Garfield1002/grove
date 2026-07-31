@@ -32,6 +32,7 @@ Usage:
   grove session open <worktree-id>    open it in the primary/new terminal
   grove agent start <worktree-id>     start the configured coding agent
   grove wait <worktree-id> --status <status>  wait for semantic agent state
+                                      (working, idle, done, attention, stopped)
   grove snapshot       print one coherent service snapshot as JSON
   grove serve       run Grove's headless local service
   grove --help     show this message
