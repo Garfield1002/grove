@@ -10,6 +10,15 @@ experiments, and maintenance. Some work is performed directly by a human.
 Some is delegated to coding agents. Much of it remains active while attention
 moves elsewhere.
 
+The constraint has moved. When work is delegated as easily as it is started,
+producing it is no longer the slow part. The scarce resource is human
+attention spread across many parallel lines of work, not the work itself.
+
+Failure at that scale looks like not noticing rather than working slowly:
+something finished and was never reviewed, something has been waiting for an
+answer, something failed quietly and still looks alive. None of it is visible
+from inside any single session.
+
 The tools underneath this work are already good. Git owns source history and
 worktrees. tmux owns persistent terminal sessions. Terminal emulators present
 them. Coding agents participate in them.
