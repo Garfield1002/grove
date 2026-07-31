@@ -258,7 +258,12 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct StartResult {
                 unit: Option<String>,
             }
-            let result = call_service(
+            // The sender is cloned out here only because `worker` is borrowed
+            // by the call itself; the refresh is still sent on success alone,
+            // exactly as it was. The new window is activity tmux reports at
+            // once, and a poll now is what makes the row react immediately.
+            let refresh = worker.tasks.clone();
+            service_result(
                 worker,
                 "gui-start-agent",
                 "agent.start",
@@ -267,30 +272,15 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "resume": resume,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<StartResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode started agent",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            match result {
-                Ok(result) => {
-                    // The new window is activity tmux reports at once; a poll
-                    // now is what makes the row react immediately.
-                    worker.enqueue(Task::RefreshSessions);
+                "could not start the agent",
+                |result: StartResult| {
+                    let _ = refresh.send(Task::RefreshSessions);
                     vec![Message::AgentStarted {
                         worktree_id,
                         unit: result.unit,
                     }]
-                }
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    "could not start the agent",
-                    &e,
-                ))],
-            }
+                },
+            )
         }
 
         Task::ResumeAgents { idempotency_key } => {
