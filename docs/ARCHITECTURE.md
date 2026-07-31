@@ -184,6 +184,13 @@ grove/
 │           ├── notify.rs       # `grove notify`, incl. `--hook` (stdin JSON)
 │           ├── hooks.rs        # `grove hooks`: Claude Code settings.json
 │           ├── app.rs          # eframe::App, channel plumbing
+│           ├── app/
+│           │   ├── rows.rs        # the project list + everything stamped
+│           │   │                  # onto it (statuses, windows, notices) —
+│           │   │                  # no egui/worker/service — TESTED
+│           │   ├── selection.rs   # selected row, window, filter — TESTED
+│           │   ├── service_events.rs # revision & payload rules — TESTED
+│           │   └── dialogs.rs     # the four detached windows
 │           ├── workers.rs      # thread pool, poller, IPC listener
 │           └── ui/
 │               ├── project_list.rs
