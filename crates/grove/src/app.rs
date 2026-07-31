@@ -564,7 +564,7 @@ impl GroveApp {
         self.rows.clear_attention(worktree_id);
         self.workers.send(Task::ClearAttention {
             worktree_id: worktree_id.to_string(),
-            idempotency_key: format!("gui-clear-attention-{}", grove_core::agent::nonce()),
+            idempotency_key: format!("gui-clear-attention-{}", grove_core::nonce()),
         });
     }
 
@@ -646,7 +646,7 @@ impl GroveApp {
         // start a conversation twice.
         self.agents_resumed = true;
         self.workers.send(Task::ResumeAgents {
-            idempotency_key: format!("gui-launch-{}", grove_core::agent::nonce()),
+            idempotency_key: format!("gui-launch-{}", grove_core::nonce()),
         });
     }
 
@@ -666,7 +666,7 @@ impl GroveApp {
             self.workers.send(Task::StartAgent {
                 worktree_id: worktree.id.clone(),
                 resume,
-                idempotency_key: format!("gui-agent-start-{}", grove_core::agent::nonce()),
+                idempotency_key: format!("gui-agent-start-{}", grove_core::nonce()),
             });
             self.selection.select(worktree_id.to_string());
         }
@@ -700,7 +700,7 @@ impl GroveApp {
                 if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
                     self.workers.send(Task::Activate {
                         worktree_id: worktree.id.clone(),
-                        idempotency_key: format!("gui-session-open-{}", grove_core::agent::nonce()),
+                        idempotency_key: format!("gui-session-open-{}", grove_core::nonce()),
                     });
                     self.clear_attention(&worktree_id);
                     self.selection.select(worktree_id);
@@ -757,10 +757,7 @@ impl GroveApp {
                     self.selection.select(worktree_id);
                     self.workers.send(Task::OpenInNewTerminal {
                         worktree_id: target,
-                        idempotency_key: format!(
-                            "gui-additional-terminal-{}",
-                            grove_core::agent::nonce()
-                        ),
+                        idempotency_key: format!("gui-additional-terminal-{}", grove_core::nonce()),
                     });
                 }
             }
@@ -775,7 +772,7 @@ impl GroveApp {
                         worktree_id: target,
                         idempotency_key: format!(
                             "gui-session-window-create-{}",
-                            grove_core::agent::nonce()
+                            grove_core::nonce()
                         ),
                     });
                 }
@@ -792,10 +789,7 @@ impl GroveApp {
                     self.workers.send(Task::ActivateWindow {
                         worktree_id: target,
                         window_index,
-                        idempotency_key: format!(
-                            "gui-session-window-open-{}",
-                            grove_core::agent::nonce()
-                        ),
+                        idempotency_key: format!("gui-session-window-open-{}", grove_core::nonce()),
                     });
                     self.clear_attention(&worktree_id);
                     self.selection.select_window(worktree_id, window_index);
@@ -828,10 +822,7 @@ impl GroveApp {
             OrphanAction::Open(session) => {
                 self.workers.send(Task::OpenSession {
                     session,
-                    idempotency_key: format!(
-                        "gui-open-orphan-session-{}",
-                        grove_core::agent::nonce()
-                    ),
+                    idempotency_key: format!("gui-open-orphan-session-{}", grove_core::nonce()),
                 });
             }
             OrphanAction::Associate {
@@ -843,10 +834,7 @@ impl GroveApp {
                     self.workers.send(Task::AssociateSession {
                         worktree_id: worktree.id.clone(),
                         session,
-                        idempotency_key: format!(
-                            "gui-associate-session-{}",
-                            grove_core::agent::nonce()
-                        ),
+                        idempotency_key: format!("gui-associate-session-{}", grove_core::nonce()),
                     });
                 }
             }
@@ -855,7 +843,7 @@ impl GroveApp {
                 if self.orphan_armed.as_deref() == Some(session.as_str()) {
                     self.workers.send(Task::CloseOrphan {
                         session,
-                        idempotency_key: format!("gui-close-orphan-{}", grove_core::agent::nonce()),
+                        idempotency_key: format!("gui-close-orphan-{}", grove_core::nonce()),
                     });
                 } else {
                     self.status = Some(format!(
@@ -994,7 +982,7 @@ impl GroveApp {
                 self.shutdown_armed = false;
                 self.status = Some("Killing the tmux server…".to_string());
                 self.workers.send(Task::KillServer {
-                    idempotency_key: format!("gui-stop-server-{}", grove_core::agent::nonce()),
+                    idempotency_key: format!("gui-stop-server-{}", grove_core::nonce()),
                 });
             } else {
                 self.shutdown_armed = true;

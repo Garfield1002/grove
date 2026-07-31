@@ -18,6 +18,7 @@ pub mod git;
 pub mod ids;
 pub mod ipc;
 pub mod model;
+pub mod nonce;
 pub mod notice;
 pub mod paths;
 pub mod process;
@@ -33,6 +34,7 @@ pub mod workflow;
 
 pub use error::{Error, Result};
 pub use model::{Project, SessionPresence, Worktree};
+pub use nonce::nonce;
 pub use paths::Paths;
 pub use status::{SessionSignals, SessionStatus, StatusEngine, StatusPolicy};
 pub use tmux::TmuxServer;

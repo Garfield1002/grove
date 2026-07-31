@@ -86,14 +86,6 @@ pub fn scope_unit(worktree_id: &str, kind: &str, nonce: u64) -> String {
     format!("grove-{worktree_id}-{kind}-{nonce:x}.scope")
 }
 
-/// A nonce for [`scope_unit`], from the clock.
-pub fn nonce() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 /// Wrap an invocation in a transient systemd scope.
 ///
 /// `--collect` makes systemd forget the unit once it exits, so a failed agent
@@ -158,7 +150,7 @@ pub fn launch(
 ) -> Result<AgentLaunch> {
     let command = expand(template, vars)?;
     let (command, unit) = if accounting.wraps(systemd_available) {
-        let unit = scope_unit(worktree_id, AGENT_WINDOW, nonce());
+        let unit = scope_unit(worktree_id, AGENT_WINDOW, crate::nonce());
         (in_scope(&unit, command), Some(unit))
     } else {
         (command, None)

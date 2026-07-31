@@ -663,7 +663,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     {
                         let _ = follow_up.send(Task::Activate {
                             worktree_id: worktree.id.clone(),
-                            idempotency_key: format!("create-open-{}", grove_core::agent::nonce()),
+                            idempotency_key: format!("create-open-{}", grove_core::nonce()),
                         });
                     }
                     messages.push(Message::WorktreesRefreshed {

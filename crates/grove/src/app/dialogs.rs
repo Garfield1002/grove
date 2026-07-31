@@ -108,7 +108,7 @@ impl GroveApp {
                         worktree_id: form.worktree_id.clone(),
                         idempotency_key: format!(
                             "gui-close-worktree-session-{}",
-                            grove_core::agent::nonce()
+                            grove_core::nonce()
                         ),
                     });
                 }
@@ -117,7 +117,7 @@ impl GroveApp {
                 project_id: form.project_id.clone(),
                 worktree_id: form.worktree_id.clone(),
                 force,
-                idempotency_key: format!("gui-remove-worktree-{}", grove_core::agent::nonce()),
+                idempotency_key: format!("gui-remove-worktree-{}", grove_core::nonce()),
             }),
             Request::DeleteBranch { force } => {
                 if let Some(branch) = form.branch.clone() {
@@ -125,10 +125,7 @@ impl GroveApp {
                         project_id: form.project_id.clone(),
                         branch,
                         force,
-                        idempotency_key: format!(
-                            "gui-delete-branch-{}",
-                            grove_core::agent::nonce()
-                        ),
+                        idempotency_key: format!("gui-delete-branch-{}", grove_core::nonce()),
                     });
                 }
             }
@@ -210,7 +207,7 @@ impl GroveApp {
                 self.status = Some(format!("Opening {path}…"));
                 self.workers.send(Task::OpenProject {
                     path: PathBuf::from(path),
-                    idempotency_key: format!("gui-project-open-{}", grove_core::agent::nonce()),
+                    idempotency_key: format!("gui-project-open-{}", grove_core::nonce()),
                 });
                 close = true;
             }
@@ -260,7 +257,7 @@ impl GroveApp {
                     project_id: form.project_id.clone(),
                     add,
                     open_after: form.open_after,
-                    idempotency_key: format!("gui-create-worktree-{}", grove_core::agent::nonce()),
+                    idempotency_key: format!("gui-create-worktree-{}", grove_core::nonce()),
                 });
                 self.status = Some("Creating the worktree…".to_string());
                 close = true;
