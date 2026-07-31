@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/grove-core", "crates/grove"]
+members = ["crates/grove-core", "crates/grove-harness", "crates/grove"]
 
 [workspace.package]
 version = "0.1.0"
@@ -61,6 +61,7 @@ fn_params_excessive_bools = "allow"
 
 [workspace.dependencies]
 grove-core = { path = "crates/grove-core" }
+grove-harness = { path = "crates/grove-harness" }
 eframe = { version = "0.32", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 egui = "0.32"
 # Only to decode the backdrop PNG at first paint. No codecs beyond png, and

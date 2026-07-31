@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use crate::error::{Error, Result};
-use crate::status::SessionStatus;
+use grove_core::error::{Error, Result};
+use grove_core::status::SessionStatus;
 
 /// The command Claude Code is configured to run. It reads the payload itself,
 /// so every event installs the same line.
@@ -363,9 +363,8 @@ fn rewrite(
     transform: fn(&str) -> std::result::Result<String, SettingsError>,
 ) -> Result<HookChange> {
     let current = read_settings(path)?;
-    let updated = transform(&current).map_err(|source| Error::ClaudeSettings {
-        path: path.to_path_buf(),
-        source,
+    let updated = transform(&current).map_err(|source| {
+        Error::integration(format!("could not update {}", path.display()), source)
     })?;
     let installed = installed_events(&updated);
     if updated == current {
@@ -377,7 +376,7 @@ fn rewrite(
         });
     }
     let backup = back_up(path, &current)?;
-    crate::atomic::write(path, &updated)?;
+    grove_core::atomic::write(path, &updated)?;
     Ok(HookChange {
         path: path.to_path_buf(),
         backup,
@@ -779,7 +778,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{ this is not json").expect("write");
         let err = install_hooks(&path).expect_err("refused");
-        assert!(matches!(err, Error::ClaudeSettings { .. }));
+        assert!(matches!(err, Error::Integration { .. }));
         assert_eq!(
             std::fs::read_to_string(&path).expect("still there"),
             "{ this is not json"

@@ -17,13 +17,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use grove_core::Paths;
-use grove_core::claude::HookChange;
 use grove_core::config::Config;
 use grove_core::ipc::Notification;
 use grove_core::protocol::Event;
 use grove_core::reconcile::{OrphanSession, Reconciliation};
 use grove_core::state::State;
 use grove_core::workflow::Activation;
+use grove_harness::claude::HookChange;
 
 use crate::status_watch::{Control, StatusWatch};
 use crate::ui::chrome::Detached;

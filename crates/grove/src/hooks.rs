@@ -10,7 +10,7 @@
 //! a removal, a copy is taken before it is replaced, and a file Grove cannot
 //! parse is reported rather than overwritten.
 
-use grove_core::claude::{self, HOOK_COMMAND, HOOK_EVENTS, HookChange};
+use grove_harness::claude::{self, HOOK_COMMAND, HOOK_EVENTS, HookChange};
 
 pub const USAGE: &str = "\
 grove hooks — Grove's hooks in Claude Code's settings

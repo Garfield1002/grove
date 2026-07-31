@@ -172,14 +172,20 @@ pub enum Error {
     #[error("could not serialize state: {0}")]
     StateWrite(#[from] toml::ser::Error),
 
-    /// Claude Code's `settings.json` could not be rewritten. The file is left
-    /// exactly as it was: it is the user's, and a file Grove cannot parse is
-    /// the last one to overwrite.
-    #[error("could not update {path}: {source}")]
-    ClaudeSettings {
-        path: PathBuf,
+    /// A failure inside a layer built on top of Grove rather than inside
+    /// Grove — the agent harness, today.
+    ///
+    /// Core does not know what those layers are, and must not: naming
+    /// `grove_harness`'s types here is exactly the dependency the crate split
+    /// removed. They still surface to the same UI and the same CLI, so they
+    /// need a way in, and this is it. The `context` says which operation
+    /// failed; the source carries the layer's own error whole, so nothing is
+    /// flattened to a string on the way through.
+    #[error("{context}: {source}")]
+    Integration {
+        context: String,
         #[source]
-        source: crate::claude::SettingsError,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
     #[error("no agent command is configured — set `command` under [agents] in config.toml")]
@@ -231,6 +237,18 @@ impl Error {
         Error::Io {
             context: context.into(),
             source,
+        }
+    }
+
+    /// Wrap a failure from a layer built on top of Grove. See
+    /// [`Error::Integration`].
+    pub fn integration(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Integration {
+            context: context.into(),
+            source: Box::new(source),
         }
     }
 }

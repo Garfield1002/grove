@@ -1,0 +1,214 @@
+Grove project review
+====================
+
+Grove is a well-engineered Git-worktree launcher and tmux session navigator.
+Its core behavior is clear and useful; its main weakness is that it is becoming
+two products at once: a small desktop tool and a general automation service.
+
+This review covers the current dirty branch, including the uncommitted
+service-control work.
+
+What Grove does
+---------------
+
+Grove provides one desktop view of registered Git projects and their
+worktrees. Each worktree can have a persistent session on a private tmux
+server.
+
+Its central workflow is:
+
+1. Discover worktrees from Git.
+2. Derive a stable worktree ID.
+3. Associate that ID with a private tmux session.
+4. Create, switch, or launch a terminal attached to the session.
+5. Show Git and agent status without reading terminal contents.
+6. Reconstruct its index from Git and tmux after restart or state loss.
+
+It also supports safe worktree removal, agent launching and resumption, Claude
+Code hooks, desktop notifications, numbered shortcuts, JSON queries, and--on
+the current branch--a persistent control API.
+
+The strongest product decision is that Grove does not implement a terminal.
+It lets Git own worktrees, tmux own sessions, and the terminal emulator own
+display. That keeps the essential product technically sound.
+
+Is it doing it well?
+--------------------
+
+Yes, especially in the areas where mistakes would be costly.
+
+- Git and tmux remain sources of truth; state.toml is only an index.
+- The private tmux socket avoids interfering with the user's normal tmux
+  server.
+- Worktree IDs are deterministic, so recovery does not depend on saved state.
+- Destructive actions remain separate and confirmed.
+- Paths and branch names are passed as process arguments rather than
+  interpolated shell text.
+- Subprocess work stays off the egui thread.
+- Configuration edits preserve user comments and formatting.
+- The core crate has no UI dependency.
+- Errors preserve underlying Git/tmux diagnostics.
+- The testing is excellent: 717 tests passed across 11 suites.
+- Build, formatting, and Clippy with warnings denied all pass.
+
+The project is around 32,000 lines of Rust including tests. That is substantial
+for the product, but much of it is real safety, parser, integration, and
+platform behavior rather than gratuitous abstraction.
+
+I found no critical correctness or safety problem during this review.
+
+Where complexity has accumulated
+--------------------------------
+
+1. Grove currently has competing owners of application state
+
+The service is documented as the sole owner of state.toml, but the GUI still
+loads and keeps a complete local State, mutates it, clones it, and sends the
+whole value back through state.replace.
+
+The comment in apply_reconciliation explicitly guards against an older GUI
+copy overwriting service-owned session records. That is a sign the ownership
+model is fighting itself.
+
+This is the most important simplification:
+
+- If the service is authoritative, the GUI should bootstrap from a service
+  snapshot and send narrow operations such as project.add, project.remove,
+  slot.set, and attention.clear.
+- If the GUI is authoritative, remove state.replace, service reconciliation,
+  subscriptions, and sole-writer claims.
+
+Avoid a whole-state replication protocol between two processes.
+
+2. The persistent service has grown beyond Grove's original need
+
+The original requirement was modest: retain agent notifications while the GUI
+is absent and handle grove toggle. The current service additionally implements:
+
+- versioned length-prefixed JSON frames,
+- method dispatch,
+- coherent snapshots,
+- mutations,
+- subscriptions and revisions,
+- slow-subscriber eviction,
+- idempotency caching,
+- semantic status waiting,
+- control-completion events,
+- legacy-protocol fallback.
+
+That is legitimate infrastructure for a programmable worktree daemon, but it
+is not inherently necessary for a desktop tmux navigator.
+
+The uncommitted work alone adds roughly 460 lines, mostly to this surface.
+
+A product decision is needed:
+
+- For a focused desktop application, retain only notification queueing,
+  toggling, and perhaps read-only snapshots.
+- For an automation platform, keep the service but make the GUI a thin client
+  of it and remove the duplicate direct execution paths.
+
+The present hybrid costs more than either coherent choice.
+
+3. Git/tmux state is collected through too many paths
+
+Today there are several overlapping execution routes:
+
+- the GUI worker,
+- the status watcher,
+- service query methods,
+- service control methods,
+- direct CLI query fallback,
+- subscription events,
+- polling as subscription recovery.
+
+Each is individually reasonable, but together they make it harder to establish
+which snapshot is current and where a behavior belongs.
+
+A simpler model would have one core collector that produces a Snapshot from
+one state load plus Git/tmux inspection. The GUI, CLI, service, and
+reconciliation code could all consume that same operation. The existing
+grove-core query module is already close to being that shared boundary.
+
+4. The main orchestration modules are too concentrated
+
+Several files have become "everything for this layer" modules:
+
+- app.rs: 2,339 lines
+- workers.rs: 1,483 lines
+- worktree_row.rs: 1,568 lines
+- workflow.rs: 1,249 lines
+- service.rs: currently about 1,000 lines
+
+The issue is not merely file length. GroveApp simultaneously owns domain state,
+dialogs, selection, notification application, reconciliation, agent
+resumption, persistence synchronization, keyboard behavior, and rendering.
+
+I would split only along existing responsibilities:
+
+- app/model.rs: GUI state and service-event application
+- app/actions.rs: translating UI actions into worker/service commands
+- app/view.rs: frame and detached-window rendering
+- worker handlers grouped by git, tmux, config, and desktop operations
+- service handlers separated from socket/listener machinery
+
+This does not require new architectural layers or generic traits.
+
+5. The command protocol duplicates typed internal operations
+
+Task and Message in workers.rs already form a typed application command
+boundary. The service then introduces a second, stringly named command system
+using JSON method names.
+
+If the service remains, define the domain operations once in grove-core and
+adapt:
+
+- GUI task -> domain operation
+- service request -> domain operation
+- CLI command -> service request
+
+This would reduce differences between "click session open" and
+grove session open, which currently travel through different orchestration
+paths.
+
+What should remain
+------------------
+
+I would not simplify away:
+
+- the two-crate boundary,
+- deterministic IDs,
+- the private tmux server,
+- atomic state writes,
+- surgical configuration editing,
+- the status precedence and attention latch,
+- explicit destructive operations,
+- real Git/tmux integration tests,
+- argument-array subprocess construction,
+- the rule against reading terminal output.
+
+These are the parts making Grove dependable.
+
+Recommended direction
+---------------------
+
+My preference is to keep Grove desktop-first:
+
+1. Keep the small persistent service for notifications, toggles, and one
+   authoritative snapshot/state owner.
+2. Make the GUI consume that snapshot and issue narrow mutations.
+3. Remove whole-state replacement and direct GUI persistence.
+4. Keep polling inside one owner; expose snapshots or deltas to the GUI.
+5. Keep a small set of read-only automation commands.
+6. Postpone generic subscriptions, idempotency, control-completion events, and
+   semantic waiting until an actual external consumer requires them.
+7. Split the large orchestration files along their existing responsibilities.
+
+That preserves everything distinctive about Grove while removing most of its
+distributed-systems burden.
+
+In short: Grove is doing its core job well. It is safe, well-tested, and
+architecturally disciplined. The project does not need a rewrite; it needs a
+firm decision about whether the service is an implementation detail or a
+public automation platform, followed by one unambiguous owner for state,
+reconciliation, and polling.

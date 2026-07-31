@@ -1135,6 +1135,7 @@ dependencies = [
  "eframe",
  "egui",
  "grove-core",
+ "grove-harness",
  "image",
  "rfd",
  "serde",
@@ -1154,6 +1155,17 @@ dependencies = [
  "thiserror 2.0.19",
  "toml",
  "toml_edit",
+]
+
+[[package]]
+name = "grove-harness"
+version = "0.1.0"
+dependencies = [
+ "grove-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

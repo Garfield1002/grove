@@ -9,7 +9,6 @@
 pub mod agent;
 pub mod atomic;
 pub mod cgroup;
-pub mod claude;
 pub mod config;
 pub mod config_write;
 pub mod desktop;

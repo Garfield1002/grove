@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use grove_core::Error;
-use grove_core::claude::HookChange;
 use grove_core::config::LoadedConfig;
 use grove_core::config_write::Edit;
 use grove_core::git::{RefEntry, StatusSummary, WorktreeAdd};
@@ -22,6 +21,7 @@ use grove_core::state::State;
 use grove_core::status::SessionReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{Activation, NewWindow};
+use grove_harness::claude::HookChange;
 
 /// Work requested by the UI.
 #[derive(Debug)]

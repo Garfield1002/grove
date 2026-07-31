@@ -17,11 +17,11 @@
 
 use std::io::{IsTerminal, Read};
 
-use grove_core::claude::HookPayload;
 use grove_core::ipc::{self, Notification};
 use grove_core::status::{AttentionReason, SessionStatus};
 use grove_core::tmux::session;
 use grove_core::{Paths, TmuxServer, ids};
+use grove_harness::claude::HookPayload;
 
 pub const USAGE: &str = "\
 grove notify — report a session's status to Grove

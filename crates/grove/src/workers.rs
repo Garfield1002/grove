@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use grove_core::claude::{self, HookChange};
 use grove_core::config::Config;
 use grove_core::config_write;
 use grove_core::git::{RefEntry, StatusSummary};
@@ -23,6 +22,7 @@ use grove_core::removal::RemovalReport;
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::{Activation, NewWindow};
 use grove_core::{Error, Paths, TmuxServer, config, terminal};
+use grove_harness::claude::{self, HookChange};
 
 mod messages;
 mod service_call;

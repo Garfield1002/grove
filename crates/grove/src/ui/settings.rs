@@ -13,10 +13,10 @@
 use std::path::Path;
 
 use grove_core::agent::Accounting;
-use grove_core::claude::HookChange;
 use grove_core::config::Config;
 use grove_core::config_write::{self, Edit};
 use grove_core::{Paths, terminal};
+use grove_harness::claude::HookChange;
 
 use super::{icons, theme};
 use crate::workers::HookOp;
