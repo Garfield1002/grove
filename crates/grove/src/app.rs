@@ -1,25 +1,20 @@
 //! The eframe application: state held for the UI, channel plumbing to the
 //! worker, and the narrow vertical layout from direction 1c.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use grove_core::Paths;
 use grove_core::claude::HookChange;
 use grove_core::config::Config;
-use grove_core::git::StatusSummary;
 use grove_core::ipc::Notification;
-use grove_core::model::{Project, SessionPresence};
-use grove_core::notice::Notices;
+use grove_core::model::Project;
 use grove_core::protocol::Event;
-use grove_core::reconcile::{OrphanSession, ProjectRef, Reconciliation};
+use grove_core::reconcile::{OrphanSession, Reconciliation};
 use grove_core::state::State;
-use grove_core::status::{SessionReport, SessionStatus};
-use grove_core::tmux::WindowInfo;
 use grove_core::workflow::Activation;
 
-use crate::status_watch::{Control, StatusWatch, WorktreeLabel};
+use crate::status_watch::{Control, StatusWatch};
 use crate::ui::chrome::Detached;
 use crate::ui::dialogs::create_worktree::CreateForm;
 use crate::ui::dialogs::open_project::OpenProjectForm;
@@ -27,8 +22,10 @@ use crate::ui::dialogs::removal::{RemovalForm, Request};
 use crate::ui::{self, Action, theme};
 use crate::workers::{ErrorReport, Message, PickTarget, Task, Workers};
 
+mod rows;
 mod service_events;
 
+use rows::Rows;
 use service_events::{ServiceEventAction, ServiceUpdate, classify_service_event};
 
 pub struct GroveApp {
@@ -38,16 +35,9 @@ pub struct GroveApp {
     /// The status poller and the `grove notify` listener (Milestone 4).
     watch: StatusWatch,
     messages: Receiver<Message>,
-    /// Last polled status per worktree id, kept so a refreshed worktree list
-    /// shows its status immediately instead of blank until the next poll.
-    statuses: HashMap<String, SessionReport>,
-    /// Last known windows per tmux session name, kept for the same reason: a
-    /// refreshed worktree list keeps its child rows instead of blinking empty.
-    windows: HashMap<String, Vec<WindowInfo>>,
-    /// What the last `grove notify` said, per worktree and per window. Held
-    /// here rather than on the rows because a refresh rebuilds those, and a
-    /// message has nothing to be re-derived from.
-    notices: Notices,
+    /// The rows and everything stamped onto them. One owner for the project
+    /// list, the state snapshot, and the three caches derived onto it.
+    rows: Rows,
     /// Grove's hooks in Claude Code's settings, as the last check found them.
     /// `None` until one has run.
     claude_hooks: Option<HookChange>,
@@ -56,8 +46,6 @@ pub struct GroveApp {
     last_service_revision: u64,
 
     config: Option<Config>,
-    state: State,
-    projects: Vec<Project>,
 
     selected: Option<String>,
     /// The window row the user last opened, as (worktree id, window index).
@@ -137,14 +125,10 @@ impl GroveApp {
             workers,
             watch,
             messages,
-            statuses: HashMap::new(),
-            windows: HashMap::new(),
-            notices: Notices::default(),
+            rows: Rows::default(),
             claude_hooks: None,
             last_service_revision: 0,
             config: None,
-            state: State::default(),
-            projects: Vec::new(),
             selected: None,
             selected_window: None,
             filter: String::new(),
@@ -231,42 +215,33 @@ impl GroveApp {
                     &mut self.create,
                     &mut self.settings,
                 ),
-                Message::ProjectOpened(project) => self.add_project(*project),
+                Message::ProjectOpened(project) => {
+                    self.status = Some(self.rows.add_project(*project));
+                }
                 Message::WorktreesRefreshed {
                     project_id,
                     worktrees,
                 } => {
-                    if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
-                        project.worktrees = worktrees;
-                        // git answered, so the project is there after all.
-                        project.unavailable = None;
-                        // Select a worktree Grove has just created, once the
-                        // refreshed list actually contains it.
-                        if let Some((pending_project, path)) = &self.pending_selection
-                            && pending_project == &project_id
-                            && let Some(worktree) =
-                                project.worktrees.iter().find(|w| &w.path == path)
-                        {
-                            self.selected = Some(worktree.id.clone());
-                            self.pending_selection = None;
-                        }
+                    self.rows.refresh_worktrees(&project_id, worktrees);
+                    // Select a worktree Grove has just created, once the
+                    // refreshed list actually contains it.
+                    if let Some((pending_project, path)) = &self.pending_selection
+                        && pending_project == &project_id
+                        && let Some(project) = self.rows.project(&project_id)
+                        && let Some(worktree) = project.worktrees.iter().find(|w| &w.path == path)
+                    {
+                        self.selected = Some(worktree.id.clone());
+                        self.pending_selection = None;
                     }
-                    // A fresh list arrives with no statuses on it; re-stamp
-                    // the last poll rather than blanking every pill, and the
-                    // session index, or a refresh would turn every *stopped*
-                    // row back into "no session".
-                    self.mark_stopped_sessions();
-                    self.apply_session_statuses();
-                    self.apply_session_windows();
                     self.describe_worktrees();
                 }
                 Message::StatusesRefreshed {
                     project_id,
                     statuses,
-                } => self.apply_statuses(&project_id, &statuses),
+                } => self.rows.apply_git_statuses(&project_id, &statuses),
                 Message::SessionsRefreshed { presence, windows } => {
-                    self.windows = windows;
-                    self.apply_presence(&presence);
+                    self.rows.set_windows(windows);
+                    self.rows.apply_presence(&presence);
                 }
                 Message::Reconciled { result, state } => {
                     self.apply_reconciliation(*result, *state);
@@ -316,14 +291,8 @@ impl GroveApp {
                     self.watch.send(Control::PollNow);
                 }
                 Message::GitStatusDue => self.refresh_git_statuses(),
-                Message::StatusPolled(statuses) => {
-                    self.statuses = statuses;
-                    self.apply_session_statuses();
-                }
-                Message::WindowsPolled(windows) => {
-                    self.windows = windows;
-                    self.apply_session_windows();
-                }
+                Message::StatusPolled(statuses) => self.rows.set_statuses(statuses),
+                Message::WindowsPolled(windows) => self.rows.set_windows(windows),
                 Message::Toggled { slot } => {
                     if let Some(slot) = slot
                         && !self.reconciled_once
@@ -387,7 +356,7 @@ impl GroveApp {
                         // The session or the worktree is gone; its latch
                         // would otherwise outlive it until the next poll.
                         self.watch.forget(&form.worktree_id);
-                        self.statuses.remove(&form.worktree_id);
+                        self.rows.forget(&form.worktree_id);
                         // A session the *user* closed is not a stopped
                         // session: forget the mapping, or the row would go on
                         // offering to bring back what was just dismissed.
@@ -440,92 +409,18 @@ impl GroveApp {
         }
     }
 
-    fn add_project(&mut self, project: Project) {
-        match self.projects.iter_mut().find(|p| p.id == project.id) {
-            Some(existing) => {
-                self.status = Some(format!("{} is already open", project.name));
-                *existing = project;
-            }
-            None => {
-                self.status = Some(format!(
-                    "Registered {} ({} worktrees)",
-                    project.name,
-                    project.worktrees.len()
-                ));
-                self.projects.push(project);
-            }
-        }
-    }
-
-    /// Stamp fresh git statuses onto a project's rows. A worktree with no
-    /// reading keeps whatever it had: never blanked, never invented.
-    fn apply_statuses(&mut self, project_id: &str, statuses: &HashMap<String, StatusSummary>) {
-        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
-            grove_core::workflow::apply_statuses(&mut project.worktrees, statuses);
-        }
-    }
-
-    /// Re-derive *stopped* from the session index for every row without a live
-    /// session. Reconciliation does this too; doing it here as well keeps an
-    /// ordinary refresh from downgrading "session stopped" to "no session".
-    fn mark_stopped_sessions(&mut self) {
-        for project in &mut self.projects {
-            for worktree in &mut project.worktrees {
-                worktree.session_stopped =
-                    !worktree.session.exists() && self.state.session(&worktree.id).is_some();
-            }
-        }
-    }
-
-    fn apply_presence(&mut self, presence: &HashMap<String, SessionPresence>) {
-        for project in &mut self.projects {
-            grove_core::workflow::apply_session_presence(&mut project.worktrees, presence);
-        }
-        self.mark_stopped_sessions();
-        // Presence just changed, so a row that lost its session must lose its
-        // status — and its windows — with it rather than waiting for the next
-        // poll.
-        self.apply_session_statuses();
-        self.apply_session_windows();
-    }
-
     /// Re-read every project's working-tree status, on the poller's cadence.
     ///
     /// Queued on the worker, never run here: this is one `git status` per
     /// worktree.
     fn refresh_git_statuses(&self) {
-        for project in &self.projects {
+        for project in self.rows.projects() {
             if project.worktrees.is_empty() {
                 continue;
             }
             self.workers.send(Task::RefreshStatuses {
                 project_id: project.id.clone(),
             });
-        }
-    }
-
-    /// Stamp the last polled statuses onto every row.
-    fn apply_session_statuses(&mut self) {
-        for project in &mut self.projects {
-            grove_core::workflow::apply_session_status(&mut project.worktrees, &self.statuses);
-        }
-    }
-
-    /// Stamp the last known tmux windows onto every row, so each worktree
-    /// carries the child rows the tree draws under it.
-    fn apply_session_windows(&mut self) {
-        for project in &mut self.projects {
-            grove_core::workflow::apply_session_windows(&mut project.worktrees, &self.windows);
-        }
-        // The notes hang off the windows, so they are restamped with them: a
-        // note for a window that has closed must not outlive its row.
-        self.apply_window_notes();
-    }
-
-    /// Stamp what each window last reported onto the rows that draw it.
-    fn apply_window_notes(&mut self) {
-        for project in &mut self.projects {
-            grove_core::workflow::apply_window_notes(&mut project.worktrees, &self.notices);
         }
     }
 
@@ -551,7 +446,7 @@ impl GroveApp {
     /// Enter on its row does. A number pointing at nothing is reported and
     /// nothing else: it is a stale label, never a reason to act on another row.
     fn activate_slot(&mut self, slot: u8) {
-        match slot_target(&self.projects, &self.state, slot) {
+        match self.rows.slot_target(slot) {
             Some((project_id, worktree_id)) => self.apply_action(Action::ActivateWorktree {
                 project_id,
                 worktree_id,
@@ -567,7 +462,7 @@ impl GroveApp {
     /// Pressing the digit a worktree already carries clears it, so one
     /// keystroke both assigns and unassigns.
     fn set_slot(&mut self, worktree_id: &str, slot: u8) {
-        if self.state.slot(worktree_id) == Some(slot) {
+        if self.rows.state().slot(worktree_id) == Some(slot) {
             self.workers.send(Task::ClearSlot {
                 worktree_id: worktree_id.to_string(),
             });
@@ -586,40 +481,7 @@ impl GroveApp {
     /// otherwise not show until that poll lands.
     fn apply_notification(&mut self, notification: &Notification) {
         self.watch.notified(notification);
-        let worktree_id = notification.worktree_id.as_str();
-        let state = notification.state;
-        let reason = notification.reason;
-        self.notices.record(notification);
-        if state == SessionStatus::Attention || state == SessionStatus::Done {
-            // Keep any resource figures the last poll produced; only the
-            // status is being overridden here.
-            let report = self.statuses.entry(worktree_id.to_string()).or_default();
-            // Attention outranks a "done" that arrives while it is raised: the
-            // agent finishing a turn does not answer the question it asked.
-            if !(state == SessionStatus::Done && report.status == SessionStatus::Attention) {
-                report.status = state;
-            }
-        }
-        for project in &mut self.projects {
-            if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
-                worktree.status_message = notification.message.clone();
-                if state == SessionStatus::Attention && worktree.session.exists() {
-                    worktree.status = Some(SessionStatus::Attention);
-                    worktree.attention_reason = reason;
-                }
-                // Applied here as well as at the next poll so a row says
-                // "done" the moment the agent says so. Waiting for the poller
-                // would leave up to a full interval where the thing the user
-                // is watching for has happened and the list does not show it.
-                if state == SessionStatus::Done
-                    && worktree.session.exists()
-                    && worktree.status != Some(SessionStatus::Attention)
-                {
-                    worktree.status = Some(SessionStatus::Done);
-                }
-            }
-        }
-        self.apply_window_notes();
+        self.rows.apply_notification(notification);
     }
 
     fn apply_service_event(&mut self, event: Event) {
@@ -696,18 +558,7 @@ impl GroveApp {
         if !self.watch.opened(worktree_id) {
             return;
         }
-        self.statuses.remove(worktree_id);
-        // The messages explained a state the user has now gone and looked at,
-        // per window as well as for the worktree.
-        self.notices.clear(worktree_id);
-        for project in &mut self.projects {
-            if let Some(worktree) = project.worktrees.iter_mut().find(|w| w.id == worktree_id) {
-                worktree.status = None;
-                worktree.status_message = None;
-                worktree.attention_reason = None;
-                worktree.window_notes.clear();
-            }
-        }
+        self.rows.clear_attention(worktree_id);
         self.workers.send(Task::ClearAttention {
             worktree_id: worktree_id.to_string(),
             idempotency_key: format!("gui-clear-attention-{}", grove_core::agent::nonce()),
@@ -716,80 +567,20 @@ impl GroveApp {
 
     /// Tell the poller what to call each worktree in a desktop notification.
     fn describe_worktrees(&self) {
-        let labels: HashMap<String, WorktreeLabel> = self
-            .projects
-            .iter()
-            .flat_map(|project| {
-                project.worktrees.iter().map(|worktree| {
-                    (
-                        worktree.id.clone(),
-                        WorktreeLabel {
-                            project: project.name.clone(),
-                            worktree: worktree.label(),
-                        },
-                    )
-                })
-            })
-            .collect();
-        self.watch.send(Control::Describe(labels));
+        self.watch.send(Control::Describe(self.rows.labels()));
     }
 
     /// Replace the GUI's read-only cache with the state returned by the
-    /// daemon. On bootstrap this also creates the project rows; later updates
-    /// preserve live Git/tmux data already attached to those rows.
+    /// daemon, and close a removal window whose project it no longer lists.
     fn apply_daemon_state(&mut self, state: State, bootstrap: bool) {
-        if bootstrap {
-            self.projects = state
-                .projects
-                .iter()
-                .map(|record| Project {
-                    id: record.id.clone(),
-                    name: record.name.clone(),
-                    repository_path: record.repository_path.clone(),
-                    git_common_dir: record.git_common_dir.clone(),
-                    default_worktree_path: record.default_worktree_path.clone(),
-                    is_expanded: record.is_expanded,
-                    worktrees: Vec::new(),
-                    unavailable: None,
-                })
-                .collect();
-        } else {
-            self.projects
-                .retain(|project| state.find(&project.id).is_some());
-            for project in &mut self.projects {
-                if let Some(record) = state.find(&project.id) {
-                    project.name = record.name.clone();
-                    project.repository_path = record.repository_path.clone();
-                    project.git_common_dir = record.git_common_dir.clone();
-                    project.default_worktree_path = record.default_worktree_path.clone();
-                    project.is_expanded = record.is_expanded;
-                }
-            }
-            for record in &state.projects {
-                if self.projects.iter().any(|project| project.id == record.id) {
-                    continue;
-                }
-                self.projects.push(Project {
-                    id: record.id.clone(),
-                    name: record.name.clone(),
-                    repository_path: record.repository_path.clone(),
-                    git_common_dir: record.git_common_dir.clone(),
-                    default_worktree_path: record.default_worktree_path.clone(),
-                    is_expanded: record.is_expanded,
-                    worktrees: Vec::new(),
-                    unavailable: None,
-                });
-            }
-        }
-        self.state = state;
+        self.rows.apply_daemon_state(state, bootstrap);
         if self
             .removal
             .get()
-            .is_some_and(|form| self.state.find(&form.project_id).is_none())
+            .is_some_and(|form| self.rows.state().find(&form.project_id).is_none())
         {
             self.removal.close();
         }
-        self.mark_stopped_sessions();
     }
 
     /// Ask the worker for a reconciliation pass (ARCHITECTURE.md §7). This is
@@ -797,7 +588,7 @@ impl GroveApp {
     /// startup all do.
     fn reconcile(&mut self) {
         self.workers.send(Task::Reconcile {
-            projects: project_refs(&self.projects),
+            projects: self.rows.project_refs(),
         });
         self.status = Some("Reconciling with git and tmux…".to_string());
     }
@@ -809,20 +600,8 @@ impl GroveApp {
     /// drive must not look as though its worktrees were deleted.
     fn apply_reconciliation(&mut self, result: Reconciliation, state: State) {
         self.reconciled_once = true;
-        // The service owns state persistence and returns the exact state
-        // snapshot it reconciled and atomically wrote. The GUI keeps this
-        // read-only cache for rendering and sends only narrow mutations back.
-        self.state = state;
         let summary = result.summary();
-        for status in result.projects {
-            let Some(project) = self.projects.iter_mut().find(|p| p.id == status.id) else {
-                continue;
-            };
-            project.unavailable = status.unavailable;
-            if project.unavailable.is_none() {
-                project.worktrees = status.worktrees;
-            }
-        }
+        self.rows.apply_reconciliation(result.projects, state);
         self.orphans = result.orphans;
         self.ignored_orphans = result.ignored;
         if self
@@ -832,9 +611,6 @@ impl GroveApp {
         {
             self.orphan_armed = None;
         }
-        self.forget_stale_notices();
-        self.apply_session_statuses();
-        self.apply_session_windows();
         self.describe_worktrees();
         self.status = Some(summary);
         // A `grove toggle <n>` that had to start this process waited for this:
@@ -871,23 +647,6 @@ impl GroveApp {
         });
     }
 
-    /// Drop reports for worktrees reconciliation no longer lists, so a Grove
-    /// left open for weeks cannot accumulate them.
-    ///
-    /// Bookkeeping only, and deliberately not tied to `state.toml`: forgetting
-    /// what an agent said about a row that is gone removes nothing anywhere.
-    fn forget_stale_notices(&mut self) {
-        if self.notices.is_empty() {
-            return;
-        }
-        let live: std::collections::HashSet<&str> = self
-            .projects
-            .iter()
-            .flat_map(|project| project.worktrees.iter().map(|w| w.id.as_str()))
-            .collect();
-        self.notices.retain_ids(|id| live.contains(id));
-    }
-
     /// Is there a `resume_command` to offer at all? There is one by default —
     /// Claude Code's, since Claude Code is what reports the ids — so this is
     /// false only for a user who blanked the key.
@@ -900,9 +659,7 @@ impl GroveApp {
     /// Start the configured agent in a worktree, or resume the conversation
     /// `resume` names.
     fn start_agent(&mut self, project_id: &str, worktree_id: &str, resume: Option<String>) {
-        if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-            && let Some(worktree) = project.worktree(worktree_id)
-        {
+        if let Some(worktree) = self.rows.worktree(project_id, worktree_id) {
             self.workers.send(Task::StartAgent {
                 worktree_id: worktree.id.clone(),
                 resume,
@@ -915,7 +672,7 @@ impl GroveApp {
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::ToggleProject(id) => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == id) {
+                if let Some(project) = self.rows.project(&id) {
                     self.workers.send(Task::SetProjectExpanded {
                         project_id: id,
                         expanded: !project.is_expanded,
@@ -923,7 +680,7 @@ impl GroveApp {
                 }
             }
             Action::RefreshProject(id) => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == id) {
+                if let Some(project) = self.rows.project(&id) {
                     self.workers.send(Task::RefreshProject {
                         project_id: project.id.clone(),
                     });
@@ -937,9 +694,7 @@ impl GroveApp {
                 project_id,
                 worktree_id,
             } => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-                    && let Some(worktree) = project.worktree(&worktree_id)
-                {
+                if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
                     self.workers.send(Task::Activate {
                         worktree_id: worktree.id.clone(),
                         idempotency_key: format!("gui-session-open-{}", grove_core::agent::nonce()),
@@ -959,7 +714,7 @@ impl GroveApp {
             Action::ResumeAgent {
                 project_id,
                 worktree_id,
-            } => match self.state.agent(&worktree_id) {
+            } => match self.rows.state().agent(&worktree_id) {
                 Some(record) if !record.session_id.is_empty() => {
                     let resume = record.session_id.clone();
                     self.start_agent(&project_id, &worktree_id, Some(resume));
@@ -969,20 +724,23 @@ impl GroveApp {
                         Some("No agent conversation has been reported for this worktree.".into());
                 }
             },
-            Action::OpenAgentTranscript { worktree_id } => match self.state.agent(&worktree_id) {
-                Some(record) if record.has_transcript() => {
-                    self.workers
-                        .send(Task::OpenWithDesktop(record.transcript_path.clone()));
+            Action::OpenAgentTranscript { worktree_id } => {
+                match self.rows.state().agent(&worktree_id) {
+                    Some(record) if record.has_transcript() => {
+                        self.workers
+                            .send(Task::OpenWithDesktop(record.transcript_path.clone()));
+                    }
+                    _ => {
+                        self.status =
+                            Some("No transcript has been reported for this worktree.".into());
+                    }
                 }
-                _ => {
-                    self.status = Some("No transcript has been reported for this worktree.".into());
-                }
-            },
+            }
             Action::SelectWorktree { worktree_id, .. } => self.selected = Some(worktree_id),
             Action::SetWorktreeSlot { worktree_id, slot } => match slot {
                 Some(slot) => self.set_slot(&worktree_id, slot),
                 None => {
-                    if self.state.slot(&worktree_id).is_some() {
+                    if self.rows.state().slot(&worktree_id).is_some() {
                         self.workers.send(Task::ClearSlot { worktree_id });
                     }
                 }
@@ -991,12 +749,11 @@ impl GroveApp {
                 project_id,
                 worktree_id,
             } => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-                    && let Some(worktree) = project.worktree(&worktree_id)
-                {
+                if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
+                    let target = worktree.id.clone();
                     self.selected = Some(worktree_id);
                     self.workers.send(Task::OpenInNewTerminal {
-                        worktree_id: worktree.id.clone(),
+                        worktree_id: target,
                         idempotency_key: format!(
                             "gui-additional-terminal-{}",
                             grove_core::agent::nonce()
@@ -1008,12 +765,11 @@ impl GroveApp {
                 project_id,
                 worktree_id,
             } => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-                    && let Some(worktree) = project.worktree(&worktree_id)
-                {
+                if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
+                    let target = worktree.id.clone();
                     self.selected = Some(worktree_id);
                     self.workers.send(Task::OpenNewWindow {
-                        worktree_id: worktree.id.clone(),
+                        worktree_id: target,
                         idempotency_key: format!(
                             "gui-session-window-create-{}",
                             grove_core::agent::nonce()
@@ -1028,11 +784,10 @@ impl GroveApp {
                 worktree_id,
                 window_index,
             } => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-                    && let Some(worktree) = project.worktree(&worktree_id)
-                {
+                if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
+                    let target = worktree.id.clone();
                     self.workers.send(Task::ActivateWindow {
-                        worktree_id: worktree.id.clone(),
+                        worktree_id: target,
                         window_index,
                         idempotency_key: format!(
                             "gui-session-window-open-{}",
@@ -1053,14 +808,11 @@ impl GroveApp {
             // existing record when it is the same repository, because the
             // project id is derived from the git-common-dir.
             Action::LocateProject(id) => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == id) {
-                    self.open_project.open(OpenProjectForm::at(
-                        project.repository_path.display().to_string(),
-                    ));
-                    self.status = Some(format!(
-                        "Point Grove at {} where it lives now.",
-                        project.name
-                    ));
+                if let Some(project) = self.rows.project(&id) {
+                    let at = project.repository_path.display().to_string();
+                    let name = project.name.clone();
+                    self.open_project.open(OpenProjectForm::at(at));
+                    self.status = Some(format!("Point Grove at {name} where it lives now."));
                 }
             }
         }
@@ -1094,9 +846,7 @@ impl GroveApp {
                 project_id,
                 worktree_id,
             } => {
-                if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
-                    && let Some(worktree) = project.worktree(&worktree_id)
-                {
+                if let Some(worktree) = self.rows.worktree(&project_id, &worktree_id) {
                     self.workers.send(Task::AssociateSession {
                         worktree_id: worktree.id.clone(),
                         session,
@@ -1143,7 +893,7 @@ impl GroveApp {
     /// Open the create-worktree window, or raise the one already open. Asking
     /// again for the same project keeps whatever has been typed.
     fn open_create_dialog(&mut self, project_id: &str) {
-        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
+        let Some(project) = self.rows.project(project_id) else {
             return;
         };
         let form = CreateForm::new(project);
@@ -1157,7 +907,7 @@ impl GroveApp {
     }
 
     fn open_removal_dialog(&mut self, project_id: &str, worktree_id: &str) {
-        let Some(project) = self.projects.iter().find(|p| p.id == project_id) else {
+        let Some(project) = self.rows.project(project_id) else {
             return;
         };
         let Some(worktree) = project.worktree(worktree_id) else {
@@ -1446,7 +1196,7 @@ impl GroveApp {
 
     /// The rows the keyboard walks: every visible worktree, in list order.
     fn visible_rows(&self) -> Vec<(String, String)> {
-        visible_rows(&self.projects, &self.filter)
+        visible_rows(self.rows.projects(), &self.filter)
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1469,7 +1219,7 @@ impl GroveApp {
         if let Some((project_id, _)) = self.selected_row() {
             return Some(project_id);
         }
-        match self.projects.as_slice() {
+        match self.rows.projects() {
             [only] => Some(only.id.clone()),
             _ => None,
         }
@@ -1673,20 +1423,6 @@ impl GroveApp {
     }
 }
 
-/// What Grove knows about each project before git is consulted, for a
-/// reconciliation pass.
-fn project_refs(projects: &[Project]) -> Vec<ProjectRef> {
-    projects
-        .iter()
-        .map(|project| ProjectRef {
-            id: project.id.clone(),
-            name: project.name.clone(),
-            repository_path: project.repository_path.clone(),
-            git_common_dir: project.git_common_dir.clone(),
-        })
-        .collect()
-}
-
 /// The status line for an activation, whichever route it took.
 fn describe(activation: &Activation) -> String {
     match activation {
@@ -1860,7 +1596,7 @@ impl eframe::App for GroveApp {
                     .show(ui, |ui| {
                         action = ui::project_list::show(
                             ui,
-                            &self.projects,
+                            self.rows.projects(),
                             ui::project_list::Tree {
                                 selected: self.selected.as_deref(),
                                 selected_window: self
@@ -1869,8 +1605,8 @@ impl eframe::App for GroveApp {
                                     .map(|(id, index)| (id.as_str(), *index)),
                                 filter: &self.filter,
                                 home: self.home.as_deref(),
-                                slots: &self.state.slots,
-                                agents: &self.state.agents,
+                                slots: &self.rows.state().slots,
+                                agents: &self.rows.state().agents,
                                 can_resume: self.can_resume_agents(),
                             },
                         );
@@ -1879,7 +1615,7 @@ impl eframe::App for GroveApp {
                             &self.orphans,
                             self.ignored_orphans,
                             self.orphan_armed.as_deref(),
-                            &self.projects,
+                            self.rows.projects(),
                         );
                         ui.min_rect().bottom()
                     })
@@ -1936,20 +1672,6 @@ fn visible_rows(projects: &[Project], filter: &str) -> Vec<(String, String)> {
         }
     }
     rows
-}
-
-/// The (project id, worktree id) a number points at, if it still points at a
-/// row Grove is listing.
-///
-/// A number that names nothing resolves to `None` and is left alone: it is a
-/// stale label, and the worktree it named may simply be on a project that is
-/// currently unavailable.
-fn slot_target(projects: &[Project], state: &State, slot: u8) -> Option<(String, String)> {
-    let worktree_id = state.slot_worktree(slot)?;
-    projects
-        .iter()
-        .find(|project| project.worktree(worktree_id).is_some())
-        .map(|project| (project.id.clone(), worktree_id.to_string()))
 }
 
 /// The 1..=9 digit pressed with Alt this frame, if any.
@@ -2033,44 +1755,6 @@ mod tests {
 
     fn ids(rows: &[(String, String)]) -> Vec<String> {
         rows.iter().map(|(_, w)| w.clone()).collect()
-    }
-
-    #[test]
-    fn a_number_resolves_to_its_row() {
-        let projects = vec![
-            project("p1", "acme", &["main", "feature"]),
-            project("p2", "design", &["main"]),
-        ];
-        let target = projects[1].worktrees[0].id.clone();
-        let mut state = State::default();
-        state.assign_slot(3, &target);
-        assert_eq!(
-            slot_target(&projects, &state, 3),
-            Some(("p2".to_string(), target))
-        );
-    }
-
-    /// A number Grove cannot resolve must select nothing at all — never the
-    /// nearest row, and never a row from another project.
-    #[test]
-    fn an_unassigned_or_stale_number_resolves_to_nothing() {
-        let projects = vec![project("p1", "acme", &["main"])];
-        let mut state = State::default();
-        assert_eq!(slot_target(&projects, &state, 3), None, "never assigned");
-
-        state.assign_slot(3, "deadbe");
-        assert_eq!(
-            slot_target(&projects, &state, 3),
-            None,
-            "points at a worktree Grove is not listing"
-        );
-
-        // A collapsed project still holds its rows: the number is about the
-        // worktree, not about what the list happens to be showing.
-        let mut collapsed = projects.clone();
-        collapsed[0].is_expanded = false;
-        state.assign_slot(3, &collapsed[0].worktrees[0].id);
-        assert!(slot_target(&collapsed, &state, 3).is_some());
     }
 
     #[test]
@@ -2193,24 +1877,6 @@ mod tests {
         assert_eq!(next_selection(&[], None, 1), None);
         assert_eq!(next_selection(&[], Some("a1b2c3"), -1), None);
         assert!(visible_rows(&[], "").is_empty());
-    }
-
-    // ------------------------------------------------------- reconciliation
-
-    #[test]
-    fn project_refs_carry_the_repository_identity_reconciliation_needs() {
-        let projects = vec![project("p1", "acme", &["main"])];
-        let refs = project_refs(&projects);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].id, "p1");
-        assert_eq!(refs[0].name, "acme");
-        assert_eq!(refs[0].repository_path, PathBuf::from("/home/u/acme"));
-        assert_eq!(
-            refs[0].git_common_dir,
-            PathBuf::from("/home/u/acme/.git"),
-            "matching is by repository identity, not by name"
-        );
-        assert!(project_refs(&[]).is_empty());
     }
 
     #[test]
