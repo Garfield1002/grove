@@ -28,7 +28,7 @@ pub const BAND: f32 = 6.0;
 /// cut out of the edge rectangles as well, so the two can never disagree.
 /// `band` is clamped so that a very small window still leaves a usable middle.
 pub fn zones(rect: Rect, band: f32) -> Vec<(ResizeDirection, Rect)> {
-    use ResizeDirection::*;
+    use ResizeDirection::{East, North, NorthEast, NorthWest, South, SouthEast, SouthWest, West};
 
     let band = band
         .min(rect.width() / 3.0)

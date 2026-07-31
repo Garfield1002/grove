@@ -122,7 +122,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.extreme_bg_color = FIELD;
     visuals.faint_bg_color = BADGE;
     visuals.override_text_color = Some(TEXT);
-    visuals.window_stroke = Stroke::new(1.0, HAIRLINE);
+    visuals.window_stroke = Stroke::new(1.0_f32, HAIRLINE);
     visuals.window_corner_radius = CornerRadius::same(12);
     visuals.window_shadow = egui::epaint::Shadow {
         offset: [0, 12],
@@ -137,8 +137,8 @@ pub fn apply(ctx: &egui::Context) {
         color: Color32::from_black_alpha(140),
     };
     visuals.selection.bg_fill = ACCENT_FILL;
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
 
     let radius = CornerRadius::same(CHIP_RADIUS);
     for widget in [
@@ -152,18 +152,18 @@ pub fn apply(ctx: &egui::Context) {
         widget.expansion = 0.0;
     }
     visuals.widgets.noninteractive.bg_fill = BG;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
     visuals.widgets.inactive.bg_fill = CHIP;
     visuals.widgets.inactive.weak_bg_fill = CHIP;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
     visuals.widgets.hovered.bg_fill = HAIRLINE;
     visuals.widgets.hovered.weak_bg_fill = HAIRLINE;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_STRONG);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_STRONG);
     visuals.widgets.active.bg_fill = ACCENT_FILL;
     visuals.widgets.active.weak_bg_fill = ACCENT_FILL;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.open.bg_fill = FIELD;
     visuals.widgets.open.weak_bg_fill = FIELD;
     ctx.set_visuals(visuals);

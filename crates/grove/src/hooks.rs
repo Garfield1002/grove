@@ -30,23 +30,44 @@ Claude Code reads its settings at startup: restart it after installing.
 
 /// Run `grove hooks`.
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    match args.first().map(String::as_str) {
-        Some("-h" | "--help") | Some("help") => {
+    match command(args) {
+        Ok(Command::Help) => {
             print!("{USAGE}");
             Ok(())
         }
-        None | Some("status") => report(claude::hook_status(&path()?)?, "status"),
-        Some("install") => report(claude::install_hooks(&path()?)?, "install"),
-        Some("uninstall") => report(claude::uninstall_hooks(&path()?)?, "uninstall"),
-        Some("print") => {
+        Ok(Command::Status) => report(claude::hook_status(&path()?)?, "status"),
+        Ok(Command::Install) => report(claude::install_hooks(&path()?)?, "install"),
+        Ok(Command::Uninstall) => report(claude::uninstall_hooks(&path()?)?, "uninstall"),
+        Ok(Command::Print) => {
             print!("{}", claude::install("")?);
             Ok(())
         }
-        Some(other) => {
-            eprintln!("grove hooks: unknown command `{other}`\n");
+        Err(error) => {
+            eprintln!("grove hooks: {error}\n");
             eprint!("{USAGE}");
             std::process::exit(2);
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Help,
+    Status,
+    Install,
+    Uninstall,
+    Print,
+}
+
+fn command(args: &[String]) -> Result<Command, String> {
+    match args {
+        [] => Ok(Command::Status),
+        [arg] if arg == "status" => Ok(Command::Status),
+        [arg] if matches!(arg.as_str(), "-h" | "--help" | "help") => Ok(Command::Help),
+        [arg] if arg == "install" => Ok(Command::Install),
+        [arg] if arg == "uninstall" => Ok(Command::Uninstall),
+        [arg] if arg == "print" => Ok(Command::Print),
+        _ => Err(format!("unknown command `{}`", args.join(" "))),
     }
 }
 
@@ -94,4 +115,66 @@ fn missing(change: &HookChange) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn command_grammar_is_exact_and_status_is_the_default() {
+        assert_eq!(command(&[]).expect("default"), Command::Status);
+        for (name, expected) in [
+            ("status", Command::Status),
+            ("install", Command::Install),
+            ("uninstall", Command::Uninstall),
+            ("print", Command::Print),
+            ("-h", Command::Help),
+            ("--help", Command::Help),
+            ("help", Command::Help),
+        ] {
+            assert_eq!(command(&strings(&[name])).expect(name), expected);
+        }
+        for args in [
+            strings(&["unknown"]),
+            strings(&["install", "unexpected"]),
+            strings(&["status", "extra"]),
+            strings(&["--help", "extra"]),
+        ] {
+            let error = command(&args).expect_err("invalid command");
+            assert!(error.contains(&args.join(" ")));
+        }
+    }
+
+    fn change(installed: Vec<&'static str>) -> HookChange {
+        HookChange {
+            path: PathBuf::from("/tmp/settings.json"),
+            backup: None,
+            changed: false,
+            installed,
+        }
+    }
+
+    #[test]
+    fn event_summaries_preserve_order_and_name_every_missing_hook() {
+        let partial = change(vec!["Notification", "Stop"]);
+        assert_eq!(events(&partial), "Notification, Stop");
+        assert_eq!(
+            missing(&partial),
+            "UserPromptSubmit, SessionStart, SessionEnd"
+        );
+
+        let complete = change(HOOK_EVENTS.to_vec());
+        assert!(complete.is_installed());
+        assert_eq!(missing(&complete), "");
+
+        let empty = change(Vec::new());
+        assert_eq!(events(&empty), "");
+        assert_eq!(missing(&empty), HOOK_EVENTS.join(", "));
+    }
 }

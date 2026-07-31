@@ -311,6 +311,8 @@ pub fn snapshot(state: &State, server: &TmuxServer) -> Result<Snapshot> {
 mod tests {
     use super::*;
     use crate::state::ProjectRecord;
+    use crate::tmux::SessionMetadata;
+    use std::path::Path;
 
     #[test]
     fn project_view_is_public_data_not_ui_state() {
@@ -343,5 +345,43 @@ mod tests {
             serde_json::to_string(&SessionState::Stopped).expect("serializes"),
             "\"stopped\""
         );
+    }
+
+    #[test]
+    fn session_views_preserve_every_live_signal_and_management_field() {
+        let list = sessions_from_live(vec![tmux::SessionInfo {
+            name: "renamed-session".into(),
+            path: "/work/tree".into(),
+            attached: 2,
+            metadata: SessionMetadata {
+                id: Some("abc123".into()),
+                project: Some("Grove".into()),
+                worktree: Some("/work/tree".into()),
+                repo: Some("/repo/.git".into()),
+            },
+            attention: true,
+            activity_epoch: Some(1234),
+            bell: true,
+        }]);
+
+        assert_eq!(list.version, API_VERSION);
+        assert_eq!(list.sessions.len(), 1);
+        let session = &list.sessions[0];
+        assert_eq!(session.name, "renamed-session");
+        assert_eq!(session.worktree_id.as_deref(), Some("abc123"));
+        assert_eq!(session.project_name.as_deref(), Some("Grove"));
+        assert_eq!(
+            session.worktree_path.as_deref(),
+            Some(Path::new("/work/tree"))
+        );
+        assert_eq!(
+            session.git_common_dir.as_deref(),
+            Some(Path::new("/repo/.git"))
+        );
+        assert_eq!(session.attached_clients, 2);
+        assert!(session.attention);
+        assert_eq!(session.last_activity_at, Some(1234));
+        assert!(session.bell);
+        assert!(session.managed);
     }
 }

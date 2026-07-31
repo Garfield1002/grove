@@ -501,7 +501,8 @@ pub fn scope_usage(
 }
 
 /// What activating a worktree actually did, so the UI can say so.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Activation {
     /// An attached client was retargeted at the session.
     SwitchedClient { session: String, client_tty: String },
@@ -718,7 +719,7 @@ pub fn open_new_window(
 }
 
 /// A shell window Grove opened inside a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct NewWindow {
     pub session: String,
     /// The window index tmux reported, for the status line.

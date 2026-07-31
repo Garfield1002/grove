@@ -102,6 +102,24 @@ collection as a fallback. `grove snapshot` returns projects, worktrees,
 sessions, windows, numbered slots and known agent conversations from one state
 load and one collection pass.
 
+The same service exposes safe control operations by deterministic worktree ID:
+
+```bash
+grove session ensure <worktree-id>
+grove session open <worktree-id>
+grove agent start <worktree-id>
+grove wait <worktree-id> --status attention --timeout 300
+```
+
+`ensure` is naturally idempotent. Mutations also accept
+`--idempotency-key <key>`, which makes a retry return the first structured
+result without performing the action twice. `wait` wakes on service events
+and periodically rechecks Grove's semantic status, so a dropped event cannot
+strand it. Valid states are `working`, `idle`, `attention`, and `stopped`.
+These commands resolve paths from Grove's own index and live Git data—callers
+never supply shell commands or repository paths. They do not expose terminal
+contents.
+
 ### Local service
 
 Grove starts a small local service on demand:
@@ -113,8 +131,9 @@ grove serve
 It owns the public runtime socket independently of the GUI. Agent reports that
 arrive while the GUI is closed are held until the next GUI connects, and
 `grove toggle` can ask the service to launch the GUI. It is also the sole
-writer of `state.toml`: GUI changes and reconciliation pass through its
-versioned API and are serialized into atomic writes. Connected clients can
+writer of `state.toml`: the GUI loads state through the daemon and sends narrow
+mutations rather than replacing a local copy. Reconciliation and
+mutations are serialized into atomic writes. Connected clients can
 subscribe to revisioned state, reconciliation and notification events; the
 GUI uses that stream for immediate updates and keeps polling as recovery. The
 service never owns

@@ -56,7 +56,8 @@ pub fn worktree_list(dir: &Path) -> Result<Vec<WorktreeEntry>> {
 }
 
 /// A worktree Grove is about to create (DESIGN.md §10).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorktreeAdd {
     /// Directory to create. Never interpolated into a shell string.
     pub path: PathBuf,
@@ -141,7 +142,7 @@ pub fn branch_delete(repository_path: &Path, branch: &str, force: bool) -> Resul
 }
 
 /// A ref offered as the base of a new worktree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefEntry {
     /// Short name: `main`, or `origin/main` for a remote-tracking branch.
     pub name: String,

@@ -75,6 +75,8 @@ pub struct Options {
 /// Why a command line was rejected. Every variant is a usage error the caller
 /// can fix; none of them are runtime conditions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+// Every variant describes the same invalid CLI value and the shared suffix
+// keeps diagnostics precise; removing it would make the names less clear.
 #[allow(clippy::enum_variant_names)]
 pub enum ArgsError {
     #[error("--state is required")]

@@ -139,6 +139,7 @@ impl TmuxServer {
         Self::is_no_server(&stderr)
             || stderr.contains("no such session")
             || stderr.contains("can't find")
+            || stderr.contains("no current target")
     }
 
     /// Terminate the private server. Only used by tests and by an explicit
@@ -259,6 +260,7 @@ mod tests {
         assert!(TmuxServer::is_missing_target(
             "can't find session: wt-abc123"
         ));
+        assert!(TmuxServer::is_missing_target("no current target"));
         // A missing server means the target is missing too.
         assert!(TmuxServer::is_missing_target("no server running on /tmp/x"));
         // But a real failure is still a real failure.

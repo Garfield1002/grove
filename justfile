@@ -8,7 +8,11 @@ default:
 # ------------------------------------------------------------------ the gate
 
 # Everything CLAUDE.md requires before a commit.
-gate: build build-minimal test clippy fmt-check
+gate: build build-minimal test test-minimal clippy clippy-minimal fmt-check
+
+# The manifesto gate also prevents measured coverage from regressing. Raise
+# these floors whenever coverage improves; `coverage-check` is the destination.
+quality: gate coverage-ratchet
 
 build:
     cargo build --workspace
@@ -20,8 +24,35 @@ build-minimal:
 test:
     cargo test --workspace
 
+# The optional native picker must not hide compile or test failures in the
+# dependency-minimal build.
+test-minimal:
+    cargo test -p grove --no-default-features
+
 clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --all-features
+
+clippy-minimal:
+    cargo clippy -p grove --all-targets --no-default-features
+
+# Measure all reachable production code, including branches. `coverage-check`
+# is the release gate; `coverage` remains useful while closing an existing gap.
+coverage:
+    cargo +nightly llvm-cov --workspace --all-features --branch --summary-only
+
+coverage-ratchet:
+    cargo +nightly llvm-cov --workspace --all-features --branch \
+        --json --summary-only --output-path target/grove-coverage-summary.json \
+        --fail-under-regions 72 --fail-under-functions 80 \
+        --fail-under-lines 70
+    jq -e '.data[0].totals.branches.percent >= 45' target/grove-coverage-summary.json >/dev/null
+
+coverage-check:
+    cargo +nightly llvm-cov --workspace --all-features --branch \
+        --json --summary-only --output-path target/grove-coverage-summary.json \
+        --fail-under-regions 100 --fail-under-functions 100 \
+        --fail-under-lines 100
+    jq -e '.data[0].totals.branches.percent >= 100' target/grove-coverage-summary.json >/dev/null
 
 fmt:
     cargo fmt --all

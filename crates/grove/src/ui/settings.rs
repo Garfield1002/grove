@@ -620,7 +620,10 @@ pub fn body(
                     },
                 ))
                 .fill(theme::ACCENT_FILL)
-                .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    theme::ACCENT.gamma_multiply(0.6),
+                ));
                 if ui.add_enabled(can_save, save).clicked() {
                     form.saving = true;
                     form.note = None;

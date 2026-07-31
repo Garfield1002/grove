@@ -6,9 +6,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use grove_core::Paths;
+use grove_core::ids;
 use grove_core::ipc::{self, Command as IpcCommand, Notification};
 use grove_core::protocol::{self, EventKind, Request};
-use grove_core::state::{self, AgentRecord, ProjectRecord, SlotRecord, State};
+use grove_core::state::{self, AgentRecord, Mutation, ProjectRecord, SlotRecord, State};
 use grove_core::status::SessionStatus;
 
 const GROVE: &str = env!("CARGO_BIN_EXE_grove");
@@ -20,6 +21,53 @@ impl Drop for ServiceProcess {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+fn start_service(paths: &Paths) -> ServiceProcess {
+    let config_home = paths.config_dir.parent().expect("config home");
+    let state_home = paths.state_dir.parent().expect("state home");
+    let runtime_home = paths.runtime_dir.parent().expect("runtime home");
+    ServiceProcess(
+        Command::new(GROVE)
+            .arg("serve")
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("XDG_STATE_HOME", state_home)
+            .env("XDG_RUNTIME_DIR", runtime_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("starts service"),
+    )
+}
+
+fn wait_for_service(paths: &Paths) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if ipc::send_command(&paths.notify_socket(), &IpcCommand::Ping).unwrap_or(false) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "service did not bind its socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn command(paths: &Paths) -> Command {
+    let mut command = Command::new(GROVE);
+    command
+        .env(
+            "XDG_CONFIG_HOME",
+            paths.config_dir.parent().expect("config home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            paths.state_dir.parent().expect("state home"),
+        )
+        .env(
+            "XDG_RUNTIME_DIR",
+            paths.runtime_dir.parent().expect("runtime home"),
+        );
+    command
 }
 
 #[test]
@@ -54,26 +102,8 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         },
     )
     .expect("isolated state");
-    let child = Command::new(GROVE)
-        .arg("serve")
-        .env("XDG_CONFIG_HOME", temp.path().join("config"))
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("XDG_RUNTIME_DIR", temp.path().join("run"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("starts service");
-    let mut service = ServiceProcess(child);
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if ipc::send_command(&paths.notify_socket(), &IpcCommand::Ping).unwrap_or(false) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "service did not bind its socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut service = start_service(&paths);
+    wait_for_service(&paths);
     assert!(
         service.0.try_wait().expect("service state").is_none(),
         "service should remain alive without a GUI"
@@ -124,59 +154,62 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         .expect("subscription id")
         .to_string();
 
-    let replacement = State {
-        projects: vec![ProjectRecord {
-            id: "project2".into(),
-            name: "service-owned".into(),
-            repository_path: temp.path().join("service-owned"),
-            git_common_dir: temp.path().join("service-owned/.git"),
-            default_worktree_path: temp.path().join("worktrees"),
-            is_expanded: false,
-        }],
-        slots: vec![
-            SlotRecord {
-                number: 4,
-                worktree_id: "first".into(),
-            },
-            SlotRecord {
-                number: 4,
-                worktree_id: "duplicate".into(),
-            },
-        ],
-        ..State::default()
+    let project = ProjectRecord {
+        id: "project2".into(),
+        name: "service-owned".into(),
+        repository_path: temp.path().join("service-owned"),
+        git_common_dir: temp.path().join("service-owned/.git"),
+        default_worktree_path: temp.path().join("worktrees"),
+        is_expanded: false,
     };
-    let replaced = protocol::call(
+    let mutated = protocol::call(
         &paths.notify_socket(),
         &Request::new(
             "state-1",
-            "state.replace",
-            serde_json::json!({"state": replacement}),
+            "state.mutate",
+            serde_json::json!({
+                "mutation": Mutation::UpsertProject { record: project }
+            }),
         ),
     )
-    .expect("state replacement");
-    assert!(replaced.ok);
+    .expect("state mutation");
+    assert!(mutated.ok);
     let changed = protocol::read_event(&mut event_stream).expect("state event");
     assert_eq!(changed.kind, EventKind::StateChanged);
-    assert_eq!(changed.payload["state"]["project"][0]["id"], "project2");
-    let saved = state::load(&paths.state_file()).expect("service saved state");
-    assert_eq!(saved.projects[0].id, "project2");
-    assert_eq!(
-        saved.slots.len(),
-        1,
-        "service normalizes state before saving"
+    assert!(
+        changed.payload["state"]["project"]
+            .as_array()
+            .is_some_and(|projects| projects.iter().any(|p| p["id"] == "project2"))
     );
+    let numbered = protocol::call(
+        &paths.notify_socket(),
+        &Request::new(
+            "state-slot",
+            "state.mutate",
+            serde_json::json!({
+                "mutation": Mutation::AssignSlot {
+                    number: 4,
+                    worktree_id: "first".into(),
+                }
+            }),
+        ),
+    )
+    .expect("slot mutation");
+    assert!(numbered.ok);
+    let changed = protocol::read_event(&mut event_stream).expect("slot state event");
+    assert_eq!(changed.kind, EventKind::StateChanged);
+    let saved = state::load(&paths.state_file()).expect("service saved state");
+    assert!(saved.find("project2").is_some());
 
-    let mut incompatible = saved.clone();
-    incompatible.version += 1;
     let rejected = protocol::call(
         &paths.notify_socket(),
         &Request::new(
             "state-2",
-            "state.replace",
-            serde_json::json!({"state": incompatible}),
+            "state.mutate",
+            serde_json::json!({"mutation": {"kind": "unknown"}}),
         ),
     )
-    .expect("schema rejection");
+    .expect("mutation rejection");
     assert!(!rejected.ok);
     assert_eq!(rejected.error.expect("error").code, "invalid_params");
     assert_eq!(
@@ -197,7 +230,11 @@ fn service_queues_a_report_until_the_gui_is_ready() {
     assert!(reconciled.ok);
     let result = reconciled.result.expect("reconciliation result");
     assert_eq!(result["reconciliation"]["projects"], serde_json::json!([]));
-    assert_eq!(result["state"]["project"][0]["id"], "project2");
+    assert!(
+        result["state"]["project"]
+            .as_array()
+            .is_some_and(|projects| projects.iter().any(|p| p["id"] == "project2"))
+    );
     let reconciliation = protocol::read_event(&mut event_stream).expect("reconciliation event");
     assert_eq!(reconciliation.kind, EventKind::ReconciliationCompleted);
     assert!(reconciliation.revision > changed.revision);
@@ -222,9 +259,19 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         .expect("snapshot");
         let result = snapshot.result.expect("result");
         assert_eq!(result["protocol_version"], protocol::VERSION);
-        assert_eq!(result["slots"][0]["number"], 4);
-        assert_eq!(result["agents"], serde_json::json!([]));
-        assert_eq!(result["unavailable_projects"][0]["project_id"], "project2");
+        assert!(
+            result["slots"]
+                .as_array()
+                .is_some_and(|slots| slots.iter().any(|slot| slot["number"] == 4))
+        );
+        assert_eq!(result["agents"][0]["worktree_id"], "abc123");
+        assert!(
+            result["unavailable_projects"]
+                .as_array()
+                .is_some_and(|projects| projects
+                    .iter()
+                    .any(|project| project["project_id"] == "project2"))
+        );
     }
 
     // An impossible payload is isolated to its own connection and cannot
@@ -258,4 +305,138 @@ fn service_queues_a_report_until_the_gui_is_ready() {
         ipc::read_command(stream).expect("valid command"),
         IpcCommand::Notify(notification)
     );
+}
+
+#[test]
+fn control_cli_ensures_idempotent_sessions_and_waits_with_a_timeout() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths {
+        config_dir: temp.path().join("config/grove"),
+        state_dir: temp.path().join("state/grove"),
+        runtime_dir: temp.path().join("run/grove"),
+    };
+    let repository = temp.path().join("repo");
+    std::fs::create_dir_all(&repository).expect("repo dir");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .status()
+            .expect("git init")
+            .success()
+    );
+    let git_common_dir = std::fs::canonicalize(repository.join(".git")).expect("git common dir");
+    let repository = std::fs::canonicalize(repository).expect("repository");
+    let worktree_id = ids::worktree_id(&git_common_dir, &repository);
+    state::save(
+        &paths.state_file(),
+        &State {
+            projects: vec![ProjectRecord {
+                id: "project-control".into(),
+                name: "control".into(),
+                repository_path: repository.clone(),
+                git_common_dir: git_common_dir.clone(),
+                default_worktree_path: temp.path().join("worktrees"),
+                is_expanded: true,
+            }],
+            ..State::default()
+        },
+    )
+    .expect("state");
+    let _service = start_service(&paths);
+    wait_for_service(&paths);
+
+    let stopped = command(&paths)
+        .args([
+            "wait",
+            &worktree_id,
+            "--status",
+            "stopped",
+            "--timeout",
+            "1",
+        ])
+        .output()
+        .expect("wait command");
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    let subscription = Request::new(
+        "control-events",
+        "event.subscribe",
+        serde_json::json!({"topics": [EventKind::ControlCompleted]}),
+    );
+    let (mut events, subscribed) =
+        protocol::open_subscription(&paths.notify_socket(), &subscription).expect("subscription");
+    assert!(subscribed.ok);
+
+    let first = command(&paths)
+        .args([
+            "session",
+            "ensure",
+            &worktree_id,
+            "--idempotency-key",
+            "same-request",
+        ])
+        .output()
+        .expect("ensure");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).expect("ensure json");
+    assert_eq!(first_json["created"], true);
+    let completed = protocol::read_event(&mut events).expect("completion event");
+    assert_eq!(completed.kind, EventKind::ControlCompleted);
+    assert_eq!(completed.payload["worktree_id"], worktree_id);
+
+    let replay = command(&paths)
+        .args([
+            "session",
+            "ensure",
+            &worktree_id,
+            "--idempotency-key",
+            "same-request",
+        ])
+        .output()
+        .expect("idempotent replay");
+    assert!(replay.status.success());
+    assert_eq!(replay.stdout, first.stdout);
+
+    let sessions = protocol::call(
+        &paths.notify_socket(),
+        &Request::new("sessions", "session.list", serde_json::json!({})),
+    )
+    .expect("sessions");
+    assert_eq!(
+        sessions.result.expect("session result")["sessions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let timed_out = command(&paths)
+        .args([
+            "wait",
+            &worktree_id,
+            "--status",
+            "stopped",
+            "--timeout",
+            "0",
+        ])
+        .output()
+        .expect("timeout");
+    assert!(!timed_out.status.success());
+
+    let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(paths.tmux_socket())
+        .arg("kill-server")
+        .status();
 }

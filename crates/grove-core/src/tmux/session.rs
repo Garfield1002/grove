@@ -734,7 +734,10 @@ pub fn list_all_panes(server: &TmuxServer) -> Result<Vec<PaneInfo>> {
 /// confirmed operation (ARCHITECTURE.md §8.2).
 pub fn kill_session(server: &TmuxServer, name: &str) -> Result<()> {
     let out = server.run_allow_failure(["kill-session", "-t", name])?;
-    if out.success || TmuxServer::is_no_server(&out.stderr) {
+    if out.success
+        || TmuxServer::is_no_server(&out.stderr)
+        || TmuxServer::is_missing_target(&out.stderr)
+    {
         return Ok(());
     }
     Err(out.failure.into())

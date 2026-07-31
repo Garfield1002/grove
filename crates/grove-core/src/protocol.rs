@@ -143,6 +143,7 @@ pub enum EventKind {
     StateChanged,
     ReconciliationCompleted,
     NotificationReceived,
+    ControlCompleted,
 }
 
 /// One revisioned event on a subscription connection.
@@ -377,6 +378,16 @@ pub fn open_subscription(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::net::UnixListener;
+
+    fn serve_response(socket: &Path, response: Response) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = read_request(&mut stream).expect("request");
+            write_json(&mut stream, &response).expect("response");
+        })
+    }
 
     #[test]
     fn framed_json_round_trips_over_a_stream() {
@@ -406,6 +417,45 @@ mod tests {
     }
 
     #[test]
+    fn first_header_byte_path_preserves_the_complete_frame() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        let request = Request::new("req-first", "ping", json!({"n": 1}));
+        write_json(&mut writer, &request).expect("write");
+        let mut first = [0_u8; 1];
+        reader.read_exact(&mut first).expect("first byte");
+        assert_eq!(
+            read_request_after_first(&mut reader, first[0]).expect("read remainder"),
+            request
+        );
+    }
+
+    #[test]
+    fn truncated_and_invalid_payloads_report_the_exact_boundary() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        writer.write_all(&5_u32.to_be_bytes()).expect("header");
+        writer.write_all(b"{}").expect("partial payload");
+        writer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close writer");
+        let error = read_json::<Value>(&mut reader).expect_err("truncated");
+        assert!(matches!(
+            error,
+            Error::Io {
+                context: "read service frame payload",
+                ..
+            }
+        ));
+
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        writer.write_all(&3_u32.to_be_bytes()).expect("header");
+        writer.write_all(b"{!]").expect("invalid json");
+        assert!(matches!(
+            read_json::<Value>(&mut reader),
+            Err(Error::Json(_))
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_json_fields_and_bad_identifiers() {
         let (mut writer, mut reader) = UnixStream::pair().expect("pair");
         write_json(
@@ -425,6 +475,37 @@ mod tests {
             Request::new("", "ping", json!({})).validate(),
             Err(ValidationError::Empty("request id"))
         ));
+
+        for (request, expected) in [
+            (
+                Request::new("x".repeat(MAX_REQUEST_ID_LEN + 1), "ping", json!({})),
+                ValidationError::TooLong {
+                    field: "request id",
+                    max: MAX_REQUEST_ID_LEN,
+                },
+            ),
+            (
+                Request::new("line\nbreak", "ping", json!({})),
+                ValidationError::Control("request id"),
+            ),
+            (
+                Request::new("id", "", json!({})),
+                ValidationError::Empty("method"),
+            ),
+            (
+                Request::new("id", "x".repeat(MAX_REQUEST_ID_LEN + 1), json!({})),
+                ValidationError::TooLong {
+                    field: "method",
+                    max: MAX_REQUEST_ID_LEN,
+                },
+            ),
+            (
+                Request::new("id", "bad\tmethod", json!({})),
+                ValidationError::Control("method"),
+            ),
+        ] {
+            assert_eq!(request.validate().expect_err("invalid token"), expected);
+        }
     }
 
     #[test]
@@ -459,6 +540,18 @@ mod tests {
         let event = Event::new(7, EventKind::StateChanged, json!({"state": {"version": 1}}));
         write_json(&mut writer, &event).expect("write");
         assert_eq!(read_event(&mut reader).expect("read"), event);
+
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        let mut future = event;
+        future.protocol = VERSION + 1;
+        write_json(&mut writer, &future).expect("write future event");
+        assert!(matches!(
+            read_event(&mut reader),
+            Err(Error::ProtocolVersion {
+                actual,
+                expected
+            }) if actual == VERSION + 1 && expected == VERSION
+        ));
     }
 
     #[test]
@@ -467,5 +560,79 @@ mod tests {
         configure_with_timeout(&reader, Duration::from_millis(20)).expect("configures");
         let error = read_json::<Value>(&mut reader).expect_err("must time out");
         assert!(matches!(error, Error::Io { .. }));
+    }
+
+    #[test]
+    fn calls_reject_mismatched_ids_versions_and_response_shapes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request = Request::new("expected", "ping", Value::Null);
+
+        let mismatch_socket = temp.path().join("mismatch.sock");
+        let mismatch_server =
+            serve_response(&mismatch_socket, Response::success("different", json!({})));
+        let error = call(&mismatch_socket, &request).expect_err("mismatched id");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match request id `expected`")
+        );
+        mismatch_server.join().expect("server");
+
+        let version_socket = temp.path().join("version.sock");
+        let mut future = Response::success("expected", json!({}));
+        future.protocol = VERSION + 1;
+        let version_server = serve_response(&version_socket, future);
+        assert!(matches!(
+            call(&version_socket, &request),
+            Err(Error::ProtocolVersion {
+                actual,
+                expected
+            }) if actual == VERSION + 1 && expected == VERSION
+        ));
+        version_server.join().expect("server");
+
+        let shape_socket = temp.path().join("shape.sock");
+        let malformed = Response {
+            protocol: VERSION,
+            id: "expected".into(),
+            ok: true,
+            result: None,
+            error: None,
+        };
+        let shape_server = serve_response(&shape_socket, malformed);
+        assert!(matches!(
+            call(&shape_socket, &request),
+            Err(Error::Validation(ValidationError::ResponseShape))
+        ));
+        shape_server.join().expect("server");
+    }
+
+    #[test]
+    fn subscriptions_validate_acknowledgements_and_clear_read_timeouts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request = Request::new(
+            "subscribe",
+            "event.subscribe",
+            json!({"topics": ["state_changed"]}),
+        );
+        let socket = temp.path().join("subscription.sock");
+        let server = serve_response(
+            &socket,
+            Response::success("subscribe", json!({"revision": 0})),
+        );
+        let (stream, response) = open_subscription(&socket, &request).expect("subscription");
+        assert!(response.ok);
+        assert_eq!(stream.read_timeout().expect("read timeout"), None);
+        server.join().expect("server");
+
+        let mismatch_socket = temp.path().join("subscription-mismatch.sock");
+        let mismatch_server = serve_response(
+            &mismatch_socket,
+            Response::success("wrong", json!({"revision": 0})),
+        );
+        let error =
+            open_subscription(&mismatch_socket, &request).expect_err("mismatched acknowledgement");
+        assert!(error.to_string().contains("response id does not match"));
+        mismatch_server.join().expect("server");
     }
 }

@@ -239,7 +239,10 @@ pub fn body(ui: &mut Ui, form: &mut CreateForm) -> Outcome {
             },
         ))
         .fill(theme::ACCENT_FILL)
-        .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            theme::ACCENT.gamma_multiply(0.6),
+        ));
         if ui.add_enabled(form.is_valid(), create).clicked()
             && let Some(add) = form.to_add()
         {

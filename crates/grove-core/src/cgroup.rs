@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Memory and CPU for one cgroup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     /// `memory.current`, in bytes.
     pub memory_bytes: u64,

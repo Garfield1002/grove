@@ -8,6 +8,57 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# These are useful API-design and documentation policies, but adopting them is
+# a separate review from turning on correctness-oriented pedantic analysis.
+# Keep the exceptions explicit so the quality gate cannot silently weaken.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# Grove's concrete collections and state models are intentional domain types.
+# Generalizing them would add public generics without improving correctness.
+implicit_hasher = "allow"
+struct_excessive_bools = "allow"
+
+# Transitional pedantic exceptions. These are named rather than disabling the
+# group, so every newly introduced pedantic finding outside this reviewed set
+# fails the gate. Remove entries as the existing call sites are audited.
+return_self_not_must_use = "allow"
+map_unwrap_or = "allow"
+redundant_closure_for_method_calls = "allow"
+single_match_else = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+format_push_string = "allow"
+ref_option = "allow"
+match_bool = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+match_same_arms = "allow"
+semicolon_if_nothing_returned = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+match_wildcard_for_single_variants = "allow"
+assigning_clones = "allow"
+float_cmp = "allow"
+items_after_statements = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+manual_midpoint = "allow"
+unnecessary_wraps = "allow"
+fn_params_excessive_bools = "allow"
+
 [workspace.dependencies]
 grove-core = { path = "crates/grove-core" }
 eframe = { version = "0.32", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }

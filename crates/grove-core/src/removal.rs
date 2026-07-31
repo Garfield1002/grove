@@ -105,7 +105,10 @@ impl RemovalInputs {
 }
 
 /// One line of the report, with how alarming it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// Context: true but harmless.
     Note,
@@ -116,7 +119,7 @@ pub enum Severity {
 }
 
 /// A fact the dialog must display before the user decides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
     pub severity: Severity,
     pub text: String,
@@ -144,7 +147,7 @@ impl Finding {
 }
 
 /// The assembled report shown by the removal dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemovalReport {
     pub worktree_path: PathBuf,
     pub branch: Option<String>,

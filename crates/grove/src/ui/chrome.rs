@@ -299,7 +299,7 @@ fn hairline(ctx: &Context, at: egui::Pos2, width: f32) {
     .hline(
         at.x..=(at.x + width),
         at.y - 0.5,
-        egui::Stroke::new(1.0, theme::HAIRLINE),
+        egui::Stroke::new(1.0_f32, theme::HAIRLINE),
     );
 }
 

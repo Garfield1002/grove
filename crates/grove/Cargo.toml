@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["native-file-picker"]
 # The native directory picker. On Wayland `rfd` talks to xdg-desktop-portal,

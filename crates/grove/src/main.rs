@@ -3,6 +3,7 @@
 //! `grove` launches the GUI; `grove notify` reports an agent's status to it.
 
 mod app;
+mod control;
 mod hooks;
 mod notify;
 mod query;
@@ -27,6 +28,10 @@ Usage:
   grove project list   list registered projects as JSON
   grove worktree list  list current Git worktrees as JSON
   grove session list   list live Grove tmux sessions as JSON
+  grove session ensure <worktree-id>  ensure its persistent tmux session
+  grove session open <worktree-id>    open it in the primary/new terminal
+  grove agent start <worktree-id>     start the configured coding agent
+  grove wait <worktree-id> --status <status>  wait for semantic agent state
   grove snapshot       print one coherent service snapshot as JSON
   grove serve       run Grove's headless local service
   grove --help     show this message
@@ -46,6 +51,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("hooks") => {
             hooks::run(&args[1..])?;
+            return Ok(());
+        }
+        Some("session")
+            if args
+                .get(1)
+                .is_some_and(|action| matches!(action.as_str(), "ensure" | "open")) =>
+        {
+            let paths = Paths::from_process_env()?;
+            control::run(&args, &paths)?;
+            return Ok(());
+        }
+        Some("agent" | "wait") => {
+            let paths = Paths::from_process_env()?;
+            control::run(&args, &paths)?;
             return Ok(());
         }
         Some("project" | "worktree" | "session" | "snapshot") => {

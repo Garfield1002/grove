@@ -158,6 +158,26 @@ pub struct AgentRecord {
     pub transcript_path: PathBuf,
 }
 
+/// One narrow change to the service-owned state index.
+///
+/// The GUI sends these instead of replacing the complete state snapshot, so
+/// a stale UI cache cannot overwrite records learned from reconciliation or
+/// agent notifications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Mutation {
+    UpsertProject { record: ProjectRecord },
+    RemoveProject { project_id: String },
+    SetProjectExpanded { project_id: String, expanded: bool },
+    RecordSession { record: SessionRecord },
+    ForgetSession { worktree_id: String },
+    IgnoreSession { session_name: String },
+    ClearIgnoredSessions,
+    AssignSlot { number: u8, worktree_id: String },
+    ClearSlot { worktree_id: String },
+    RecordAgent { record: AgentRecord },
+}
+
 impl AgentRecord {
     /// Is there anything here worth keeping?
     fn is_usable(&self) -> bool {
@@ -169,7 +189,110 @@ impl AgentRecord {
     }
 }
 
+#[cfg(test)]
+mod direct_state_tests {
+    use super::*;
+
+    #[test]
+    fn bookkeeping_operations_are_idempotent_and_never_delete_external_data() {
+        let mut state = State::default();
+        state.ignore_session("scratch");
+        state.ignore_session("scratch");
+        assert!(state.is_ignored("scratch"));
+        assert!(state.clear_ignored_sessions());
+        assert!(!state.clear_ignored_sessions());
+
+        assert!(state.assign_slot(3, "abc123"));
+        assert_eq!(state.slot("abc123"), Some(3));
+        assert_eq!(state.slot_worktree(3), Some("abc123"));
+        assert!(state.clear_slot("abc123"));
+        assert!(!state.clear_slot("abc123"));
+
+        let agent = AgentRecord {
+            worktree_id: "abc123".into(),
+            session_id: "conversation-1".into(),
+            transcript_path: "/tmp/transcript.jsonl".into(),
+        };
+        assert!(state.record_agent(agent.clone()));
+        assert!(!state.record_agent(agent));
+        assert_eq!(
+            state
+                .agent("abc123")
+                .map(|record| record.session_id.as_str()),
+            Some("conversation-1")
+        );
+        assert!(state.forget_agent("abc123"));
+        assert!(!state.forget_agent("abc123"));
+
+        state.record_session(SessionRecord {
+            worktree_id: "abc123".into(),
+            project_id: "project-1".into(),
+            worktree_path: "/tmp/tree".into(),
+            session_name: "wt-abc123".into(),
+            last_activity_at: 1,
+        });
+        assert_eq!(state.recorded_session_ids(), ["abc123"]);
+        assert!(state.forget_session("abc123"));
+        assert!(!state.forget_session("abc123"));
+    }
+}
+
 impl State {
+    /// Apply one daemon-owned mutation and report whether it changed state.
+    pub fn apply(&mut self, mutation: Mutation) -> bool {
+        match mutation {
+            Mutation::UpsertProject { record } => {
+                let id = record.id.clone();
+                let before = self.find(&id).cloned();
+                self.upsert(record);
+                before != self.find(&id).cloned()
+            }
+            Mutation::RemoveProject { project_id } => self.remove(&project_id),
+            Mutation::SetProjectExpanded {
+                project_id,
+                expanded,
+            } => {
+                let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else {
+                    return false;
+                };
+                if project.is_expanded == expanded {
+                    return false;
+                }
+                project.is_expanded = expanded;
+                true
+            }
+            Mutation::RecordSession { record } => {
+                let changed = self.session(&record.worktree_id) != Some(&record);
+                if changed {
+                    self.record_session(record);
+                }
+                changed
+            }
+            Mutation::ForgetSession { worktree_id } => self.forget_session(&worktree_id),
+            Mutation::IgnoreSession { session_name } => {
+                if self.is_ignored(&session_name) {
+                    false
+                } else {
+                    self.ignore_session(&session_name);
+                    true
+                }
+            }
+            Mutation::ClearIgnoredSessions => self.clear_ignored_sessions(),
+            Mutation::AssignSlot {
+                number,
+                worktree_id,
+            } => {
+                if self.slot(&worktree_id) == Some(number) {
+                    false
+                } else {
+                    self.assign_slot(number, &worktree_id)
+                }
+            }
+            Mutation::ClearSlot { worktree_id } => self.clear_slot(&worktree_id),
+            Mutation::RecordAgent { record } => self.record_agent(record),
+        }
+    }
+
     pub fn from_toml(text: &str, path: &Path) -> Result<Self> {
         let mut state: Self = toml::from_str(text).map_err(|source| Error::StateRead {
             path: path.to_path_buf(),
@@ -910,5 +1033,29 @@ mod tests {
         assert_eq!(record.session_name, "");
         assert_eq!(record.last_activity_at, 0);
         assert_eq!(record.worktree_path, PathBuf::new());
+    }
+
+    #[test]
+    fn narrow_mutations_change_only_the_named_state() {
+        let mut state = State::default();
+        let project = ProjectRecord {
+            id: "project".into(),
+            name: "Grove".into(),
+            ..ProjectRecord::default()
+        };
+        assert!(state.apply(Mutation::UpsertProject {
+            record: project.clone(),
+        }));
+        assert!(!state.apply(Mutation::UpsertProject { record: project }));
+        assert!(state.apply(Mutation::AssignSlot {
+            number: 3,
+            worktree_id: "abc123".into(),
+        }));
+        assert!(!state.apply(Mutation::AssignSlot {
+            number: 3,
+            worktree_id: "abc123".into(),
+        }));
+        assert_eq!(state.slot("abc123"), Some(3));
+        assert_eq!(state.projects.len(), 1);
     }
 }

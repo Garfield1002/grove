@@ -9,7 +9,7 @@ use crate::status::SessionStatus;
 use crate::tmux::WindowInfo;
 
 /// A registered Git repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,

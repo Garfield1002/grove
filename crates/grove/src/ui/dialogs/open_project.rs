@@ -130,7 +130,10 @@ pub fn body(ui: &mut Ui, form: &mut OpenProjectForm) -> Outcome {
             },
         ))
         .fill(theme::ACCENT_FILL)
-        .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            theme::ACCENT.gamma_multiply(0.6),
+        ));
         if (ui.add_enabled(can_open, open).clicked() || submitted) && can_open {
             outcome = Outcome::Confirmed(form.path.trim().to_string());
         }

@@ -16,7 +16,7 @@ This document records the *resolved* architecture. The full product design
 | GUI framework | **egui/eframe** (glow backend) | Immediate mode fits a small list UI; native Wayland. **Hard budget: ≤ 100 MB RSS.** If egui cannot stay under it, fall back to GPUI. |
 | Persistence | **TOML only**, split into `config.toml` + `state.toml` | Config is hand-editable and never rewritten by the app; state is app-owned and written atomically (temp file + rename). No SQLite. |
 | Concurrency | **OS threads + channels** (`std::thread`, `std::process::Command`, mpsc back to UI) | No async runtime. Subprocess work is short-lived and blocking-friendly. UI wakes via `egui::Context::request_repaint`. |
-| Status detection | **Interval poller, paced by what is on screen** | Background thread polls tmux every ~2 s and git status every ~10 s per visible project, diffs against cache, sends deltas to the UI. While the UI paints nothing (minimised, another workspace, fully occluded) the tmux poll drops to ~30 s and the git poll stops entirely; the first frame after that gap polls immediately. See §6. tmux hooks are a possible v2 upgrade. |
+| Status detection | **Interval poller, paced by what is on screen** | The GUI's background thread requests one daemon-owned tmux observation every ~2 s and git status every ~10 s per visible project, diffs against cache, and sends deltas to the UI. While the UI paints nothing (minimised, another workspace, fully occluded) the tmux observation drops to ~30 s and the git poll stops entirely; the first frame after that gap polls immediately. See §6. tmux hooks are a possible v2 upgrade. |
 | Worktree IDs | **Deterministic hash** | First 6 hex chars of a hash over `(git-common-dir, canonical worktree path)`. Session name = `wt-<id>`. Losing `state.toml` is recoverable: restore re-derives identical IDs and reattaches to live tmux sessions. |
 | Terminal default | **Auto-detect on first run** | Probe PATH in order (`ptyxis`, `foot`, `alacritty`, `kitty`, `gnome-terminal`); write the winning template into `config.toml` so it is visible and editable. |
 | Agent attention | **`grove notify` CLI + persistent local service** | Agent wrappers call `grove notify --session <id> --state attention`. `grove serve` owns the public runtime socket independently of the GUI, queues the latest report per worktree while no GUI is attached, and forwards live reports to the GUI-only socket. The tmux attention option remains the durable recovery truth. |
@@ -39,8 +39,9 @@ This document records the *resolved* architecture. The full product design
 │ grove (GUI process)         │
 │  egui event loop (main)     │
 │  ├─ worker: git commands    │──▶ git CLI (arg arrays, never shell)
+│  ├─ worker: git commands    │──▶ git CLI (arg arrays, never shell)
 │  ├─ worker: tmux commands   │──▶ tmux -S $SOCKET … (private server)
-│  ├─ poller thread (2s/10s,  │
+│  ├─ poller thread (2s/10s,  │──▶ daemon status snapshots
 │  │    30s while off screen) │
 │  └─ IPC delivery thread     │◀── service-forwarded reports and toggles
 └─────────────────────────────┘
@@ -96,9 +97,37 @@ This document records the *resolved* architecture. The full product design
   has bounded read/write timeouts and is handled independently, with at most
   32 client threads, so a slow or malformed local client cannot stall the
   listener, exhaust threads, or affect legacy agent reports. Protocol version
-  1 exposes `ping`, `project.list`, `worktree.list`, `session.list`,
-  `session.snapshot`, `state.replace`, `state.reconcile`, `event.subscribe`
-  and `event.unsubscribe`. A subscription receives one normal response and
+1 exposes `ping`, `project.open`, `project.refresh`, `project.statuses`, `project.refs`,
+`project.list`, `worktree.list`, `session.list`, `session.refresh`, `removal.inspect`,
+  `project.expanded.set`, `project.remove`, `slot.assign`, `slot.clear`,
+  `session.ignore`, `session.ignored.clear`,
+  `session.snapshot`, `state.get`, `state.mutate`, `state.reconcile`, `event.subscribe`,
+  `event.unsubscribe`, `session.ensure`, `session.attention.clear`, `session.associate`,
+  `session.close`, `session.open`,
+  `session.orphan.open`,
+  `session.terminal.open`,
+  `session.window.open`, `session.window.create`, `agent.start`,
+  `session.worktree.close`,
+  `server.stop`,
+  `worktree.create`,
+  `worktree.remove`,
+  `branch.delete`,
+  `agent.resume_recorded`, `status.get`, and `status.poll`. Recorded-agent
+  resumption reads configuration, conversations, Git worktrees, and tmux
+  signals in the service; the GUI supplies only a per-launch idempotency key.
+  Explicit fresh and resume starts likewise send only the worktree id,
+  optional conversation id, and idempotency key; the service owns
+  configuration lookup, Git resolution, tmux mutation, and state recording.
+  The GUI's paced watcher requests
+  `status.poll`; the service is the only component that reads tmux signals and
+  windows, while the GUI still owns presentation cadence and its attention
+  latch. Control methods accept only a worktree id, resolve its project
+  and path from service-owned state plus live Git, and call the same core
+  workflows. An optional idempotency key caches a successful
+  result for the service lifetime, preventing a retry from starting a second
+  agent or terminal. Successful mutations publish `control_completed`.
+  `grove wait` combines those events with bounded semantic-status checks; it
+  never reads pane output. A subscription receives one normal response and
   then a stream of typed, monotonically revisioned events for the requested
   state, reconciliation and notification topics. Each subscriber has a
   bounded non-blocking queue; a full queue or failed write drops only that
@@ -107,7 +136,14 @@ This document records the *resolved* architecture. The full product design
   During migration, a healthy GUI notification subscription replaces legacy
   forwarding; when it is absent or full, the existing `gui.sock` queue path
   resumes automatically. The service is
-  the sole production writer of `state.toml`; mutation and reconciliation
+  the sole production writer of `state.toml`; the GUI reads it only through
+  `state.get` and sends dedicated intent methods for project visibility,
+  registration removal, numbered slots, and ignored sessions. The lower-level
+  `state.mutate` method remains an automation surface, but is not a GUI
+  ownership path. The GUI changes its cached state and reports success only
+  after the daemon returns the atomically persisted snapshot; reconciliation
+  dependent on an ignore/restore intent is queued only after that response.
+  Mutation and reconciliation
   requests share one lock and finish with an atomic save. The snapshot is a
   coherent bootstrap view built from one
   state-file load and one listing each of live tmux sessions and panes; it

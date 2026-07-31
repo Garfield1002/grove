@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
+use grove_core::Paths;
 use grove_core::claude::HookChange;
 use grove_core::config::Config;
 use grove_core::git::StatusSummary;
@@ -13,11 +14,10 @@ use grove_core::model::{Project, SessionPresence};
 use grove_core::notice::Notices;
 use grove_core::protocol::{Event, EventKind};
 use grove_core::reconcile::{OrphanSession, ProjectRef, Reconciliation};
-use grove_core::state::{AgentRecord, ProjectRecord, SessionRecord, State};
+use grove_core::state::State;
 use grove_core::status::{SessionReport, SessionStatus};
 use grove_core::tmux::WindowInfo;
 use grove_core::workflow::Activation;
-use grove_core::{Paths, state};
 
 use crate::status_watch::{Control, StatusWatch, WorktreeLabel};
 use crate::ui::chrome::Detached;
@@ -109,6 +109,82 @@ const CREATE_VIEWPORT: &str = "grove-create-worktree-window";
 const REMOVAL_VIEWPORT: &str = "grove-removal-window";
 const OPEN_PROJECT_VIEWPORT: &str = "grove-open-project-window";
 
+enum ServiceUpdate {
+    State(State),
+    Reconciliation {
+        reconciliation: Reconciliation,
+        state: State,
+    },
+    Notification(Notification),
+    ControlCompleted,
+}
+
+enum ServiceEventAction {
+    Ignore,
+    Recover(serde_json::Error),
+    Apply {
+        revision: u64,
+        update: ServiceUpdate,
+        gap: bool,
+    },
+}
+
+fn decode_service_event(event: Event) -> Result<(u64, ServiceUpdate), serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StatePayload {
+        state: State,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReconciliationPayload {
+        reconciliation: Reconciliation,
+        state: State,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NotificationPayload {
+        notification: Notification,
+    }
+
+    let update = match event.kind {
+        EventKind::StateChanged => {
+            let payload = serde_json::from_value::<StatePayload>(event.payload)?;
+            ServiceUpdate::State(payload.state)
+        }
+        EventKind::ReconciliationCompleted => {
+            let payload = serde_json::from_value::<ReconciliationPayload>(event.payload)?;
+            ServiceUpdate::Reconciliation {
+                reconciliation: payload.reconciliation,
+                state: payload.state,
+            }
+        }
+        EventKind::NotificationReceived => {
+            let payload = serde_json::from_value::<NotificationPayload>(event.payload)?;
+            ServiceUpdate::Notification(payload.notification)
+        }
+        EventKind::ControlCompleted => ServiceUpdate::ControlCompleted,
+    };
+    Ok((event.revision, update))
+}
+
+fn classify_service_event(last_revision: u64, event: Event) -> ServiceEventAction {
+    if event.revision <= last_revision {
+        return ServiceEventAction::Ignore;
+    }
+    let gap = event.revision > last_revision.saturating_add(1);
+    match decode_service_event(event) {
+        Ok((revision, update)) => ServiceEventAction::Apply {
+            revision,
+            update,
+            gap,
+        },
+        Err(error) => ServiceEventAction::Recover(error),
+    }
+}
+
 impl GroveApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths, pending_toggle: Option<u8>) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -121,38 +197,11 @@ impl GroveApp {
         let (workers, messages) = Workers::start(paths.clone(), cc.egui_ctx.clone());
         let watch = StatusWatch::start(&paths, workers.message_sender(), cc.egui_ctx.clone());
 
-        // Reading two small TOML files on the UI thread is fine; running a
-        // subprocess here would not be, which is why config loading (it may
-        // probe PATH and write a file) and all git/tmux work go to the worker.
-        let mut errors = Vec::new();
-        let loaded = state::load(&paths.state_file()).unwrap_or_else(|e| {
-            errors.push(ErrorReport::new("could not read state.toml", &e));
-            State::default()
-        });
-
-        let projects: Vec<Project> = loaded
-            .projects
-            .iter()
-            .map(|record| Project {
-                id: record.id.clone(),
-                name: record.name.clone(),
-                repository_path: record.repository_path.clone(),
-                git_common_dir: record.git_common_dir.clone(),
-                default_worktree_path: record.default_worktree_path.clone(),
-                is_expanded: record.is_expanded,
-                worktrees: Vec::new(),
-                unavailable: None,
-            })
-            .collect();
-
+        // The daemon is the only reader and writer of state.toml in
+        // production. The GUI starts empty and receives an authoritative
+        // state snapshot before it asks the daemon to reconcile Git and tmux.
+        workers.send(Task::LoadState);
         workers.send(Task::LoadConfig);
-        // Startup reconciliation (ARCHITECTURE.md §7): one pass over git and
-        // tmux rather than a refresh per project, so sessions are reattached,
-        // stopped ones are named as stopped and orphans are found before the
-        // user touches anything.
-        workers.send(Task::Reconcile {
-            projects: project_refs(&projects),
-        });
 
         Self {
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -166,13 +215,13 @@ impl GroveApp {
             claude_hooks: None,
             last_service_revision: 0,
             config: None,
-            state: loaded,
-            projects,
+            state: State::default(),
+            projects: Vec::new(),
             selected: None,
             selected_window: None,
             filter: String::new(),
             status: None,
-            errors,
+            errors: Vec::new(),
             orphans: Vec::new(),
             ignored_orphans: 0,
             orphan_armed: None,
@@ -192,6 +241,21 @@ impl GroveApp {
     fn drain_messages(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.messages.try_recv() {
             match message {
+                Message::StateLoaded(state) => {
+                    self.apply_daemon_state(*state, true);
+                    self.reconcile();
+                }
+                Message::StateUpdated {
+                    state,
+                    status,
+                    reconcile,
+                } => {
+                    self.apply_daemon_state(*state, false);
+                    self.status = Some(status);
+                    if reconcile {
+                        self.reconcile();
+                    }
+                }
                 Message::ConfigLoaded { loaded } => {
                     if loaded.created {
                         self.status = Some(format!(
@@ -399,11 +463,6 @@ impl GroveApp {
                         // A session the *user* closed is not a stopped
                         // session: forget the mapping, or the row would go on
                         // offering to bring back what was just dismissed.
-                        if operation == crate::workers::RemovalOp::CloseSession {
-                            self.state.forget_session(&form.worktree_id);
-                            let state = self.state.clone();
-                            self.workers.send(Task::SaveState(Box::new(state)));
-                        }
                         form.note_done(operation, detail);
                     }
                 }
@@ -429,10 +488,6 @@ impl GroveApp {
                     activation,
                 } => {
                     self.status = Some(describe(&activation));
-                    // The worktree now has a session; recording it is what
-                    // makes a later disappearance read as *stopped* rather
-                    // than as "there was never one" (DESIGN.md §11).
-                    self.record_session(&worktree_id, activation.session());
                     self.selected = Some(worktree_id);
                 }
                 Message::WindowOpened {
@@ -458,14 +513,6 @@ impl GroveApp {
     }
 
     fn add_project(&mut self, project: Project) {
-        self.state.upsert(ProjectRecord {
-            id: project.id.clone(),
-            name: project.name.clone(),
-            repository_path: project.repository_path.clone(),
-            git_common_dir: project.git_common_dir.clone(),
-            default_worktree_path: project.default_worktree_path.clone(),
-            is_expanded: project.is_expanded,
-        });
         match self.projects.iter_mut().find(|p| p.id == project.id) {
             Some(existing) => {
                 self.status = Some(format!("{} is already open", project.name));
@@ -480,7 +527,6 @@ impl GroveApp {
                 self.projects.push(project);
             }
         }
-        self.save_state();
     }
 
     /// Stamp fresh git statuses onto a project's rows. A worktree with no
@@ -526,7 +572,6 @@ impl GroveApp {
             }
             self.workers.send(Task::RefreshStatuses {
                 project_id: project.id.clone(),
-                worktrees: project.worktrees.clone(),
             });
         }
     }
@@ -595,14 +640,15 @@ impl GroveApp {
     /// keystroke both assigns and unassigns.
     fn set_slot(&mut self, worktree_id: &str, slot: u8) {
         if self.state.slot(worktree_id) == Some(slot) {
-            self.state.clear_slot(worktree_id);
-            self.status = Some(format!("Took {slot} off this worktree."));
-        } else if self.state.assign_slot(slot, worktree_id) {
-            self.status = Some(format!("`grove toggle {slot}` now opens this worktree."));
-        } else {
-            return;
+            self.workers.send(Task::ClearSlot {
+                worktree_id: worktree_id.to_string(),
+            });
+        } else if (1..=grove_core::state::MAX_SLOT).contains(&slot) {
+            self.workers.send(Task::AssignSlot {
+                number: slot,
+                worktree_id: worktree_id.to_string(),
+            });
         }
-        self.save_state();
     }
 
     /// An explicit `grove notify` report: show its message straight away.
@@ -611,6 +657,7 @@ impl GroveApp {
     /// later — except for attention, which is latched in the engine and would
     /// otherwise not show until that poll lands.
     fn apply_notification(&mut self, notification: &Notification) {
+        self.watch.notified(notification);
         let worktree_id = notification.worktree_id.as_str();
         let state = notification.state;
         self.notices.record(notification);
@@ -629,73 +676,41 @@ impl GroveApp {
             }
         }
         self.apply_window_notes();
-        self.record_agent(notification);
     }
 
     fn apply_service_event(&mut self, event: Event) {
-        if event.revision <= self.last_service_revision {
-            return;
-        }
-        if event.revision > self.last_service_revision.saturating_add(1) {
+        let (revision, update, gap) =
+            match classify_service_event(self.last_service_revision, event) {
+                ServiceEventAction::Ignore => return,
+                ServiceEventAction::Recover(error) => {
+                    eprintln!("grove: invalid service event: {error}");
+                    self.watch.send(Control::PollNow);
+                    return;
+                }
+                ServiceEventAction::Apply {
+                    revision,
+                    update,
+                    gap,
+                } => (revision, update, gap),
+            };
+        if gap {
             // The bounded queue deliberately drops a slow subscriber. If a
             // future transport replays across that gap, polling still makes
             // git and tmux authoritative rather than trusting a partial log.
             self.watch.send(Control::PollNow);
         }
-        self.last_service_revision = event.revision;
-        match event.kind {
-            EventKind::StateChanged => {
-                #[derive(serde::Deserialize)]
-                struct Payload {
-                    state: State,
-                }
-                match serde_json::from_value::<Payload>(event.payload) {
-                    Ok(payload) => self.state = payload.state,
-                    Err(error) => eprintln!("grove: invalid state event: {error}"),
-                }
+        self.last_service_revision = revision;
+        match update {
+            ServiceUpdate::State(state) => self.apply_daemon_state(state, false),
+            ServiceUpdate::Reconciliation {
+                reconciliation,
+                state,
+            } => self.apply_reconciliation(reconciliation, state),
+            ServiceUpdate::Notification(notification) => self.apply_notification(&notification),
+            ServiceUpdate::ControlCompleted => {
+                self.workers.send(Task::RefreshSessions);
+                self.watch.send(Control::PollNow);
             }
-            EventKind::ReconciliationCompleted => {
-                #[derive(serde::Deserialize)]
-                struct Payload {
-                    reconciliation: Reconciliation,
-                    state: State,
-                }
-                match serde_json::from_value::<Payload>(event.payload) {
-                    Ok(payload) => {
-                        self.apply_reconciliation(payload.reconciliation, payload.state);
-                    }
-                    Err(error) => eprintln!("grove: invalid reconciliation event: {error}"),
-                }
-            }
-            EventKind::NotificationReceived => {
-                #[derive(serde::Deserialize)]
-                struct Payload {
-                    notification: Notification,
-                }
-                match serde_json::from_value::<Payload>(event.payload) {
-                    Ok(payload) => self.apply_notification(&payload.notification),
-                    Err(error) => eprintln!("grove: invalid notification event: {error}"),
-                }
-            }
-        }
-    }
-
-    /// Remember the conversation an agent reported, so Grove can offer to
-    /// resume it or open its transcript later.
-    ///
-    /// `state.toml` is only written when something actually changed: agents
-    /// report several times a turn and the id is the same every time.
-    fn record_agent(&mut self, notification: &Notification) {
-        if !notification.has_agent_record() {
-            return;
-        }
-        let changed = self.state.record_agent(AgentRecord {
-            worktree_id: notification.worktree_id.clone(),
-            session_id: notification.agent_session.clone().unwrap_or_default(),
-            transcript_path: notification.transcript.clone().unwrap_or_default(),
-        });
-        if changed {
-            self.save_state();
         }
     }
 
@@ -733,7 +748,7 @@ impl GroveApp {
     ///
     /// Both halves must go, or the next poll would read the option back and
     /// re-raise attention the user has just answered.
-    fn clear_attention(&mut self, worktree_id: &str, session: &str) {
+    fn clear_attention(&mut self, worktree_id: &str) {
         if !self.watch.opened(worktree_id) {
             return;
         }
@@ -749,7 +764,8 @@ impl GroveApp {
             }
         }
         self.workers.send(Task::ClearAttention {
-            session: session.to_string(),
+            worktree_id: worktree_id.to_string(),
+            idempotency_key: format!("gui-clear-attention-{}", grove_core::agent::nonce()),
         });
     }
 
@@ -773,9 +789,62 @@ impl GroveApp {
         self.watch.send(Control::Describe(labels));
     }
 
-    fn save_state(&self) {
-        self.workers
-            .send(Task::SaveState(Box::new(self.state.clone())));
+    /// Replace the GUI's read-only cache with the state returned by the
+    /// daemon. On bootstrap this also creates the project rows; later updates
+    /// preserve live Git/tmux data already attached to those rows.
+    fn apply_daemon_state(&mut self, state: State, bootstrap: bool) {
+        if bootstrap {
+            self.projects = state
+                .projects
+                .iter()
+                .map(|record| Project {
+                    id: record.id.clone(),
+                    name: record.name.clone(),
+                    repository_path: record.repository_path.clone(),
+                    git_common_dir: record.git_common_dir.clone(),
+                    default_worktree_path: record.default_worktree_path.clone(),
+                    is_expanded: record.is_expanded,
+                    worktrees: Vec::new(),
+                    unavailable: None,
+                })
+                .collect();
+        } else {
+            self.projects
+                .retain(|project| state.find(&project.id).is_some());
+            for project in &mut self.projects {
+                if let Some(record) = state.find(&project.id) {
+                    project.name = record.name.clone();
+                    project.repository_path = record.repository_path.clone();
+                    project.git_common_dir = record.git_common_dir.clone();
+                    project.default_worktree_path = record.default_worktree_path.clone();
+                    project.is_expanded = record.is_expanded;
+                }
+            }
+            for record in &state.projects {
+                if self.projects.iter().any(|project| project.id == record.id) {
+                    continue;
+                }
+                self.projects.push(Project {
+                    id: record.id.clone(),
+                    name: record.name.clone(),
+                    repository_path: record.repository_path.clone(),
+                    git_common_dir: record.git_common_dir.clone(),
+                    default_worktree_path: record.default_worktree_path.clone(),
+                    is_expanded: record.is_expanded,
+                    worktrees: Vec::new(),
+                    unavailable: None,
+                });
+            }
+        }
+        self.state = state;
+        if self
+            .removal
+            .get()
+            .is_some_and(|form| self.state.find(&form.project_id).is_none())
+        {
+            self.removal.close();
+        }
+        self.mark_stopped_sessions();
     }
 
     /// Ask the worker for a reconciliation pass (ARCHITECTURE.md §7). This is
@@ -796,9 +865,8 @@ impl GroveApp {
     fn apply_reconciliation(&mut self, result: Reconciliation, state: State) {
         self.reconciled_once = true;
         // The service owns state persistence and returns the exact state
-        // snapshot it reconciled and atomically wrote. Keep the GUI mirror in
-        // sync so a later state.replace cannot overwrite service-owned session
-        // records with an older copy.
+        // snapshot it reconciled and atomically wrote. The GUI keeps this
+        // read-only cache for rendering and sends only narrow mutations back.
         self.state = state;
         let summary = result.summary();
         for status in result.projects {
@@ -846,20 +914,15 @@ impl GroveApp {
         // Config first: until it has loaded, "resume on startup" has no
         // answer, and treating that as "no" would spend the one pass this
         // launch gets on a question nobody asked yet.
-        let Some(config) = self.config.as_ref() else {
+        let Some(_config) = self.config.as_ref() else {
             return;
         };
-        let enabled = config.agents.resume_on_startup;
-        // Nothing to do is still done: a config that says no, or a state file
-        // with no conversations in it, must not leave this armed for a later
-        // refresh to fire.
+        // The service reads the authoritative config and state. The GUI only
+        // supplies a per-launch idempotency key so a lost response cannot
+        // start a conversation twice.
         self.agents_resumed = true;
-        if !enabled || self.state.agents.is_empty() {
-            return;
-        }
         self.workers.send(Task::ResumeAgents {
-            projects: self.projects.clone(),
-            records: self.state.agents.clone(),
+            idempotency_key: format!("gui-launch-{}", grove_core::agent::nonce()),
         });
     }
 
@@ -880,26 +943,6 @@ impl GroveApp {
         self.notices.retain_ids(|id| live.contains(id));
     }
 
-    /// Record one worktree's session mapping, by worktree id.
-    fn record_session(&mut self, worktree_id: &str, session: &str) {
-        let found = self.projects.iter().find_map(|project| {
-            project
-                .worktree(worktree_id)
-                .map(|worktree| (project.id.clone(), worktree.path.clone()))
-        });
-        let Some((project_id, worktree_path)) = found else {
-            return;
-        };
-        self.state.record_session(SessionRecord {
-            worktree_id: worktree_id.to_string(),
-            project_id,
-            worktree_path,
-            session_name: session.to_string(),
-            last_activity_at: grove_core::workflow::now_epoch(),
-        });
-        self.save_state();
-    }
-
     /// Is there a `resume_command` to offer at all? There is one by default —
     /// Claude Code's, since Claude Code is what reports the ids — so this is
     /// false only for a user who blanked the key.
@@ -916,10 +959,9 @@ impl GroveApp {
             && let Some(worktree) = project.worktree(worktree_id)
         {
             self.workers.send(Task::StartAgent {
-                project_name: project.name.clone(),
-                git_common_dir: project.git_common_dir.clone(),
-                worktree: Box::new(worktree.clone()),
+                worktree_id: worktree.id.clone(),
                 resume,
+                idempotency_key: format!("gui-agent-start-{}", grove_core::agent::nonce()),
             });
             self.selected = Some(worktree_id.to_string());
         }
@@ -928,21 +970,17 @@ impl GroveApp {
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::ToggleProject(id) => {
-                if let Some(project) = self.projects.iter_mut().find(|p| p.id == id) {
-                    project.is_expanded = !project.is_expanded;
-                    let expanded = project.is_expanded;
-                    if let Some(record) = self.state.projects.iter_mut().find(|p| p.id == id) {
-                        record.is_expanded = expanded;
-                    }
-                    self.save_state();
+                if let Some(project) = self.projects.iter().find(|p| p.id == id) {
+                    self.workers.send(Task::SetProjectExpanded {
+                        project_id: id,
+                        expanded: !project.is_expanded,
+                    });
                 }
             }
             Action::RefreshProject(id) => {
                 if let Some(project) = self.projects.iter().find(|p| p.id == id) {
                     self.workers.send(Task::RefreshProject {
                         project_id: project.id.clone(),
-                        repository_path: project.repository_path.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
                     });
                 }
             }
@@ -957,13 +995,11 @@ impl GroveApp {
                 if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
                     && let Some(worktree) = project.worktree(&worktree_id)
                 {
-                    let session = worktree.session_name();
                     self.workers.send(Task::Activate {
-                        project_name: project.name.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
-                        worktree: Box::new(worktree.clone()),
+                        worktree_id: worktree.id.clone(),
+                        idempotency_key: format!("gui-session-open-{}", grove_core::agent::nonce()),
                     });
-                    self.clear_attention(&worktree_id, &session);
+                    self.clear_attention(&worktree_id);
                     self.selected = Some(worktree_id);
                 }
             }
@@ -1001,9 +1037,8 @@ impl GroveApp {
             Action::SetWorktreeSlot { worktree_id, slot } => match slot {
                 Some(slot) => self.set_slot(&worktree_id, slot),
                 None => {
-                    if self.state.clear_slot(&worktree_id) {
-                        self.status = Some("Took the number off this worktree.".to_string());
-                        self.save_state();
+                    if self.state.slot(&worktree_id).is_some() {
+                        self.workers.send(Task::ClearSlot { worktree_id });
                     }
                 }
             },
@@ -1016,9 +1051,11 @@ impl GroveApp {
                 {
                     self.selected = Some(worktree_id);
                     self.workers.send(Task::OpenInNewTerminal {
-                        project_name: project.name.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
-                        worktree: Box::new(worktree.clone()),
+                        worktree_id: worktree.id.clone(),
+                        idempotency_key: format!(
+                            "gui-additional-terminal-{}",
+                            grove_core::agent::nonce()
+                        ),
                     });
                 }
             }
@@ -1031,9 +1068,11 @@ impl GroveApp {
                 {
                     self.selected = Some(worktree_id);
                     self.workers.send(Task::OpenNewWindow {
-                        project_name: project.name.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
-                        worktree: Box::new(worktree.clone()),
+                        worktree_id: worktree.id.clone(),
+                        idempotency_key: format!(
+                            "gui-session-window-create-{}",
+                            grove_core::agent::nonce()
+                        ),
                     });
                 }
             }
@@ -1047,14 +1086,15 @@ impl GroveApp {
                 if let Some(project) = self.projects.iter().find(|p| p.id == project_id)
                     && let Some(worktree) = project.worktree(&worktree_id)
                 {
-                    let session = worktree.session_name();
                     self.workers.send(Task::ActivateWindow {
-                        project_name: project.name.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
-                        worktree: Box::new(worktree.clone()),
+                        worktree_id: worktree.id.clone(),
                         window_index,
+                        idempotency_key: format!(
+                            "gui-session-window-open-{}",
+                            grove_core::agent::nonce()
+                        ),
                     });
-                    self.clear_attention(&worktree_id, &session);
+                    self.clear_attention(&worktree_id);
                     self.selected_window = Some((worktree_id.clone(), window_index));
                     self.selected = Some(worktree_id);
                 }
@@ -1096,13 +1136,13 @@ impl GroveApp {
         use ui::orphans::OrphanAction;
         match action {
             OrphanAction::Open(session) => {
-                let cwd = self
-                    .orphans
-                    .iter()
-                    .find(|o| o.name == session)
-                    .and_then(|o| o.worktree_path.clone())
-                    .unwrap_or_else(|| PathBuf::from("."));
-                self.workers.send(Task::OpenSession { session, cwd });
+                self.workers.send(Task::OpenSession {
+                    session,
+                    idempotency_key: format!(
+                        "gui-open-orphan-session-{}",
+                        grove_core::agent::nonce()
+                    ),
+                });
             }
             OrphanAction::Associate {
                 session,
@@ -1113,17 +1153,22 @@ impl GroveApp {
                     && let Some(worktree) = project.worktree(&worktree_id)
                 {
                     self.workers.send(Task::AssociateSession {
-                        project_name: project.name.clone(),
-                        git_common_dir: project.git_common_dir.clone(),
-                        worktree: Box::new(worktree.clone()),
+                        worktree_id: worktree.id.clone(),
                         session,
+                        idempotency_key: format!(
+                            "gui-associate-session-{}",
+                            grove_core::agent::nonce()
+                        ),
                     });
                 }
             }
             // The first click arms; only the second one closes anything.
             OrphanAction::Close(session) => {
                 if self.orphan_armed.as_deref() == Some(session.as_str()) {
-                    self.workers.send(Task::CloseOrphan { session });
+                    self.workers.send(Task::CloseOrphan {
+                        session,
+                        idempotency_key: format!("gui-close-orphan-{}", grove_core::agent::nonce()),
+                    });
                 } else {
                     self.status = Some(format!(
                         "Choose “Confirm: close {session}” to end that session."
@@ -1132,17 +1177,12 @@ impl GroveApp {
                 }
             }
             OrphanAction::Ignore(session) => {
-                self.state.ignore_session(&session);
-                self.save_state();
-                self.status = Some(format!(
-                    "Ignoring {session}. It is still running; use Restore to list it again."
-                ));
-                self.reconcile();
+                self.workers.send(Task::IgnoreSession {
+                    session: session.clone(),
+                });
             }
             OrphanAction::ShowIgnored => {
-                self.state.clear_ignored_sessions();
-                self.save_state();
-                self.reconcile();
+                self.workers.send(Task::ClearIgnoredSessions);
             }
         }
     }
@@ -1150,13 +1190,9 @@ impl GroveApp {
     /// Remove a project from Grove's index. Metadata only — this must never
     /// be accompanied by a git or tmux operation (ARCHITECTURE.md §8.1).
     fn remove_project(&mut self, id: &str) {
-        self.projects.retain(|p| p.id != id);
-        self.state.remove(id);
-        self.save_state();
-        if self.removal.get().is_some_and(|f| f.project_id == id) {
-            self.removal.close();
-        }
-        self.status = Some("Removed from Grove. The repository is untouched.".to_string());
+        self.workers.send(Task::RemoveProject {
+            project_id: id.to_string(),
+        });
     }
 
     /// Open the create-worktree window, or raise the one already open. Asking
@@ -1166,15 +1202,12 @@ impl GroveApp {
             return;
         };
         let form = CreateForm::new(project);
-        let (id, repository_path) = (project.id.clone(), project.repository_path.clone());
+        let id = project.id.clone();
         if self
             .create
             .open_or_focus(form, |open| open.project_id == id)
         {
-            self.workers.send(Task::LoadBaseRefs {
-                project_id: id,
-                repository_path,
-            });
+            self.workers.send(Task::LoadBaseRefs { project_id: id });
         }
     }
 
@@ -1187,8 +1220,7 @@ impl GroveApp {
         };
         self.selected = Some(worktree_id.to_string());
         let gather = Task::GatherRemoval {
-            project_id: project.id.clone(),
-            worktree: Box::new(worktree.clone()),
+            worktree_id: worktree.id.clone(),
         };
         let form = RemovalForm {
             project_id: project.id.clone(),
@@ -1229,28 +1261,33 @@ impl GroveApp {
                 self.remove_project(&id);
             }
             Request::CloseSession => {
-                if let Some(session) = form.session.clone() {
+                if form.session.is_some() {
                     self.workers.send(Task::CloseSession {
                         project_id: form.project_id.clone(),
-                        session,
+                        worktree_id: form.worktree_id.clone(),
+                        idempotency_key: format!(
+                            "gui-close-worktree-session-{}",
+                            grove_core::agent::nonce()
+                        ),
                     });
                 }
             }
             Request::RemoveWorktree { force } => self.workers.send(Task::RemoveWorktree {
                 project_id: form.project_id.clone(),
-                repository_path: form.repository_path.clone(),
-                git_common_dir: form.git_common_dir.clone(),
-                worktree_path: form.worktree_path.clone(),
+                worktree_id: form.worktree_id.clone(),
                 force,
+                idempotency_key: format!("gui-remove-worktree-{}", grove_core::agent::nonce()),
             }),
             Request::DeleteBranch { force } => {
                 if let Some(branch) = form.branch.clone() {
                     self.workers.send(Task::DeleteBranch {
                         project_id: form.project_id.clone(),
-                        repository_path: form.repository_path.clone(),
-                        git_common_dir: form.git_common_dir.clone(),
                         branch,
                         force,
+                        idempotency_key: format!(
+                            "gui-delete-branch-{}",
+                            grove_core::agent::nonce()
+                        ),
                     });
                 }
             }
@@ -1330,7 +1367,10 @@ impl GroveApp {
             Outcome::Cancelled => close = true,
             Outcome::Confirmed(path) => {
                 self.status = Some(format!("Opening {path}…"));
-                self.workers.send(Task::OpenProject(PathBuf::from(path)));
+                self.workers.send(Task::OpenProject {
+                    path: PathBuf::from(path),
+                    idempotency_key: format!("gui-project-open-{}", grove_core::agent::nonce()),
+                });
                 close = true;
             }
         }
@@ -1377,11 +1417,9 @@ impl GroveApp {
             Outcome::Create(add) => {
                 self.workers.send(Task::CreateWorktree {
                     project_id: form.project_id.clone(),
-                    project_name: form.project_name.clone(),
-                    repository_path: form.repository_path.clone(),
-                    git_common_dir: form.git_common_dir.clone(),
                     add,
                     open_after: form.open_after,
+                    idempotency_key: format!("gui-create-worktree-{}", grove_core::agent::nonce()),
                 });
                 self.status = Some("Creating the worktree…".to_string());
                 close = true;
@@ -1598,7 +1636,9 @@ impl GroveApp {
             if armed {
                 self.shutdown_armed = false;
                 self.status = Some("Killing the tmux server…".to_string());
-                self.workers.send(Task::KillServer);
+                self.workers.send(Task::KillServer {
+                    idempotency_key: format!("gui-stop-server-{}", grove_core::agent::nonce()),
+                });
             } else {
                 self.shutdown_armed = true;
                 self.status =
@@ -1614,7 +1654,7 @@ impl GroveApp {
     fn filter_field(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(theme::FIELD)
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
             .corner_radius(egui::CornerRadius::same(theme::CHIP_RADIUS))
             .inner_margin(egui::Margin::symmetric(10, 0))
             .show(ui, |ui| {
@@ -1931,7 +1971,7 @@ fn hairline(ctx: &egui::Context, at: egui::Pos2, width: f32) {
     .hline(
         at.x..=(at.x + width),
         at.y - 0.5,
-        egui::Stroke::new(1.0, theme::HAIRLINE),
+        egui::Stroke::new(1.0_f32, theme::HAIRLINE),
     );
 }
 
@@ -2226,6 +2266,99 @@ mod tests {
             "matching is by repository identity, not by name"
         );
         assert!(project_refs(&[]).is_empty());
+    }
+
+    #[test]
+    fn service_events_decode_only_their_documented_state_bearing_payloads() {
+        let state = State::default();
+        let reconciliation = Reconciliation::default();
+        let notification = Notification::new("a1b2c3", SessionStatus::Attention);
+
+        let (revision, update) = decode_service_event(Event::new(
+            7,
+            EventKind::StateChanged,
+            serde_json::json!({"state": state}),
+        ))
+        .expect("state event");
+        assert_eq!(revision, 7);
+        assert!(matches!(update, ServiceUpdate::State(_)));
+
+        let (_, update) = decode_service_event(Event::new(
+            8,
+            EventKind::ReconciliationCompleted,
+            serde_json::json!({
+                "reconciliation": reconciliation,
+                "state": State::default(),
+            }),
+        ))
+        .expect("reconciliation event");
+        assert!(matches!(update, ServiceUpdate::Reconciliation { .. }));
+
+        let (_, update) = decode_service_event(Event::new(
+            9,
+            EventKind::NotificationReceived,
+            serde_json::json!({"notification": notification}),
+        ))
+        .expect("notification event");
+        assert!(matches!(update, ServiceUpdate::Notification(_)));
+
+        let (_, update) = decode_service_event(Event::new(
+            10,
+            EventKind::ControlCompleted,
+            serde_json::json!({"operation": "anything"}),
+        ))
+        .expect("control completion");
+        assert!(matches!(update, ServiceUpdate::ControlCompleted));
+
+        for kind in [
+            EventKind::StateChanged,
+            EventKind::ReconciliationCompleted,
+            EventKind::NotificationReceived,
+        ] {
+            assert!(
+                decode_service_event(Event::new(11, kind, serde_json::Value::Null)).is_err(),
+                "accepted a missing state-bearing payload for {kind:?}"
+            );
+            assert!(
+                decode_service_event(Event::new(
+                    11,
+                    kind,
+                    serde_json::json!({"unexpected": true}),
+                ))
+                .is_err(),
+                "accepted an unknown payload shape for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_event_revisions_ignore_replays_and_recover_from_gaps_or_corruption() {
+        let event = |revision, payload| Event::new(revision, EventKind::StateChanged, payload);
+
+        assert!(matches!(
+            classify_service_event(5, event(5, serde_json::json!({"state": State::default()}))),
+            ServiceEventAction::Ignore
+        ));
+        assert!(matches!(
+            classify_service_event(5, event(4, serde_json::json!({"state": State::default()}))),
+            ServiceEventAction::Ignore
+        ));
+        assert!(matches!(
+            classify_service_event(5, event(6, serde_json::json!({"state": State::default()}))),
+            ServiceEventAction::Apply { gap: false, .. }
+        ));
+        assert!(matches!(
+            classify_service_event(5, event(7, serde_json::json!({"state": State::default()}))),
+            ServiceEventAction::Apply { gap: true, .. }
+        ));
+        assert!(matches!(
+            classify_service_event(5, event(6, serde_json::Value::Null)),
+            ServiceEventAction::Recover(_)
+        ));
+        assert!(matches!(
+            classify_service_event(u64::MAX, event(u64::MAX, serde_json::Value::Null)),
+            ServiceEventAction::Ignore
+        ));
     }
 
     #[test]

@@ -135,7 +135,7 @@ impl StatusPolicy {
 }
 
 /// One poll's worth of signals about a single session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionSignals {
     /// Time since the session's last activity (`#{session_activity}`), or
     /// `None` when tmux did not report a usable timestamp.

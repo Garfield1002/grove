@@ -23,96 +23,99 @@ use grove_core::process::Invocation;
 use grove_core::protocol::{self, Request};
 use grove_core::reconcile::{ProjectRef, Reconciliation};
 use grove_core::removal::RemovalReport;
-use grove_core::state::{AgentRecord, State};
+use grove_core::state::State;
 use grove_core::status::SessionReport;
 use grove_core::tmux::WindowInfo;
-use grove_core::workflow::{self, Activation, NewWindow};
-use grove_core::{Error, Paths, TmuxServer, config, git, terminal, tmux};
+use grove_core::workflow::{Activation, NewWindow};
+use grove_core::{Error, Paths, TmuxServer, config, terminal};
 
 /// Work requested by the UI.
 #[derive(Debug)]
 pub enum Task {
+    /// Load the daemon-owned state used to bootstrap the GUI.
+    LoadState,
     /// Load `config.toml`, auto-detecting a terminal on first run.
     LoadConfig,
     /// Register the project containing this path.
-    OpenProject(PathBuf),
+    OpenProject {
+        path: PathBuf,
+        idempotency_key: String,
+    },
     /// Re-read a project's worktrees and sessions.
     RefreshProject {
         project_id: String,
-        repository_path: PathBuf,
-        git_common_dir: PathBuf,
     },
     /// Re-read the working-tree status of a project's worktrees. Queued
     /// after a refresh and after every git operation Grove performs.
     RefreshStatuses {
         project_id: String,
-        worktrees: Vec<Worktree>,
     },
     /// Re-read session presence only.
     RefreshSessions,
     /// Startup / refresh / restore reconciliation (ARCHITECTURE.md §7): diff
     /// Grove's index against `git worktree list` and `tmux list-sessions`.
     /// Marks; never deletes.
-    Reconcile { projects: Vec<ProjectRef> },
+    Reconcile {
+        projects: Vec<ProjectRef>,
+    },
     /// Open an existing session by name — how an orphaned session is looked at
     /// before the user decides what to do with it. Creates nothing.
     OpenSession {
         session: String,
-        /// Only used for the `{path}` template variable.
-        cwd: PathBuf,
+        idempotency_key: String,
     },
     /// Adopt an orphaned session as a worktree's session: rename and re-stamp
     /// its `@grove_*` options. Nothing is created or killed.
     AssociateSession {
-        project_name: String,
-        git_common_dir: PathBuf,
-        worktree: Box<Worktree>,
+        worktree_id: String,
         /// The orphan's current session name.
         session: String,
+        idempotency_key: String,
     },
     /// Close an orphaned session, after its own confirmation. This is the
     /// tmux-session operation of the four, and never accompanies another.
-    CloseOrphan { session: String },
+    CloseOrphan {
+        session: String,
+        idempotency_key: String,
+    },
     /// Unset `@grove_attention` on a session the user has just opened.
     ///
     /// The in-memory latch is cleared on the UI thread; this clears the
     /// durable half, which is what would otherwise re-raise attention on the
     /// next poll or after a restart.
-    ClearAttention { session: String },
+    ClearAttention {
+        worktree_id: String,
+        idempotency_key: String,
+    },
     /// Open a worktree: ensure the session, then switch or launch.
     Activate {
-        project_name: String,
-        git_common_dir: PathBuf,
-        worktree: Box<Worktree>,
+        worktree_id: String,
+        idempotency_key: String,
     },
     /// Open one window of a worktree's session: ensure the session, select the
     /// window, then switch or launch.
     ActivateWindow {
-        project_name: String,
-        git_common_dir: PathBuf,
-        worktree: Box<Worktree>,
+        worktree_id: String,
         window_index: u32,
+        idempotency_key: String,
     },
     /// Attach an additional terminal without retargeting the primary client.
     OpenInNewTerminal {
-        project_name: String,
-        git_common_dir: PathBuf,
-        worktree: Box<Worktree>,
+        worktree_id: String,
+        idempotency_key: String,
     },
     /// Open an extra shell window inside a worktree's tmux session.
     OpenNewWindow {
-        project_name: String,
-        git_common_dir: PathBuf,
-        worktree: Box<Worktree>,
+        worktree_id: String,
+        idempotency_key: String,
     },
     /// Start the configured agent in a worktree's `agent` window, either as a
     /// new conversation or resuming the one the agent last reported.
     StartAgent {
-        project_name: String,
-        git_common_dir: PathBuf,
-        worktree: Box<Worktree>,
+        worktree_id: String,
         /// The conversation to resume, when the user asked to resume one.
         resume: Option<String>,
+        idempotency_key: String,
     },
     /// Bring back the conversations `state.toml` recorded, once per launch,
     /// in worktrees where no agent is running any more (DESIGN.md §11).
@@ -121,8 +124,7 @@ pub enum Task {
     /// running, so it happens here rather than on the UI thread — over the
     /// reconciled project list the UI already holds.
     ResumeAgents {
-        projects: Vec<Project>,
-        records: Vec<AgentRecord>,
+        idempotency_key: String,
     },
     /// Install or remove Grove's hooks in Claude Code's `settings.json`, or
     /// just look at what is there. File work, so never the UI thread.
@@ -130,48 +132,64 @@ pub enum Task {
     /// Local and remote-tracking branches for the create-worktree dialog.
     LoadBaseRefs {
         project_id: String,
-        repository_path: PathBuf,
     },
     /// `git worktree add`, then refresh, then optionally open the session.
     CreateWorktree {
         project_id: String,
-        project_name: String,
-        repository_path: PathBuf,
-        git_common_dir: PathBuf,
         add: Box<WorktreeAdd>,
         open_after: bool,
+        idempotency_key: String,
     },
     /// Gather the safe-removal risk report. Reads only; removes nothing.
     GatherRemoval {
-        project_id: String,
-        worktree: Box<Worktree>,
+        worktree_id: String,
     },
     /// Close one tmux session on the private server.
-    CloseSession { project_id: String, session: String },
+    CloseSession {
+        project_id: String,
+        worktree_id: String,
+        idempotency_key: String,
+    },
     /// `git worktree remove`. `force` only ever arrives from a second,
     /// explicit confirmation after git refused.
     RemoveWorktree {
         project_id: String,
-        repository_path: PathBuf,
-        git_common_dir: PathBuf,
-        worktree_path: PathBuf,
+        worktree_id: String,
         force: bool,
+        idempotency_key: String,
     },
     /// `git branch -d`, or `-D` after a second explicit confirmation.
     DeleteBranch {
         project_id: String,
-        repository_path: PathBuf,
-        git_common_dir: PathBuf,
         branch: String,
         force: bool,
+        idempotency_key: String,
     },
     /// Kill the private tmux server, after its own armed confirmation in the
     /// footer — every Grove session, and everything running inside one, ends.
     /// Never part of ordinary shutdown (FR-7: sessions outlive the GUI); only
     /// this explicit user action sends it.
-    KillServer,
-    /// Persist the project index.
-    SaveState(Box<State>),
+    KillServer {
+        idempotency_key: String,
+    },
+    SetProjectExpanded {
+        project_id: String,
+        expanded: bool,
+    },
+    RemoveProject {
+        project_id: String,
+    },
+    AssignSlot {
+        number: u8,
+        worktree_id: String,
+    },
+    ClearSlot {
+        worktree_id: String,
+    },
+    IgnoreSession {
+        session: String,
+    },
+    ClearIgnoredSessions,
     /// Write the changed `config.toml` keys, then re-read the file.
     ///
     /// Surgical, key by key: the user's comments and formatting survive
@@ -247,6 +265,14 @@ impl ErrorReport {
 /// Results sent back to the UI.
 #[derive(Debug)]
 pub enum Message {
+    /// The authoritative daemon state used to bootstrap the GUI.
+    StateLoaded(Box<State>),
+    /// The authoritative state after one narrow mutation.
+    StateUpdated {
+        state: Box<State>,
+        status: String,
+        reconcile: bool,
+    },
     ConfigLoaded {
         loaded: Box<LoadedConfig>,
     },
@@ -475,17 +501,6 @@ impl WorkerState {
     fn enqueue(&self, task: Task) {
         let _ = self.tasks.send(task);
     }
-
-    /// Queue "re-read this project's worktrees, then their statuses". Run
-    /// after every git operation Grove performs, so the rows never show a
-    /// status that predates the operation.
-    fn queue_refresh(&self, project_id: &str, repository_path: &Path, git_common_dir: &Path) {
-        self.enqueue(Task::RefreshProject {
-            project_id: project_id.to_string(),
-            repository_path: repository_path.to_path_buf(),
-            git_common_dir: git_common_dir.to_path_buf(),
-        });
-    }
 }
 
 const SERVICE_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -547,14 +562,65 @@ fn service_error(method: &str, error: protocol::Error) -> Error {
     )
 }
 
-fn save_state_through_service(worker: &WorkerState, state: State) -> Result<(), Error> {
-    call_service(
+fn load_state_through_service(worker: &WorkerState) -> Result<State, Error> {
+    let value = call_service(
         worker,
-        "gui-state-replace",
-        "state.replace",
-        serde_json::json!({"state": state}),
-    )
-    .map(|_| ())
+        "gui-state-get",
+        "state.get",
+        serde_json::Value::Null,
+    )?;
+    serde_json::from_value(value).map_err(|error| {
+        Error::io(
+            "decode service state",
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })
+}
+
+fn apply_state_intent(
+    worker: &WorkerState,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<State, Error> {
+    let value = call_service(worker, "gui-state-intent", method, params)?;
+    value
+        .get("state")
+        .cloned()
+        .ok_or_else(|| {
+            Error::io(
+                "decode service mutation",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "service mutation response has no state",
+                ),
+            )
+        })
+        .and_then(|state| {
+            serde_json::from_value(state).map_err(|error| {
+                Error::io(
+                    "decode service mutation state",
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                )
+            })
+        })
+}
+
+fn state_intent_messages(
+    worker: &WorkerState,
+    method: &str,
+    params: serde_json::Value,
+    context: &str,
+    success: &str,
+    reconcile: bool,
+) -> Vec<Message> {
+    match apply_state_intent(worker, method, params) {
+        Ok(state) => vec![Message::StateUpdated {
+            state: Box::new(state),
+            status: success.to_string(),
+            reconcile,
+        }],
+        Err(error) => vec![Message::Failed(ErrorReport::new(context, &error))],
+    }
 }
 
 fn reconcile_through_service(
@@ -615,6 +681,13 @@ fn run(
 
 fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
     match task {
+        Task::LoadState => match load_state_through_service(worker) {
+            Ok(state) => vec![Message::StateLoaded(Box::new(state))],
+            Err(e) => vec![Message::Failed(ErrorReport::new(
+                "could not load daemon state",
+                &e,
+            ))],
+        },
         Task::LoadConfig => {
             // Generate tmux.conf on first run rather than waiting for the
             // first tmux command, so it is there to be edited straight away.
@@ -642,9 +715,32 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             messages
         }
 
-        Task::OpenProject(path) => {
-            match workflow::open_project(&worker.server, &worker.config, &path) {
-                Ok(project) => vec![Message::ProjectOpened(Box::new(project))],
+        Task::OpenProject {
+            path,
+            idempotency_key,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct OpenProjectResult {
+                project: Project,
+            }
+            match call_service(
+                worker,
+                "gui-project-open",
+                "project.open",
+                serde_json::json!({
+                    "path": path,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<OpenProjectResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode opened project",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![Message::ProjectOpened(Box::new(result.project))],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
                     &format!("could not open {}", path.display()),
                     &e,
@@ -652,69 +748,110 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             }
         }
 
-        Task::RefreshProject {
-            project_id,
-            repository_path,
-            git_common_dir,
-        } => match workflow::refresh_project(
-            &worker.server,
-            &repository_path,
-            &project_id,
-            &git_common_dir,
-        ) {
-            Ok(worktrees) => {
-                // Statuses are a second pass so the list appears immediately
-                // and the per-worktree `git status` calls never delay it.
-                worker.enqueue(Task::RefreshStatuses {
-                    project_id: project_id.clone(),
-                    worktrees: worktrees.clone(),
-                });
-                vec![Message::WorktreesRefreshed {
-                    project_id,
-                    worktrees,
-                }]
+        Task::RefreshProject { project_id } => {
+            #[derive(serde::Deserialize)]
+            struct RefreshProjectResult {
+                project_id: String,
+                worktrees: Vec<Worktree>,
+                statuses: HashMap<String, StatusSummary>,
             }
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                &format!("could not refresh {}", repository_path.display()),
-                &e,
-            ))],
-        },
+            match call_service(
+                worker,
+                "gui-project-refresh",
+                "project.refresh",
+                serde_json::json!({"project_id": project_id}),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<RefreshProjectResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode refreshed project",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![
+                    Message::WorktreesRefreshed {
+                        project_id: result.project_id.clone(),
+                        worktrees: result.worktrees,
+                    },
+                    Message::StatusesRefreshed {
+                        project_id: result.project_id,
+                        statuses: result.statuses,
+                    },
+                ],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not refresh project {project_id}"),
+                    &e,
+                ))],
+            }
+        }
 
-        Task::RefreshStatuses {
-            project_id,
-            worktrees,
-        } => vec![Message::StatusesRefreshed {
-            project_id,
-            statuses: workflow::worktree_statuses(&worktrees),
-        }],
+        Task::RefreshStatuses { project_id } => {
+            #[derive(serde::Deserialize)]
+            struct ProjectStatusesResult {
+                project_id: String,
+                statuses: HashMap<String, StatusSummary>,
+            }
+            match call_service(
+                worker,
+                "gui-project-statuses",
+                "project.statuses",
+                serde_json::json!({"project_id": project_id}),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<ProjectStatusesResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode project statuses",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![Message::StatusesRefreshed {
+                    project_id: result.project_id,
+                    statuses: result.statuses,
+                }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not refresh statuses for project {project_id}"),
+                    &e,
+                ))],
+            }
+        }
 
         Task::StartAgent {
-            project_name,
-            git_common_dir,
-            worktree,
+            worktree_id,
             resume,
+            idempotency_key,
         } => {
-            let worktree_id = worktree.id.clone();
-            let start = match &resume {
-                Some(id) => workflow::AgentStart::Resume(id),
-                None => workflow::AgentStart::Fresh,
-            };
-            match workflow::start_agent(
-                &worker.server,
-                &worker.config,
-                &worker.paths.runtime_dir,
-                &project_name,
-                &git_common_dir,
-                &worktree,
-                start,
-            ) {
-                Ok(launch) => {
+            #[derive(serde::Deserialize)]
+            struct StartResult {
+                unit: Option<String>,
+            }
+            let result = call_service(
+                worker,
+                "gui-start-agent",
+                "agent.start",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "resume": resume,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<StartResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode started agent",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            match result {
+                Ok(result) => {
                     // The new window is activity tmux reports at once; a poll
                     // now is what makes the row react immediately.
                     worker.enqueue(Task::RefreshSessions);
                     vec![Message::AgentStarted {
                         worktree_id,
-                        unit: launch.unit,
+                        unit: result.unit,
                     }]
                 }
                 Err(e) => vec![Message::Failed(ErrorReport::new(
@@ -724,47 +861,59 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             }
         }
 
-        Task::ResumeAgents { projects, records } => {
-            let signals =
-                match workflow::poll_session_signals(&worker.server, workflow::now_epoch()) {
-                    Ok(signals) => signals,
-                    // Without a poll there is no way to tell a dead agent from a
-                    // live one, and resuming beside a live one is the outcome
-                    // worth avoiding. So: report, resume nothing.
-                    Err(e) => {
-                        return vec![Message::Failed(ErrorReport::new(
-                            "could not read the tmux server, so no conversation was resumed",
-                            &e,
-                        ))];
-                    }
-                };
-            let policy = worker.config.status.policy();
-            let plans = workflow::agents_to_resume(&projects, &records, &signals, &policy);
-
-            let mut messages = Vec::new();
-            let mut worktree_ids = Vec::new();
-            for plan in plans {
-                // One failure is one conversation's failure: the rest are
-                // still worth bringing back.
-                match workflow::start_agent(
-                    &worker.server,
-                    &worker.config,
-                    &worker.paths.runtime_dir,
-                    &plan.project_name,
-                    &plan.git_common_dir,
-                    &plan.worktree,
-                    workflow::AgentStart::Resume(&plan.session_id),
-                ) {
-                    Ok(_) => worktree_ids.push(plan.worktree.id),
-                    Err(e) => messages.push(Message::Failed(ErrorReport::new(
+        Task::ResumeAgents { idempotency_key } => {
+            #[derive(serde::Deserialize)]
+            struct ResumeFailure {
+                worktree_path: PathBuf,
+                message: String,
+            }
+            #[derive(serde::Deserialize)]
+            struct ResumeResult {
+                worktree_ids: Vec<String>,
+                failures: Vec<ResumeFailure>,
+            }
+            let result = call_service(
+                worker,
+                "gui-resume-agents",
+                "agent.resume_recorded",
+                serde_json::json!({"idempotency_key": idempotency_key}),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<ResumeResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode resumed agents",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            let ResumeResult {
+                worktree_ids,
+                failures,
+            } = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    return vec![Message::Failed(ErrorReport::new(
+                        "could not resume recorded agents",
+                        &error,
+                    ))];
+                }
+            };
+            let mut messages = failures
+                .into_iter()
+                .map(|failure| {
+                    let error = Error::io(
+                        format!("resume the agent in {}", failure.worktree_path.display()),
+                        std::io::Error::other(failure.message),
+                    );
+                    Message::Failed(ErrorReport::new(
                         &format!(
                             "could not resume the agent in {}",
-                            plan.worktree.path.display()
+                            failure.worktree_path.display()
                         ),
-                        &e,
-                    ))),
-                }
-            }
+                        &error,
+                    ))
+                })
+                .collect::<Vec<_>>();
             if !worktree_ids.is_empty() {
                 worker.enqueue(Task::RefreshSessions);
             }
@@ -783,8 +932,19 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             ))],
         },
 
-        Task::ClearAttention { session } => {
-            match tmux::session::clear_attention(&worker.server, &session) {
+        Task::ClearAttention {
+            worktree_id,
+            idempotency_key,
+        } => {
+            match call_service(
+                worker,
+                "gui-clear-attention",
+                "session.attention.clear",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            ) {
                 // Nothing to report either way: the row already stopped
                 // showing attention when the latch was cleared.
                 Ok(_) => Vec::new(),
@@ -804,7 +964,6 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     if !project.worktrees.is_empty() {
                         worker.enqueue(Task::RefreshStatuses {
                             project_id: project.id.clone(),
-                            worktrees: project.worktrees.clone(),
                         });
                     }
                 }
@@ -819,9 +978,34 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             ))],
         },
 
-        Task::OpenSession { session, cwd } => {
-            match workflow::open_session(&worker.server, &worker.config, &session, &cwd) {
-                Ok(activation) => vec![Message::SessionOpened { activation }],
+        Task::OpenSession {
+            session,
+            idempotency_key,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct OpenOrphanResult {
+                activation: Activation,
+            }
+            match call_service(
+                worker,
+                "gui-open-orphan-session",
+                "session.orphan.open",
+                serde_json::json!({
+                    "session": session,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<OpenOrphanResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode opened orphan session",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![Message::SessionOpened {
+                    activation: result.activation,
+                }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
                     &format!("could not open {session}"),
                     &e,
@@ -830,30 +1014,55 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         }
 
         Task::AssociateSession {
-            project_name,
-            git_common_dir,
-            worktree,
+            worktree_id,
             session,
-        } => match workflow::associate_session(
-            &worker.server,
-            &project_name,
-            &git_common_dir,
-            &worktree,
-            &session,
+            idempotency_key,
+        } => match call_service(
+            worker,
+            "gui-associate-session",
+            "session.associate",
+            serde_json::json!({
+                "worktree_id": worktree_id,
+                "orphan_session": session,
+                "idempotency_key": idempotency_key,
+            }),
         ) {
-            Ok(name) => vec![Message::Associated {
-                worktree_id: worktree.id.clone(),
-                session: name,
-            }],
+            Ok(value) => match value.get("session").and_then(serde_json::Value::as_str) {
+                Some(name) => vec![Message::Associated {
+                    worktree_id,
+                    session: name.to_string(),
+                }],
+                None => vec![Message::Failed(ErrorReport::new(
+                    "could not decode associated session",
+                    &Error::io(
+                        "decode associated session",
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "service response has no session",
+                        ),
+                    ),
+                ))],
+            },
             Err(e) => vec![Message::Failed(ErrorReport::new(
-                &format!("could not associate {session} with {}", worktree.label()),
+                &format!("could not associate {session} with worktree {worktree_id}"),
                 &e,
             ))],
         },
 
-        Task::CloseOrphan { session } => {
-            match tmux::session::kill_session(&worker.server, &session) {
-                Ok(()) => vec![Message::OrphanClosed { session }],
+        Task::CloseOrphan {
+            session,
+            idempotency_key,
+        } => {
+            match call_service(
+                worker,
+                "gui-close-orphan",
+                "session.close",
+                serde_json::json!({
+                    "session": session,
+                    "idempotency_key": idempotency_key,
+                }),
+            ) {
+                Ok(_) => vec![Message::OrphanClosed { session }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
                     &format!("could not close {session}"),
                     &e,
@@ -861,8 +1070,13 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             }
         }
 
-        Task::KillServer => match worker.server.kill_server() {
-            Ok(()) => vec![Message::ServerKilled],
+        Task::KillServer { idempotency_key } => match call_service(
+            worker,
+            "gui-stop-server",
+            "server.stop",
+            serde_json::json!({"idempotency_key": idempotency_key}),
+        ) {
+            Ok(_) => vec![Message::ServerKilled],
             Err(e) => vec![Message::Failed(ErrorReport::new(
                 "could not kill the tmux server",
                 &e,
@@ -870,10 +1084,29 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         },
 
         Task::RefreshSessions => {
-            match workflow::session_presence(&worker.server)
-                .and_then(|presence| Ok((presence, workflow::session_windows(&worker.server)?)))
-            {
-                Ok((presence, windows)) => vec![Message::SessionsRefreshed { presence, windows }],
+            #[derive(serde::Deserialize)]
+            struct RefreshSessionsResult {
+                presence: HashMap<String, SessionPresence>,
+                windows: HashMap<String, Vec<WindowInfo>>,
+            }
+            match call_service(
+                worker,
+                "gui-session-refresh",
+                "session.refresh",
+                serde_json::Value::Null,
+            )
+            .and_then(|value| {
+                serde_json::from_value::<RefreshSessionsResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode refreshed sessions",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![Message::SessionsRefreshed {
+                    presence: result.presence,
+                    windows: result.windows,
+                }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
                     "could not list tmux sessions",
                     &e,
@@ -882,22 +1115,35 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         }
 
         Task::Activate {
-            project_name,
-            git_common_dir,
-            worktree,
+            worktree_id,
+            idempotency_key,
         } => {
-            let worktree_id = worktree.id.clone();
-            match workflow::activate_worktree(
-                &worker.server,
-                &worker.config,
-                &project_name,
-                &git_common_dir,
-                &worktree,
-            ) {
+            #[derive(serde::Deserialize)]
+            struct OpenResult {
+                activation: Activation,
+            }
+            let result = call_service(
+                worker,
+                "gui-open-session",
+                "session.open",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<OpenResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode opened session",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            match result {
                 Ok(activation) => {
                     let mut messages = vec![Message::Activated {
                         worktree_id,
-                        activation,
+                        activation: activation.activation,
                     }];
                     // Presence changed: the row must stop saying "no session".
                     messages.extend(handle(worker, Task::RefreshSessions));
@@ -905,7 +1151,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 }
                 Err(e) => {
                     let mut messages = vec![Message::Failed(ErrorReport::new(
-                        &format!("could not open {}", worktree.label()),
+                        &format!("could not open worktree {worktree_id}"),
                         &e,
                     ))];
                     // The session may have been created before the failure.
@@ -916,29 +1162,39 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         }
 
         Task::ActivateWindow {
-            project_name,
-            git_common_dir,
-            worktree,
+            worktree_id,
             window_index,
+            idempotency_key,
         } => {
-            let worktree_id = worktree.id.clone();
-            let mut messages = match workflow::activate_window(
-                &worker.server,
-                &worker.config,
-                &project_name,
-                &git_common_dir,
-                &worktree,
-                window_index,
-            ) {
-                Ok(activation) => vec![Message::Activated {
+            #[derive(serde::Deserialize)]
+            struct OpenWindowResult {
+                activation: Activation,
+            }
+            let result = call_service(
+                worker,
+                "gui-open-session-window",
+                "session.window.open",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "window_index": window_index,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<OpenWindowResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode opened session window",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            let mut messages = match result {
+                Ok(result) => vec![Message::Activated {
                     worktree_id,
-                    activation,
+                    activation: result.activation,
                 }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!(
-                        "could not open window {window_index} of {}",
-                        worktree.label()
-                    ),
+                    &format!("could not open window {window_index} of worktree {worktree_id}"),
                     &e,
                 ))],
             };
@@ -949,24 +1205,37 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         }
 
         Task::OpenInNewTerminal {
-            project_name,
-            git_common_dir,
-            worktree,
+            worktree_id,
+            idempotency_key,
         } => {
-            let worktree_id = worktree.id.clone();
-            let mut messages = match workflow::open_in_new_terminal(
-                &worker.server,
-                &worker.config,
-                &project_name,
-                &git_common_dir,
-                &worktree,
-            ) {
-                Ok(activation) => vec![Message::Activated {
+            #[derive(serde::Deserialize)]
+            struct OpenTerminalResult {
+                activation: Activation,
+            }
+            let result = call_service(
+                worker,
+                "gui-open-additional-terminal",
+                "session.terminal.open",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<OpenTerminalResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode additional terminal",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            let mut messages = match result {
+                Ok(result) => vec![Message::Activated {
                     worktree_id,
-                    activation,
+                    activation: result.activation,
                 }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open a terminal on {}", worktree.label()),
+                    &format!("could not open a terminal on worktree {worktree_id}"),
                     &e,
                 ))],
             };
@@ -975,23 +1244,37 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         }
 
         Task::OpenNewWindow {
-            project_name,
-            git_common_dir,
-            worktree,
+            worktree_id,
+            idempotency_key,
         } => {
-            let worktree_id = worktree.id.clone();
-            let mut messages = match workflow::open_new_window(
-                &worker.server,
-                &project_name,
-                &git_common_dir,
-                &worktree,
-            ) {
-                Ok(window) => vec![Message::WindowOpened {
+            #[derive(serde::Deserialize)]
+            struct CreateWindowResult {
+                window: NewWindow,
+            }
+            let result = call_service(
+                worker,
+                "gui-create-session-window",
+                "session.window.create",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<CreateWindowResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode created session window",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            let mut messages = match result {
+                Ok(result) => vec![Message::WindowOpened {
                     worktree_id,
-                    window,
+                    window: result.window,
                 }],
                 Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open a window on {}", worktree.label()),
+                    &format!("could not open a window on worktree {worktree_id}"),
                     &e,
                 ))],
             };
@@ -999,93 +1282,149 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             messages
         }
 
-        Task::LoadBaseRefs {
-            project_id,
-            repository_path,
-        } => match git::list_refs(&repository_path) {
-            Ok(refs) => vec![Message::BaseRefsLoaded {
-                project_id,
-                refs,
-                current: git::current_branch(&repository_path).unwrap_or(None),
-            }],
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                "could not list branches",
-                &e,
-            ))],
-        },
+        Task::LoadBaseRefs { project_id } => {
+            #[derive(serde::Deserialize)]
+            struct ProjectRefsResult {
+                project_id: String,
+                refs: Vec<RefEntry>,
+                current: Option<String>,
+            }
+            match call_service(
+                worker,
+                "gui-project-refs",
+                "project.refs",
+                serde_json::json!({"project_id": project_id}),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<ProjectRefsResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode project refs",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![Message::BaseRefsLoaded {
+                    project_id: result.project_id,
+                    refs: result.refs,
+                    current: result.current,
+                }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    "could not list branches",
+                    &e,
+                ))],
+            }
+        }
 
         Task::CreateWorktree {
             project_id,
-            project_name,
-            repository_path,
-            git_common_dir,
             add,
             open_after,
-        } => match workflow::create_worktree(&repository_path, &add) {
-            Ok(path) => {
-                let mut messages = vec![Message::WorktreeCreated {
-                    project_id: project_id.clone(),
-                    path: path.clone(),
-                }];
-                match workflow::refresh_project(
-                    &worker.server,
-                    &repository_path,
-                    &project_id,
-                    &git_common_dir,
-                ) {
-                    Ok(worktrees) => {
-                        worker.enqueue(Task::RefreshStatuses {
-                            project_id: project_id.clone(),
-                            worktrees: worktrees.clone(),
-                        });
-                        if open_after
-                            && let Some(worktree) = worktrees.iter().find(|w| w.path == path)
-                        {
-                            worker.enqueue(Task::Activate {
-                                project_name,
-                                git_common_dir,
-                                worktree: Box::new(worktree.clone()),
-                            });
-                        }
-                        messages.push(Message::WorktreesRefreshed {
-                            project_id,
-                            worktrees,
+            idempotency_key,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct CreateWorktreeResult {
+                path: PathBuf,
+                worktrees: Vec<Worktree>,
+            }
+            let result = call_service(
+                worker,
+                "gui-create-worktree",
+                "worktree.create",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "add": add,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<CreateWorktreeResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode created worktree",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            });
+            match result {
+                Ok(CreateWorktreeResult { path, worktrees }) => {
+                    let mut messages = vec![Message::WorktreeCreated {
+                        project_id: project_id.clone(),
+                        path: path.clone(),
+                    }];
+                    worker.enqueue(Task::RefreshStatuses {
+                        project_id: project_id.clone(),
+                    });
+                    if open_after && let Some(worktree) = worktrees.iter().find(|w| w.path == path)
+                    {
+                        worker.enqueue(Task::Activate {
+                            worktree_id: worktree.id.clone(),
+                            idempotency_key: format!("create-open-{}", grove_core::agent::nonce()),
                         });
                     }
-                    Err(e) => messages.push(Message::Failed(ErrorReport::new(
-                        "the worktree was created but the list could not be refreshed",
-                        &e,
-                    ))),
+                    messages.push(Message::WorktreesRefreshed {
+                        project_id,
+                        worktrees,
+                    });
+                    messages
                 }
-                messages
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    "could not create the worktree",
+                    &e,
+                ))],
             }
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                "could not create the worktree",
-                &e,
-            ))],
-        },
+        }
 
-        Task::GatherRemoval {
-            project_id,
-            worktree,
-        } => match workflow::removal_inputs(&worker.server, &worktree) {
-            Ok(inputs) => vec![Message::RemovalGathered {
-                project_id,
-                worktree_id: worktree.id.clone(),
-                report: Box::new(grove_core::removal::assemble(&inputs)),
-            }],
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                &format!("could not inspect {}", worktree.label()),
-                &e,
-            ))],
-        },
+        Task::GatherRemoval { worktree_id } => {
+            #[derive(serde::Deserialize)]
+            struct InspectRemovalResult {
+                project_id: String,
+                worktree_id: String,
+                report: RemovalReport,
+            }
+            match call_service(
+                worker,
+                "gui-removal-inspect",
+                "removal.inspect",
+                serde_json::json!({"worktree_id": worktree_id}),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<InspectRemovalResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode removal inspection",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => vec![Message::RemovalGathered {
+                    project_id: result.project_id,
+                    worktree_id: result.worktree_id,
+                    report: Box::new(result.report),
+                }],
+                Err(e) => vec![Message::Failed(ErrorReport::new(
+                    &format!("could not inspect worktree {worktree_id}"),
+                    &e,
+                ))],
+            }
+        }
 
         Task::CloseSession {
             project_id,
-            session,
-        } => match tmux::session::kill_session(&worker.server, &session) {
-            Ok(()) => {
+            worktree_id,
+            idempotency_key,
+        } => match call_service(
+            worker,
+            "gui-close-worktree-session",
+            "session.worktree.close",
+            serde_json::json!({
+                "worktree_id": worktree_id,
+                "idempotency_key": idempotency_key,
+            }),
+        ) {
+            Ok(value) => {
                 worker.enqueue(Task::RefreshSessions);
+                let session = value
+                    .get("session")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the worktree session");
                 vec![Message::RemovalDone {
                     project_id,
                     operation: RemovalOp::CloseSession,
@@ -1101,63 +1440,172 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
 
         Task::RemoveWorktree {
             project_id,
-            repository_path,
-            git_common_dir,
-            worktree_path,
+            worktree_id,
             force,
-        } => match git::worktree_remove(&repository_path, &worktree_path, force) {
-            Ok(()) => {
-                worker.queue_refresh(&project_id, &repository_path, &git_common_dir);
-                vec![Message::RemovalDone {
-                    project_id,
-                    operation: RemovalOp::RemoveWorktree,
-                    detail: format!(
-                        "Removed the worktree {}. The branch was not touched.",
-                        worktree_path.display()
-                    ),
-                }]
+            idempotency_key,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct RemoveWorktreeResult {
+                path: PathBuf,
+                worktrees: Vec<Worktree>,
             }
-            Err(e) => {
-                // Nothing was removed; the dialog shows git's own refusal and
-                // only then offers --force.
-                worker.queue_refresh(&project_id, &repository_path, &git_common_dir);
-                vec![Message::RemovalFailed {
-                    project_id,
-                    operation: RemovalOp::RemoveWorktree,
-                    report: ErrorReport::new("could not remove the worktree", &e),
-                }]
+            match call_service(
+                worker,
+                "gui-remove-worktree",
+                "worktree.remove",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "force": force,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<RemoveWorktreeResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode removed worktree",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => {
+                    worker.enqueue(Task::RefreshStatuses {
+                        project_id: project_id.clone(),
+                    });
+                    vec![
+                        Message::RemovalDone {
+                            project_id: project_id.clone(),
+                            operation: RemovalOp::RemoveWorktree,
+                            detail: format!(
+                                "Removed the worktree {}. The branch was not touched.",
+                                result.path.display()
+                            ),
+                        },
+                        Message::WorktreesRefreshed {
+                            project_id,
+                            worktrees: result.worktrees,
+                        },
+                    ]
+                }
+                Err(e) => {
+                    // Nothing was removed; the dialog shows git's own refusal and
+                    // only then offers --force.
+                    vec![Message::RemovalFailed {
+                        project_id,
+                        operation: RemovalOp::RemoveWorktree,
+                        report: ErrorReport::new("could not remove the worktree", &e),
+                    }]
+                }
             }
-        },
+        }
 
         Task::DeleteBranch {
             project_id,
-            repository_path,
-            git_common_dir,
             branch,
             force,
-        } => match git::branch_delete(&repository_path, &branch, force) {
-            Ok(()) => {
-                worker.queue_refresh(&project_id, &repository_path, &git_common_dir);
-                vec![Message::RemovalDone {
+            idempotency_key,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct DeleteBranchResult {
+                branch: String,
+                worktrees: Vec<Worktree>,
+            }
+            match call_service(
+                worker,
+                "gui-delete-branch",
+                "branch.delete",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "branch": branch,
+                    "force": force,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<DeleteBranchResult>(value).map_err(|error| {
+                    Error::io(
+                        "decode deleted branch",
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                    )
+                })
+            }) {
+                Ok(result) => {
+                    worker.enqueue(Task::RefreshStatuses {
+                        project_id: project_id.clone(),
+                    });
+                    vec![
+                        Message::RemovalDone {
+                            project_id: project_id.clone(),
+                            operation: RemovalOp::DeleteBranch,
+                            detail: format!("Deleted the branch {}.", result.branch),
+                        },
+                        Message::WorktreesRefreshed {
+                            project_id,
+                            worktrees: result.worktrees,
+                        },
+                    ]
+                }
+                Err(e) => vec![Message::RemovalFailed {
                     project_id,
                     operation: RemovalOp::DeleteBranch,
-                    detail: format!("Deleted the branch {branch}."),
-                }]
+                    report: ErrorReport::new(&format!("could not delete {branch}"), &e),
+                }],
             }
-            Err(e) => vec![Message::RemovalFailed {
-                project_id,
-                operation: RemovalOp::DeleteBranch,
-                report: ErrorReport::new(&format!("could not delete {branch}"), &e),
-            }],
-        },
+        }
 
-        Task::SaveState(state) => match save_state_through_service(worker, *state) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                "could not save state.toml",
-                &e,
-            ))],
-        },
+        Task::SetProjectExpanded {
+            project_id,
+            expanded,
+        } => state_intent_messages(
+            worker,
+            "project.expanded.set",
+            serde_json::json!({"project_id": project_id, "expanded": expanded}),
+            "could not update project visibility",
+            "Updated project visibility.",
+            false,
+        ),
+        Task::RemoveProject { project_id } => state_intent_messages(
+            worker,
+            "project.remove",
+            serde_json::json!({"project_id": project_id}),
+            "could not remove the project from Grove",
+            "Removed from Grove. The repository is untouched.",
+            false,
+        ),
+        Task::AssignSlot {
+            number,
+            worktree_id,
+        } => state_intent_messages(
+            worker,
+            "slot.assign",
+            serde_json::json!({"number": number, "worktree_id": worktree_id}),
+            "could not assign the worktree number",
+            &format!("`grove toggle {number}` now opens this worktree."),
+            false,
+        ),
+        Task::ClearSlot { worktree_id } => state_intent_messages(
+            worker,
+            "slot.clear",
+            serde_json::json!({"worktree_id": worktree_id}),
+            "could not clear the worktree number",
+            "Took the number off this worktree.",
+            false,
+        ),
+        Task::IgnoreSession { session } => state_intent_messages(
+            worker,
+            "session.ignore",
+            serde_json::json!({"session": session}),
+            "could not ignore the session",
+            "Ignored the session. It is still running.",
+            true,
+        ),
+        Task::ClearIgnoredSessions => state_intent_messages(
+            worker,
+            "session.ignored.clear",
+            serde_json::Value::Null,
+            "could not restore ignored sessions",
+            "Restored ignored sessions to the reconciliation list.",
+            true,
+        ),
 
         Task::SaveConfig(edits) => {
             let path = worker.paths.config_file();
@@ -1253,6 +1701,8 @@ fn pick_directory(_start: Option<&Path>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use grove_core::error::CommandFailure;
+    use grove_core::protocol::Response;
+    use std::os::unix::net::UnixListener;
 
     /// A worker bound to a throwaway config directory. Nothing here starts a
     /// tmux server: the tasks under test only touch files.
@@ -1282,26 +1732,1165 @@ command = \"foot tmux -S {socket} attach-session -t {session}\"
 default_parent = \"/home/u/trees\"
 ";
 
-    /// The footer's kill control against a socket with no server behind it:
-    /// tmux answers "no server running", which is exactly the state the user
-    /// asked for, so the worker still reports `ServerKilled` and Grove quits.
+    /// The footer confirmation sends only an idempotency key. The daemon owns
+    /// the private tmux server and tells the GUI when shutdown has completed.
     #[test]
-    fn killing_an_absent_server_still_reports_server_killed() {
-        if std::process::Command::new(grove_core::tmux::server::TMUX)
-            .arg("-V")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: tmux is not installed");
-            return;
-        }
+    fn confirmed_server_shutdown_uses_only_the_daemon_result() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut worker = worker(tmp.path());
-        std::fs::create_dir_all(&worker.paths.config_dir).expect("mkdir config");
-        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("mkdir runtime");
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept server stop");
+            let request = protocol::read_request(&mut stream).expect("server stop request");
+            assert_eq!(request.method, "server.stop");
+            assert_eq!(request.params["idempotency_key"], "stop-test");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(&request.id, serde_json::json!({"stopped": true})),
+            )
+            .expect("server stop response");
+        });
 
-        let messages = handle(&mut worker, Task::KillServer);
+        let messages = handle(
+            &mut worker,
+            Task::KillServer {
+                idempotency_key: "stop-test".into(),
+            },
+        );
+        service.join().expect("service thread");
         assert!(matches!(messages.as_slice(), [Message::ServerKilled]));
+    }
+
+    #[test]
+    fn project_registration_uses_only_the_daemon_result() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let project_path = tmp.path().join("repository");
+        let response_path = project_path.clone();
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept project open");
+            let request = protocol::read_request(&mut stream).expect("project open request");
+            assert_eq!(request.method, "project.open");
+            assert_eq!(request.params["path"].as_str(), response_path.to_str());
+            assert_eq!(request.params["idempotency_key"], "open-test");
+            assert!(request.params.get("repository_path").is_none());
+            assert!(request.params.get("git_common_dir").is_none());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "changed": true,
+                        "project": {
+                            "id": "project-1",
+                            "name": "Grove",
+                            "repository_path": response_path,
+                            "git_common_dir": response_path.join(".git"),
+                            "default_worktree_path": response_path,
+                            "is_expanded": true,
+                            "worktrees": [],
+                            "unavailable": null,
+                        },
+                        "state": {},
+                    }),
+                ),
+            )
+            .expect("project open response");
+
+            let (mut stream, _) = listener.accept().expect("accept malformed project open");
+            let request =
+                protocol::read_request(&mut stream).expect("malformed project open request");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(&request.id, serde_json::json!({"changed": false})),
+            )
+            .expect("malformed project open response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::OpenProject {
+                path: project_path,
+                idempotency_key: "open-test".into(),
+            },
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::ProjectOpened(project)] if project.id == "project-1"
+        ));
+        let messages = handle(
+            &mut worker,
+            Task::OpenProject {
+                path: tmp.path().join("another-repository"),
+                idempotency_key: "open-malformed".into(),
+            },
+        );
+        assert!(matches!(messages.as_slice(), [Message::Failed(_)]));
+        service.join().expect("service thread");
+    }
+
+    #[test]
+    fn index_changes_use_dedicated_daemon_intents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let expected = [
+            (
+                "project.expanded.set",
+                serde_json::json!({"project_id": "project-1", "expanded": false}),
+            ),
+            (
+                "project.remove",
+                serde_json::json!({"project_id": "project-1"}),
+            ),
+            (
+                "slot.assign",
+                serde_json::json!({"number": 2, "worktree_id": "abc123"}),
+            ),
+            ("slot.clear", serde_json::json!({"worktree_id": "abc123"})),
+            ("session.ignore", serde_json::json!({"session": "scratch"})),
+            ("session.ignored.clear", serde_json::Value::Null),
+        ];
+        let service = std::thread::spawn(move || {
+            for (method, params) in expected {
+                let (mut stream, _) = listener.accept().expect("accept state intent");
+                let request = protocol::read_request(&mut stream).expect("state intent request");
+                assert_eq!(request.method, method);
+                assert_eq!(request.params, params);
+                assert_ne!(request.method, "state.mutate");
+                protocol::write_response(
+                    &mut stream,
+                    &Response::success(
+                        &request.id,
+                        serde_json::json!({"changed": true, "state": {}}),
+                    ),
+                )
+                .expect("state intent response");
+            }
+        });
+
+        for task in [
+            Task::SetProjectExpanded {
+                project_id: "project-1".into(),
+                expanded: false,
+            },
+            Task::RemoveProject {
+                project_id: "project-1".into(),
+            },
+            Task::AssignSlot {
+                number: 2,
+                worktree_id: "abc123".into(),
+            },
+            Task::ClearSlot {
+                worktree_id: "abc123".into(),
+            },
+            Task::IgnoreSession {
+                session: "scratch".into(),
+            },
+            Task::ClearIgnoredSessions,
+        ] {
+            assert!(matches!(
+                handle(&mut worker, task).as_slice(),
+                [Message::StateUpdated { .. }]
+            ));
+        }
+        service.join().expect("service thread");
+    }
+
+    #[test]
+    fn project_refresh_uses_only_daemon_owned_repository_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept project refresh");
+            let request = protocol::read_request(&mut stream).expect("project refresh request");
+            assert_eq!(request.method, "project.refresh");
+            assert_eq!(request.params["project_id"], "project-1");
+            assert_eq!(
+                request.params.as_object().map(serde_json::Map::len),
+                Some(1)
+            );
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "worktrees": [],
+                        "statuses": {},
+                    }),
+                ),
+            )
+            .expect("project refresh response");
+
+            let (mut stream, _) = listener.accept().expect("accept malformed refresh");
+            let request = protocol::read_request(&mut stream).expect("malformed refresh request");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(&request.id, serde_json::json!({"project_id": "project-1"})),
+            )
+            .expect("malformed refresh response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::RefreshProject {
+                project_id: "project-1".into(),
+            },
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                Message::WorktreesRefreshed { project_id, .. },
+                Message::StatusesRefreshed {
+                    project_id: statuses_id,
+                    ..
+                }
+            ] if project_id == "project-1" && statuses_id == "project-1"
+        ));
+        let messages = handle(
+            &mut worker,
+            Task::RefreshProject {
+                project_id: "project-1".into(),
+            },
+        );
+        assert!(matches!(messages.as_slice(), [Message::Failed(_)]));
+        service.join().expect("service thread");
+    }
+
+    #[test]
+    fn status_refresh_uses_only_the_daemon_project_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept status refresh");
+            let request = protocol::read_request(&mut stream).expect("status refresh request");
+            assert_eq!(request.method, "project.statuses");
+            assert_eq!(
+                request.params,
+                serde_json::json!({"project_id": "project-1"})
+            );
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "statuses": {},
+                    }),
+                ),
+            )
+            .expect("status refresh response");
+
+            let (mut stream, _) = listener.accept().expect("accept malformed statuses");
+            let request = protocol::read_request(&mut stream).expect("malformed statuses request");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(&request.id, serde_json::json!({"project_id": "project-1"})),
+            )
+            .expect("malformed statuses response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::RefreshStatuses {
+                project_id: "project-1".into(),
+            },
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::StatusesRefreshed { project_id, .. }] if project_id == "project-1"
+        ));
+        let messages = handle(
+            &mut worker,
+            Task::RefreshStatuses {
+                project_id: "project-1".into(),
+            },
+        );
+        assert!(matches!(messages.as_slice(), [Message::Failed(_)]));
+        service.join().expect("service thread");
+    }
+
+    #[test]
+    fn session_refresh_uses_only_the_daemon_observation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept session refresh");
+            let request = protocol::read_request(&mut stream).expect("session refresh request");
+            assert_eq!(request.method, "session.refresh");
+            assert!(request.params.is_null());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({"presence": {}, "windows": {}}),
+                ),
+            )
+            .expect("session refresh response");
+
+            let (mut stream, _) = listener.accept().expect("accept malformed sessions");
+            let request = protocol::read_request(&mut stream).expect("malformed sessions request");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(&request.id, serde_json::json!({"presence": {}})),
+            )
+            .expect("malformed sessions response");
+        });
+
+        let messages = handle(&mut worker, Task::RefreshSessions);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::SessionsRefreshed { presence, windows }]
+                if presence.is_empty() && windows.is_empty()
+        ));
+        let messages = handle(&mut worker, Task::RefreshSessions);
+        assert!(matches!(messages.as_slice(), [Message::Failed(_)]));
+        service.join().expect("service thread");
+    }
+
+    #[test]
+    fn branch_refs_use_only_the_daemon_project_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept refs");
+            let request = protocol::read_request(&mut stream).expect("refs request");
+            assert_eq!(request.method, "project.refs");
+            assert_eq!(
+                request.params,
+                serde_json::json!({"project_id": "project-1"})
+            );
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "refs": [{"name": "main", "is_remote": false}],
+                        "current": "main",
+                    }),
+                ),
+            )
+            .expect("refs response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::LoadBaseRefs {
+                project_id: "project-1".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::BaseRefsLoaded {
+                project_id,
+                refs,
+                current: Some(current),
+            }] if project_id == "project-1" && refs[0].name == "main" && current == "main"
+        ));
+    }
+
+    #[test]
+    fn removal_inspection_uses_only_the_daemon_worktree_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept inspection");
+            let request = protocol::read_request(&mut stream).expect("inspection request");
+            assert_eq!(request.method, "removal.inspect");
+            assert_eq!(request.params, serde_json::json!({"worktree_id": "abc123"}));
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "worktree_id": "abc123",
+                        "report": {
+                            "worktree_path": "/repo",
+                            "branch": "main",
+                            "findings": [],
+                            "can_remove_worktree": false,
+                            "can_delete_branch": true,
+                            "can_close_session": false,
+                            "loses_work": false,
+                        },
+                    }),
+                ),
+            )
+            .expect("inspection response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::GatherRemoval {
+                worktree_id: "abc123".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::RemovalGathered {
+                project_id,
+                worktree_id,
+                ..
+            }] if project_id == "project-1" && worktree_id == "abc123"
+        ));
+    }
+
+    #[test]
+    fn worktree_creation_sends_only_project_identity_and_intent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let created = tmp.path().join("created");
+        let response_path = created.clone();
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept create");
+            let request = protocol::read_request(&mut stream).expect("create request");
+            assert_eq!(request.method, "worktree.create");
+            assert_eq!(request.params["project_id"], "project-1");
+            assert_eq!(request.params["add"]["new_branch"], "feature");
+            assert_eq!(request.params["idempotency_key"], "create-test");
+            assert!(request.params.get("repository_path").is_none());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "path": response_path,
+                        "worktrees": [],
+                    }),
+                ),
+            )
+            .expect("create response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::CreateWorktree {
+                project_id: "project-1".into(),
+                add: Box::new(WorktreeAdd {
+                    path: created.clone(),
+                    new_branch: Some("feature".into()),
+                    base_ref: None,
+                }),
+                open_after: false,
+                idempotency_key: "create-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.first(),
+            Some(Message::WorktreeCreated { project_id, path })
+                if project_id == "project-1" && path == &created
+        ));
+    }
+
+    #[test]
+    fn worktree_removal_sends_only_live_identity_and_confirmation_level() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let removed = tmp.path().join("removed");
+        let response_path = removed.clone();
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept remove");
+            let request = protocol::read_request(&mut stream).expect("remove request");
+            assert_eq!(request.method, "worktree.remove");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["force"], true);
+            assert_eq!(request.params["idempotency_key"], "remove-test");
+            assert!(request.params.get("repository_path").is_none());
+            assert!(request.params.get("worktree_path").is_none());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "worktree_id": "abc123",
+                        "path": response_path,
+                        "worktrees": [],
+                    }),
+                ),
+            )
+            .expect("remove response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::RemoveWorktree {
+                project_id: "project-1".into(),
+                worktree_id: "abc123".into(),
+                force: true,
+                idempotency_key: "remove-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.first(),
+            Some(Message::RemovalDone {
+                operation: RemovalOp::RemoveWorktree,
+                detail,
+                ..
+            }) if detail.contains(&removed.display().to_string())
+        ));
+    }
+
+    #[test]
+    fn branch_deletion_sends_only_project_identity_and_confirmation_level() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept branch delete");
+            let request = protocol::read_request(&mut stream).expect("branch delete request");
+            assert_eq!(request.method, "branch.delete");
+            assert_eq!(request.params["project_id"], "project-1");
+            assert_eq!(request.params["branch"], "feature");
+            assert_eq!(request.params["force"], true);
+            assert_eq!(request.params["idempotency_key"], "delete-test");
+            assert!(request.params.get("repository_path").is_none());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "project_id": "project-1",
+                        "branch": "feature",
+                        "worktrees": [],
+                    }),
+                ),
+            )
+            .expect("delete response");
+
+            let (mut malformed_stream, _) = listener.accept().expect("accept malformed delete");
+            let malformed_request =
+                protocol::read_request(&mut malformed_stream).expect("malformed delete request");
+            protocol::write_response(
+                &mut malformed_stream,
+                &Response::success(
+                    &malformed_request.id,
+                    serde_json::json!({"branch": "feature"}),
+                ),
+            )
+            .expect("malformed delete response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::DeleteBranch {
+                project_id: "project-1".into(),
+                branch: "feature".into(),
+                force: true,
+                idempotency_key: "delete-test".into(),
+            },
+        );
+        assert!(matches!(
+            messages.first(),
+            Some(Message::RemovalDone {
+                operation: RemovalOp::DeleteBranch,
+                detail,
+                ..
+            }) if detail.contains("feature")
+        ));
+
+        let malformed = handle(
+            &mut worker,
+            Task::DeleteBranch {
+                project_id: "project-1".into(),
+                branch: "feature".into(),
+                force: false,
+                idempotency_key: "delete-malformed".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            malformed.as_slice(),
+            [Message::RemovalFailed {
+                operation: RemovalOp::DeleteBranch,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn recorded_agent_resumption_uses_only_the_daemon_result() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept resume request");
+            let request = protocol::read_request(&mut stream).expect("resume request");
+            assert_eq!(request.method, "agent.resume_recorded");
+            assert_eq!(request.params["idempotency_key"], "launch-test");
+            let response = Response::success(
+                &request.id,
+                serde_json::json!({
+                    "worktree_ids": ["abc123"],
+                    "failures": [{
+                        "worktree_path": "/work/failed",
+                        "message": "agent executable disappeared",
+                    }],
+                }),
+            );
+            protocol::write_response(&mut stream, &response).expect("resume response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::ResumeAgents {
+                idempotency_key: "launch-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(messages.first(), Some(Message::Failed(_))));
+        assert!(matches!(
+            messages.last(),
+            Some(Message::AgentsResumed { worktree_ids })
+                if worktree_ids == &["abc123".to_string()]
+        ));
+    }
+
+    #[test]
+    fn explicit_agent_start_sends_the_complete_intent_to_the_daemon() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept agent start");
+            let request = protocol::read_request(&mut stream).expect("agent start request");
+            assert_eq!(request.method, "agent.start");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["resume"], "conversation-7");
+            assert_eq!(request.params["idempotency_key"], "start-test");
+            let response = Response::success(
+                &request.id,
+                serde_json::json!({
+                    "worktree_id": "abc123",
+                    "session": "wt-abc123",
+                    "unit": "grove-agent-abc123.scope",
+                }),
+            );
+            protocol::write_response(&mut stream, &response).expect("agent start response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::StartAgent {
+                worktree_id: "abc123".into(),
+                resume: Some("conversation-7".into()),
+                idempotency_key: "start-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::AgentStarted { worktree_id, unit }]
+                if worktree_id == "abc123"
+                    && unit.as_deref() == Some("grove-agent-abc123.scope")
+        ));
+    }
+
+    #[test]
+    fn worktree_activation_uses_only_the_daemon_result() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept session open");
+            let request = protocol::read_request(&mut stream).expect("session open request");
+            assert_eq!(request.method, "session.open");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["idempotency_key"], "open-test");
+            let response = Response::success(
+                &request.id,
+                serde_json::json!({
+                    "worktree_id": "abc123",
+                    "session": "wt-abc123",
+                    "activation": {
+                        "kind": "switched_client",
+                        "session": "wt-abc123",
+                        "client_tty": "/dev/pts/7",
+                    },
+                }),
+            );
+            protocol::write_response(&mut stream, &response).expect("session open response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::Activate {
+                worktree_id: "abc123".into(),
+                idempotency_key: "open-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.first(),
+            Some(Message::Activated {
+                worktree_id,
+                activation: Activation::SwitchedClient {
+                    session,
+                    client_tty,
+                },
+            }) if worktree_id == "abc123"
+                && session == "wt-abc123"
+                && client_tty == "/dev/pts/7"
+        ));
+    }
+
+    #[test]
+    fn window_activation_uses_only_the_daemon_result() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept window open");
+            let request = protocol::read_request(&mut stream).expect("window open request");
+            assert_eq!(request.method, "session.window.open");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["window_index"], 7);
+            assert_eq!(request.params["idempotency_key"], "window-test");
+            let response = Response::success(
+                &request.id,
+                serde_json::json!({
+                    "worktree_id": "abc123",
+                    "session": "wt-abc123",
+                    "window_index": 7,
+                    "activation": {
+                        "kind": "launched_terminal",
+                        "session": "wt-abc123",
+                        "command": "foot tmux attach",
+                    },
+                }),
+            );
+            protocol::write_response(&mut stream, &response).expect("window open response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::ActivateWindow {
+                worktree_id: "abc123".into(),
+                window_index: 7,
+                idempotency_key: "window-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.first(),
+            Some(Message::Activated {
+                worktree_id,
+                activation: Activation::LaunchedTerminal { session, command },
+            }) if worktree_id == "abc123"
+                && session == "wt-abc123"
+                && command == "foot tmux attach"
+        ));
+    }
+
+    #[test]
+    fn terminal_and_window_creation_use_only_daemon_results() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut terminal_stream, _) = listener.accept().expect("accept terminal open");
+            let terminal_request =
+                protocol::read_request(&mut terminal_stream).expect("terminal request");
+            assert_eq!(terminal_request.method, "session.terminal.open");
+            assert_eq!(terminal_request.params["worktree_id"], "abc123");
+            assert_eq!(terminal_request.params["idempotency_key"], "terminal-test");
+            protocol::write_response(
+                &mut terminal_stream,
+                &Response::success(
+                    &terminal_request.id,
+                    serde_json::json!({
+                        "worktree_id": "abc123",
+                        "session": "wt-abc123",
+                        "activation": {
+                            "kind": "launched_terminal",
+                            "session": "wt-abc123",
+                            "command": "foot tmux attach",
+                        },
+                    }),
+                ),
+            )
+            .expect("terminal response");
+
+            let (mut refresh_stream, _) = listener.accept().expect("accept session refresh");
+            let refresh_request =
+                protocol::read_request(&mut refresh_stream).expect("refresh request");
+            assert_eq!(refresh_request.method, "session.refresh");
+            protocol::write_response(
+                &mut refresh_stream,
+                &Response::success(
+                    &refresh_request.id,
+                    serde_json::json!({"presence": {}, "windows": {}}),
+                ),
+            )
+            .expect("refresh response");
+
+            let (mut window_stream, _) = listener.accept().expect("accept window create");
+            let window_request =
+                protocol::read_request(&mut window_stream).expect("window request");
+            assert_eq!(window_request.method, "session.window.create");
+            assert_eq!(window_request.params["worktree_id"], "abc123");
+            assert_eq!(window_request.params["idempotency_key"], "create-test");
+            protocol::write_response(
+                &mut window_stream,
+                &Response::success(
+                    &window_request.id,
+                    serde_json::json!({
+                        "worktree_id": "abc123",
+                        "session": "wt-abc123",
+                        "window": {
+                            "session": "wt-abc123",
+                            "window": "3",
+                        },
+                    }),
+                ),
+            )
+            .expect("window response");
+
+            let (mut refresh_stream, _) = listener.accept().expect("accept session refresh");
+            let refresh_request =
+                protocol::read_request(&mut refresh_stream).expect("refresh request");
+            assert_eq!(refresh_request.method, "session.refresh");
+            protocol::write_response(
+                &mut refresh_stream,
+                &Response::success(
+                    &refresh_request.id,
+                    serde_json::json!({"presence": {}, "windows": {}}),
+                ),
+            )
+            .expect("refresh response");
+        });
+
+        let terminal_messages = handle(
+            &mut worker,
+            Task::OpenInNewTerminal {
+                worktree_id: "abc123".into(),
+                idempotency_key: "terminal-test".into(),
+            },
+        );
+        assert!(matches!(
+            terminal_messages.first(),
+            Some(Message::Activated {
+                activation: Activation::LaunchedTerminal { .. },
+                ..
+            })
+        ));
+
+        let window_messages = handle(
+            &mut worker,
+            Task::OpenNewWindow {
+                worktree_id: "abc123".into(),
+                idempotency_key: "create-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            window_messages.first(),
+            Some(Message::WindowOpened { worktree_id, window })
+                if worktree_id == "abc123"
+                    && window.session == "wt-abc123"
+                    && window.window == "3"
+        ));
+    }
+
+    #[test]
+    fn clearing_attention_uses_worktree_identity_through_the_daemon() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept attention clear");
+            let request = protocol::read_request(&mut stream).expect("attention clear request");
+            assert_eq!(request.method, "session.attention.clear");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["idempotency_key"], "attention-test");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "worktree_id": "abc123",
+                        "session": "wt-abc123",
+                        "cleared": true,
+                    }),
+                ),
+            )
+            .expect("attention clear response");
+
+            let (mut failed_stream, _) = listener.accept().expect("accept failed clear");
+            let failed_request =
+                protocol::read_request(&mut failed_stream).expect("failed clear request");
+            protocol::write_response(
+                &mut failed_stream,
+                &Response::error(
+                    &failed_request.id,
+                    "control_failed",
+                    "tmux rejected the mutation",
+                ),
+            )
+            .expect("failed clear response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::ClearAttention {
+                worktree_id: "abc123".into(),
+                idempotency_key: "attention-test".into(),
+            },
+        );
+        assert!(messages.is_empty());
+
+        let failed = handle(
+            &mut worker,
+            Task::ClearAttention {
+                worktree_id: "abc123".into(),
+                idempotency_key: "attention-failure".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(failed.as_slice(), [Message::Failed(_)]));
+    }
+
+    #[test]
+    fn orphan_association_uses_worktree_identity_through_the_daemon() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept association");
+            let request = protocol::read_request(&mut stream).expect("association request");
+            assert_eq!(request.method, "session.associate");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["orphan_session"], "scratch");
+            assert_eq!(request.params["idempotency_key"], "associate-test");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "worktree_id": "abc123",
+                        "session": "wt-abc123",
+                    }),
+                ),
+            )
+            .expect("association response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::AssociateSession {
+                worktree_id: "abc123".into(),
+                session: "scratch".into(),
+                idempotency_key: "associate-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::Associated {
+                worktree_id,
+                session,
+            }] if worktree_id == "abc123" && session == "wt-abc123"
+        ));
+    }
+
+    #[test]
+    fn confirmed_orphan_closure_uses_the_daemon_and_surfaces_rejection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept close");
+            let request = protocol::read_request(&mut stream).expect("close request");
+            assert_eq!(request.method, "session.close");
+            assert_eq!(request.params["session"], "scratch");
+            assert_eq!(request.params["idempotency_key"], "close-test");
+            protocol::write_response(
+                &mut stream,
+                &Response::success(&request.id, serde_json::json!({"session": "scratch"})),
+            )
+            .expect("close response");
+
+            let (mut failed_stream, _) = listener.accept().expect("accept failed close");
+            let failed_request =
+                protocol::read_request(&mut failed_stream).expect("failed close request");
+            protocol::write_response(
+                &mut failed_stream,
+                &Response::error(&failed_request.id, "control_failed", "session is busy"),
+            )
+            .expect("failed close response");
+        });
+
+        let closed = handle(
+            &mut worker,
+            Task::CloseOrphan {
+                session: "scratch".into(),
+                idempotency_key: "close-test".into(),
+            },
+        );
+        assert!(matches!(
+            closed.as_slice(),
+            [Message::OrphanClosed { session }] if session == "scratch"
+        ));
+
+        let failed = handle(
+            &mut worker,
+            Task::CloseOrphan {
+                session: "busy".into(),
+                idempotency_key: "close-failure".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(failed.as_slice(), [Message::Failed(_)]));
+    }
+
+    #[test]
+    fn confirmed_worktree_session_closure_uses_daemon_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept worktree close");
+            let request = protocol::read_request(&mut stream).expect("worktree close request");
+            assert_eq!(request.method, "session.worktree.close");
+            assert_eq!(request.params["worktree_id"], "abc123");
+            assert_eq!(request.params["idempotency_key"], "worktree-close-test");
+            assert!(request.params.get("session").is_none());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "worktree_id": "abc123",
+                        "session": "wt-abc123",
+                    }),
+                ),
+            )
+            .expect("worktree close response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::CloseSession {
+                project_id: "project-1".into(),
+                worktree_id: "abc123".into(),
+                idempotency_key: "worktree-close-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::RemovalDone {
+                project_id,
+                operation: RemovalOp::CloseSession,
+                detail,
+            }] if project_id == "project-1" && detail.contains("wt-abc123")
+        ));
+    }
+
+    #[test]
+    fn opening_an_orphan_uses_daemon_session_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut worker = worker(tmp.path());
+        std::fs::create_dir_all(&worker.paths.runtime_dir).expect("runtime directory");
+        let listener =
+            UnixListener::bind(worker.paths.notify_socket()).expect("bind service socket");
+        let service = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept orphan open");
+            let request = protocol::read_request(&mut stream).expect("orphan open request");
+            assert_eq!(request.method, "session.orphan.open");
+            assert_eq!(request.params["session"], "scratch");
+            assert_eq!(request.params["idempotency_key"], "orphan-open-test");
+            assert!(request.params.get("cwd").is_none());
+            protocol::write_response(
+                &mut stream,
+                &Response::success(
+                    &request.id,
+                    serde_json::json!({
+                        "session": "scratch",
+                        "activation": {
+                            "kind": "switched_client",
+                            "session": "scratch",
+                            "client_tty": "/dev/pts/9",
+                        },
+                    }),
+                ),
+            )
+            .expect("orphan open response");
+        });
+
+        let messages = handle(
+            &mut worker,
+            Task::OpenSession {
+                session: "scratch".into(),
+                idempotency_key: "orphan-open-test".into(),
+            },
+        );
+        service.join().expect("service thread");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::SessionOpened {
+                activation: Activation::SwitchedClient {
+                    session,
+                    client_tty,
+                },
+            }] if session == "scratch" && client_tty == "/dev/pts/9"
+        ));
     }
 
     /// The whole save path the Settings pane uses: surgical edit, atomic

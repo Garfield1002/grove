@@ -1021,10 +1021,9 @@ fn killing_a_session_that_is_already_gone_is_not_an_error() {
     let (name, _) =
         tmux::ensure_session(&test.server, &spec_for(&worktree, "acme-web")).expect("creates");
     tmux::kill_session(&test.server, &name).expect("kills it");
-    // The session is gone but the server may still be up; a second kill of a
-    // missing session must still surface as git/tmux's own error, not a panic.
-    let second = tmux::kill_session(&test.server, &name);
-    assert!(second.is_ok() || second.is_err());
+    // The session is gone but the server may still be up. Retrying a confirmed
+    // close must be idempotent so recovery after a lost response can finish.
+    tmux::kill_session(&test.server, &name).expect("a repeated close is idempotent");
 }
 
 #[test]

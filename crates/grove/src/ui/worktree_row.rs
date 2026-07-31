@@ -200,7 +200,7 @@ impl Markers {
     }
 
     #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    fn is_empty(self) -> bool {
         self.items.iter().all(Option::is_none)
     }
 }
@@ -276,7 +276,7 @@ pub fn show(ui: &mut Ui, row: Row) -> Option<RowAction> {
             painter.rect_stroke(
                 rect,
                 radius,
-                Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.5)),
+                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.5)),
                 StrokeKind::Inside,
             );
         } else if hovered {
@@ -308,7 +308,12 @@ pub fn show(ui: &mut Ui, row: Row) -> Option<RowAction> {
         // for. The colour is the status's own, so the border says nothing the
         // edge did not — it says it where it can be seen.
         if let Some(color) = row_border(worktree, stands) {
-            painter.rect_stroke(rect, radius, Stroke::new(1.0, color), StrokeKind::Inside);
+            painter.rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0_f32, color),
+                StrokeKind::Inside,
+            );
         }
 
         let dot_center = egui::pos2(rect.left() + 18.0, rect.center().y);
@@ -324,7 +329,7 @@ pub fn show(ui: &mut Ui, row: Row) -> Option<RowAction> {
                 painter.circle_filled(dot_center, 4.0, theme::STATUS_WORKING);
             }
             (SessionPresence::None, _) => {
-                painter.circle_stroke(dot_center, 4.0, Stroke::new(1.4, theme::DOT_EMPTY));
+                painter.circle_stroke(dot_center, 4.0, Stroke::new(1.4_f32, theme::DOT_EMPTY));
             }
             (SessionPresence::Detached, _) => {
                 painter.circle_filled(dot_center, 4.0, theme::DOT_IDLE);

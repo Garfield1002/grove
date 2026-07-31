@@ -187,7 +187,10 @@ pub fn body(ui: &mut Ui, form: &mut RemovalForm) -> Option<Request> {
         // git's own words, verbatim and monospaced (ARCHITECTURE.md §8.5).
         egui::Frame::new()
             .fill(theme::BG_SUNKEN)
-            .stroke(egui::Stroke::new(1.0, theme::DANGER.gamma_multiply(0.3)))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                theme::DANGER.gamma_multiply(0.3),
+            ))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -364,7 +367,10 @@ fn step(
                 theme::DANGER,
             ))
             .fill(theme::DANGER_FILL)
-            .stroke(egui::Stroke::new(1.0, theme::DANGER.gamma_multiply(0.6)));
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                theme::DANGER.gamma_multiply(0.6),
+            ));
             if ui.add(confirm).clicked() {
                 *click = Some(Click::Confirm(operation.clone()));
             }
@@ -384,7 +390,7 @@ fn step(
             };
             let button = egui::Button::new(theme::label(label, theme::FONT_BODY, color)).stroke(
                 egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     if destructive && enabled {
                         theme::DANGER.gamma_multiply(0.35)
                     } else {
