@@ -53,6 +53,48 @@ pub(super) fn call_service(
     }
 }
 
+/// Call the service, decode its reply, and turn either outcome into messages.
+///
+/// Twenty-five of the worker's tasks are the same operation with different
+/// nouns: send one request, decode one result shape, and report the failure if
+/// there is one. Written out per task that came to about nine hundred lines of
+/// which only the method name, the parameters and the mapping differed — the
+/// call, the decode and the error path were character-identical each time.
+///
+/// This is deliberately a function taking data rather than a trait with an
+/// implementation per task. The tasks do not differ in *behaviour*, only in
+/// four values, and polymorphism over things that behave identically would
+/// reproduce the same boilerplate inside every impl.
+///
+/// [`state_intent_messages`] is the same idea for the mutation subset, which
+/// already had it; this is that pattern for the tasks that read.
+pub(super) fn service_result<T, F>(
+    worker: &WorkerState,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+    failure: &str,
+    ok: F,
+) -> Vec<Message>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(T) -> Vec<Message>,
+{
+    match call_service(worker, id, method, params).and_then(|value| {
+        serde_json::from_value::<T>(value).map_err(|error| {
+            Error::io(
+                // Names the method rather than the task, which is the half a
+                // reader of the log does not already have.
+                format!("decode {method} response"),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            )
+        })
+    }) {
+        Ok(value) => ok(value),
+        Err(error) => vec![Message::Failed(ErrorReport::new(failure, &error))],
+    }
+}
+
 pub(super) fn service_is_starting(error: &protocol::Error) -> bool {
     matches!(
         error,

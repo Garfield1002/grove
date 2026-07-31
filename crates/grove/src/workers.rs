@@ -29,7 +29,8 @@ mod service_call;
 
 pub use messages::{ErrorReport, HookOp, Message, PickTarget, RemovalOp, Task};
 use service_call::{
-    call_service, load_state_through_service, reconcile_through_service, state_intent_messages,
+    call_service, load_state_through_service, reconcile_through_service, service_result,
+    state_intent_messages,
 };
 
 /// Read or rewrite Claude Code's hook configuration.
@@ -186,7 +187,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct OpenProjectResult {
                 project: Project,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-project-open",
                 "project.open",
@@ -194,21 +195,9 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "path": path,
                     "idempotency_key": idempotency_key,
                 }),
+                &format!("could not open {}", path.display()),
+                |result: OpenProjectResult| vec![Message::ProjectOpened(Box::new(result.project))],
             )
-            .and_then(|value| {
-                serde_json::from_value::<OpenProjectResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode opened project",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![Message::ProjectOpened(Box::new(result.project))],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open {}", path.display()),
-                    &e,
-                ))],
-            }
         }
 
         Task::RefreshProject { project_id } => {
@@ -218,35 +207,25 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 worktrees: Vec<Worktree>,
                 statuses: HashMap<String, StatusSummary>,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-project-refresh",
                 "project.refresh",
                 serde_json::json!({"project_id": project_id}),
+                &format!("could not refresh project {project_id}"),
+                |result: RefreshProjectResult| {
+                    vec![
+                        Message::WorktreesRefreshed {
+                            project_id: result.project_id.clone(),
+                            worktrees: result.worktrees,
+                        },
+                        Message::StatusesRefreshed {
+                            project_id: result.project_id,
+                            statuses: result.statuses,
+                        },
+                    ]
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<RefreshProjectResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode refreshed project",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![
-                    Message::WorktreesRefreshed {
-                        project_id: result.project_id.clone(),
-                        worktrees: result.worktrees,
-                    },
-                    Message::StatusesRefreshed {
-                        project_id: result.project_id,
-                        statuses: result.statuses,
-                    },
-                ],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not refresh project {project_id}"),
-                    &e,
-                ))],
-            }
         }
 
         Task::RefreshStatuses { project_id } => {
@@ -255,29 +234,19 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 project_id: String,
                 statuses: HashMap<String, StatusSummary>,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-project-statuses",
                 "project.statuses",
                 serde_json::json!({"project_id": project_id}),
+                &format!("could not refresh statuses for project {project_id}"),
+                |result: ProjectStatusesResult| {
+                    vec![Message::StatusesRefreshed {
+                        project_id: result.project_id,
+                        statuses: result.statuses,
+                    }]
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<ProjectStatusesResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode project statuses",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![Message::StatusesRefreshed {
-                    project_id: result.project_id,
-                    statuses: result.statuses,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not refresh statuses for project {project_id}"),
-                    &e,
-                ))],
-            }
         }
 
         Task::StartAgent {
@@ -449,7 +418,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct OpenOrphanResult {
                 activation: Activation,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-open-orphan-session",
                 "session.orphan.open",
@@ -457,23 +426,13 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "session": session,
                     "idempotency_key": idempotency_key,
                 }),
+                &format!("could not open {session}"),
+                |result: OpenOrphanResult| {
+                    vec![Message::SessionOpened {
+                        activation: result.activation,
+                    }]
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<OpenOrphanResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode opened orphan session",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![Message::SessionOpened {
-                    activation: result.activation,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open {session}"),
-                    &e,
-                ))],
-            }
         }
 
         Task::AssociateSession {
@@ -552,29 +511,19 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 presence: HashMap<String, SessionPresence>,
                 windows: HashMap<String, Vec<WindowInfo>>,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-session-refresh",
                 "session.refresh",
                 serde_json::Value::Null,
+                "could not list tmux sessions",
+                |result: RefreshSessionsResult| {
+                    vec![Message::SessionsRefreshed {
+                        presence: result.presence,
+                        windows: result.windows,
+                    }]
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<RefreshSessionsResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode refreshed sessions",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![Message::SessionsRefreshed {
-                    presence: result.presence,
-                    windows: result.windows,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    "could not list tmux sessions",
-                    &e,
-                ))],
-            }
         }
 
         Task::Activate {
@@ -752,30 +701,20 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 refs: Vec<RefEntry>,
                 current: Option<String>,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-project-refs",
                 "project.refs",
                 serde_json::json!({"project_id": project_id}),
+                "could not list branches",
+                |result: ProjectRefsResult| {
+                    vec![Message::BaseRefsLoaded {
+                        project_id: result.project_id,
+                        refs: result.refs,
+                        current: result.current,
+                    }]
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<ProjectRefsResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode project refs",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![Message::BaseRefsLoaded {
-                    project_id: result.project_id,
-                    refs: result.refs,
-                    current: result.current,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    "could not list branches",
-                    &e,
-                ))],
-            }
         }
 
         Task::CreateWorktree {
@@ -843,30 +782,20 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 worktree_id: String,
                 report: RemovalReport,
             }
-            match call_service(
+            service_result(
                 worker,
                 "gui-removal-inspect",
                 "removal.inspect",
                 serde_json::json!({"worktree_id": worktree_id}),
+                &format!("could not inspect worktree {worktree_id}"),
+                |result: InspectRemovalResult| {
+                    vec![Message::RemovalGathered {
+                        project_id: result.project_id,
+                        worktree_id: result.worktree_id,
+                        report: Box::new(result.report),
+                    }]
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<InspectRemovalResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode removal inspection",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => vec![Message::RemovalGathered {
-                    project_id: result.project_id,
-                    worktree_id: result.worktree_id,
-                    report: Box::new(result.report),
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not inspect worktree {worktree_id}"),
-                    &e,
-                ))],
-            }
         }
 
         Task::CloseSession {
