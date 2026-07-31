@@ -29,8 +29,8 @@ mod service_call;
 
 pub use messages::{ErrorReport, HookOp, Message, PickTarget, RemovalOp, Task};
 use service_call::{
-    call_service, load_state_through_service, reconcile_through_service, service_result,
-    state_intent_messages,
+    NoReply, Removal, load_state_through_service, reconcile_through_service, removal_result,
+    service_result, state_intent_messages,
 };
 
 /// Read or rewrite Claude Code's hook configuration.
@@ -294,53 +294,45 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 worktree_ids: Vec<String>,
                 failures: Vec<ResumeFailure>,
             }
-            let result = call_service(
+            // Cloned out because the call borrows `worker`; see
+            // `Task::StartAgent`. A partial success is still a success: the
+            // agents that did resume are reported alongside the ones that
+            // refused, which is why the failures are messages and not an `Err`.
+            let refresh = worker.tasks.clone();
+            service_result(
                 worker,
                 "gui-resume-agents",
                 "agent.resume_recorded",
                 serde_json::json!({"idempotency_key": idempotency_key}),
+                "could not resume recorded agents",
+                |result: ResumeResult| {
+                    let ResumeResult {
+                        worktree_ids,
+                        failures,
+                    } = result;
+                    let mut messages = failures
+                        .into_iter()
+                        .map(|failure| {
+                            let error = Error::io(
+                                format!("resume the agent in {}", failure.worktree_path.display()),
+                                std::io::Error::other(failure.message),
+                            );
+                            Message::Failed(ErrorReport::new(
+                                &format!(
+                                    "could not resume the agent in {}",
+                                    failure.worktree_path.display()
+                                ),
+                                &error,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    if !worktree_ids.is_empty() {
+                        let _ = refresh.send(Task::RefreshSessions);
+                    }
+                    messages.push(Message::AgentsResumed { worktree_ids });
+                    messages
+                },
             )
-            .and_then(|value| {
-                serde_json::from_value::<ResumeResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode resumed agents",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            let ResumeResult {
-                worktree_ids,
-                failures,
-            } = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    return vec![Message::Failed(ErrorReport::new(
-                        "could not resume recorded agents",
-                        &error,
-                    ))];
-                }
-            };
-            let mut messages = failures
-                .into_iter()
-                .map(|failure| {
-                    let error = Error::io(
-                        format!("resume the agent in {}", failure.worktree_path.display()),
-                        std::io::Error::other(failure.message),
-                    );
-                    Message::Failed(ErrorReport::new(
-                        &format!(
-                            "could not resume the agent in {}",
-                            failure.worktree_path.display()
-                        ),
-                        &error,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            if !worktree_ids.is_empty() {
-                worker.enqueue(Task::RefreshSessions);
-            }
-            messages.push(Message::AgentsResumed { worktree_ids });
-            messages
         }
 
         Task::ClaudeHooks(op) => match claude_hooks(op) {
@@ -357,25 +349,19 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
         Task::ClearAttention {
             worktree_id,
             idempotency_key,
-        } => {
-            match call_service(
-                worker,
-                "gui-clear-attention",
-                "session.attention.clear",
-                serde_json::json!({
-                    "worktree_id": worktree_id,
-                    "idempotency_key": idempotency_key,
-                }),
-            ) {
-                // Nothing to report either way: the row already stopped
-                // showing attention when the latch was cleared.
-                Ok(_) => Vec::new(),
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    "could not clear the session's attention marker",
-                    &e,
-                ))],
-            }
-        }
+        } => service_result(
+            worker,
+            "gui-clear-attention",
+            "session.attention.clear",
+            serde_json::json!({
+                "worktree_id": worktree_id,
+                "idempotency_key": idempotency_key,
+            }),
+            "could not clear the session's attention marker",
+            // Nothing to report on success: the row already stopped showing
+            // attention when the latch was cleared.
+            |_: NoReply| Vec::new(),
+        ),
 
         Task::Reconcile { projects } => match reconcile_through_service(worker, projects) {
             Ok((result, state)) => {
@@ -429,71 +415,53 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             worktree_id,
             session,
             idempotency_key,
-        } => match call_service(
-            worker,
-            "gui-associate-session",
-            "session.associate",
-            serde_json::json!({
-                "worktree_id": worktree_id,
-                "orphan_session": session,
-                "idempotency_key": idempotency_key,
-            }),
-        ) {
-            Ok(value) => match value.get("session").and_then(serde_json::Value::as_str) {
-                Some(name) => vec![Message::Associated {
-                    worktree_id,
-                    session: name.to_string(),
-                }],
-                None => vec![Message::Failed(ErrorReport::new(
-                    "could not decode associated session",
-                    &Error::io(
-                        "decode associated session",
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "service response has no session",
-                        ),
-                    ),
-                ))],
-            },
-            Err(e) => vec![Message::Failed(ErrorReport::new(
+        } => {
+            #[derive(serde::Deserialize)]
+            struct AssociateResult {
+                session: String,
+            }
+            service_result(
+                worker,
+                "gui-associate-session",
+                "session.associate",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "orphan_session": session,
+                    "idempotency_key": idempotency_key,
+                }),
                 &format!("could not associate {session} with worktree {worktree_id}"),
-                &e,
-            ))],
-        },
+                |result: AssociateResult| {
+                    vec![Message::Associated {
+                        worktree_id,
+                        session: result.session,
+                    }]
+                },
+            )
+        }
 
         Task::CloseOrphan {
             session,
             idempotency_key,
-        } => {
-            match call_service(
-                worker,
-                "gui-close-orphan",
-                "session.close",
-                serde_json::json!({
-                    "session": session,
-                    "idempotency_key": idempotency_key,
-                }),
-            ) {
-                Ok(_) => vec![Message::OrphanClosed { session }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not close {session}"),
-                    &e,
-                ))],
-            }
-        }
+        } => service_result(
+            worker,
+            "gui-close-orphan",
+            "session.close",
+            serde_json::json!({
+                "session": session,
+                "idempotency_key": idempotency_key,
+            }),
+            &format!("could not close {session}"),
+            |_: NoReply| vec![Message::OrphanClosed { session }],
+        ),
 
-        Task::KillServer { idempotency_key } => match call_service(
+        Task::KillServer { idempotency_key } => service_result(
             worker,
             "gui-stop-server",
             "server.stop",
             serde_json::json!({"idempotency_key": idempotency_key}),
-        ) {
-            Ok(_) => vec![Message::ServerKilled],
-            Err(e) => vec![Message::Failed(ErrorReport::new(
-                "could not kill the tmux server",
-                &e,
-            ))],
-        },
+            "could not kill the tmux server",
+            |_: NoReply| vec![Message::ServerKilled],
+        ),
 
         Task::RefreshSessions => {
             #[derive(serde::Deserialize)]
@@ -524,7 +492,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct OpenResult {
                 activation: Activation,
             }
-            let result = call_service(
+            let mut messages = service_result(
                 worker,
                 "gui-open-session",
                 "session.open",
@@ -532,35 +500,19 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "worktree_id": worktree_id,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<OpenResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode opened session",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            match result {
-                Ok(activation) => {
-                    let mut messages = vec![Message::Activated {
+                &format!("could not open worktree {worktree_id}"),
+                |result: OpenResult| {
+                    vec![Message::Activated {
                         worktree_id,
-                        activation: activation.activation,
-                    }];
-                    // Presence changed: the row must stop saying "no session".
-                    messages.extend(handle(worker, Task::RefreshSessions));
-                    messages
-                }
-                Err(e) => {
-                    let mut messages = vec![Message::Failed(ErrorReport::new(
-                        &format!("could not open worktree {worktree_id}"),
-                        &e,
-                    ))];
-                    // The session may have been created before the failure.
-                    messages.extend(handle(worker, Task::RefreshSessions));
-                    messages
-                }
-            }
+                        activation: result.activation,
+                    }]
+                },
+            );
+            // Either way: presence changed and the row must stop saying "no
+            // session", and on failure the session may still have been created
+            // before whatever refused.
+            messages.extend(handle(worker, Task::RefreshSessions));
+            messages
         }
 
         Task::ActivateWindow {
@@ -572,7 +524,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct OpenWindowResult {
                 activation: Activation,
             }
-            let result = call_service(
+            let mut messages = service_result(
                 worker,
                 "gui-open-session-window",
                 "session.window.open",
@@ -581,25 +533,14 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "window_index": window_index,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<OpenWindowResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode opened session window",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            let mut messages = match result {
-                Ok(result) => vec![Message::Activated {
-                    worktree_id,
-                    activation: result.activation,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open window {window_index} of worktree {worktree_id}"),
-                    &e,
-                ))],
-            };
+                &format!("could not open window {window_index} of worktree {worktree_id}"),
+                |result: OpenWindowResult| {
+                    vec![Message::Activated {
+                        worktree_id,
+                        activation: result.activation,
+                    }]
+                },
+            );
             // The session may have been created, and the active window has
             // moved: both are things the tree shows.
             messages.extend(handle(worker, Task::RefreshSessions));
@@ -614,7 +555,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct OpenTerminalResult {
                 activation: Activation,
             }
-            let result = call_service(
+            let mut messages = service_result(
                 worker,
                 "gui-open-additional-terminal",
                 "session.terminal.open",
@@ -622,25 +563,14 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "worktree_id": worktree_id,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<OpenTerminalResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode additional terminal",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            let mut messages = match result {
-                Ok(result) => vec![Message::Activated {
-                    worktree_id,
-                    activation: result.activation,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open a terminal on worktree {worktree_id}"),
-                    &e,
-                ))],
-            };
+                &format!("could not open a terminal on worktree {worktree_id}"),
+                |result: OpenTerminalResult| {
+                    vec![Message::Activated {
+                        worktree_id,
+                        activation: result.activation,
+                    }]
+                },
+            );
             messages.extend(handle(worker, Task::RefreshSessions));
             messages
         }
@@ -653,7 +583,7 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             struct CreateWindowResult {
                 window: NewWindow,
             }
-            let result = call_service(
+            let mut messages = service_result(
                 worker,
                 "gui-create-session-window",
                 "session.window.create",
@@ -661,25 +591,14 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "worktree_id": worktree_id,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<CreateWindowResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode created session window",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            let mut messages = match result {
-                Ok(result) => vec![Message::WindowOpened {
-                    worktree_id,
-                    window: result.window,
-                }],
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    &format!("could not open a window on worktree {worktree_id}"),
-                    &e,
-                ))],
-            };
+                &format!("could not open a window on worktree {worktree_id}"),
+                |result: CreateWindowResult| {
+                    vec![Message::WindowOpened {
+                        worktree_id,
+                        window: result.window,
+                    }]
+                },
+            );
             messages.extend(handle(worker, Task::RefreshSessions));
             messages
         }
@@ -718,7 +637,10 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 path: PathBuf,
                 worktrees: Vec<Worktree>,
             }
-            let result = call_service(
+            // Cloned out because the call borrows `worker`; see
+            // `Task::StartAgent`.
+            let follow_up = worker.tasks.clone();
+            service_result(
                 worker,
                 "gui-create-worktree",
                 "worktree.create",
@@ -727,27 +649,19 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "add": add,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<CreateWorktreeResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode created worktree",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            });
-            match result {
-                Ok(CreateWorktreeResult { path, worktrees }) => {
+                "could not create the worktree",
+                |result: CreateWorktreeResult| {
+                    let CreateWorktreeResult { path, worktrees } = result;
                     let mut messages = vec![Message::WorktreeCreated {
                         project_id: project_id.clone(),
                         path: path.clone(),
                     }];
-                    worker.enqueue(Task::RefreshStatuses {
+                    let _ = follow_up.send(Task::RefreshStatuses {
                         project_id: project_id.clone(),
                     });
                     if open_after && let Some(worktree) = worktrees.iter().find(|w| w.path == path)
                     {
-                        worker.enqueue(Task::Activate {
+                        let _ = follow_up.send(Task::Activate {
                             worktree_id: worktree.id.clone(),
                             idempotency_key: format!("create-open-{}", grove_core::agent::nonce()),
                         });
@@ -757,12 +671,8 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                         worktrees,
                     });
                     messages
-                }
-                Err(e) => vec![Message::Failed(ErrorReport::new(
-                    "could not create the worktree",
-                    &e,
-                ))],
-            }
+                },
+            )
         }
 
         Task::GatherRemoval { worktree_id } => {
@@ -792,33 +702,40 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
             project_id,
             worktree_id,
             idempotency_key,
-        } => match call_service(
-            worker,
-            "gui-close-worktree-session",
-            "session.worktree.close",
-            serde_json::json!({
-                "worktree_id": worktree_id,
-                "idempotency_key": idempotency_key,
-            }),
-        ) {
-            Ok(value) => {
-                worker.enqueue(Task::RefreshSessions);
-                let session = value
-                    .get("session")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("the worktree session");
-                vec![Message::RemovalDone {
+        } => {
+            // Cloned out because the call borrows `worker`; see
+            // `Task::StartAgent`.
+            let refresh = worker.tasks.clone();
+            // Decoded loosely on purpose: the session was closed either way,
+            // and a reply Grove cannot read is not worth reporting a
+            // destructive step as failed over.
+            removal_result(
+                worker,
+                "gui-close-worktree-session",
+                "session.worktree.close",
+                serde_json::json!({
+                    "worktree_id": worktree_id,
+                    "idempotency_key": idempotency_key,
+                }),
+                Removal {
                     project_id,
                     operation: RemovalOp::CloseSession,
-                    detail: format!("Closed the tmux session {session}."),
-                }]
-            }
-            Err(e) => vec![Message::RemovalFailed {
-                project_id,
-                operation: RemovalOp::CloseSession,
-                report: ErrorReport::new("could not close the session", &e),
-            }],
-        },
+                },
+                "could not close the session",
+                |value: serde_json::Value, project_id| {
+                    let _ = refresh.send(Task::RefreshSessions);
+                    let session = value
+                        .get("session")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("the worktree session");
+                    vec![Message::RemovalDone {
+                        project_id,
+                        operation: RemovalOp::CloseSession,
+                        detail: format!("Closed the tmux session {session}."),
+                    }]
+                },
+            )
+        }
 
         Task::RemoveWorktree {
             project_id,
@@ -831,7 +748,12 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 path: PathBuf,
                 worktrees: Vec<Worktree>,
             }
-            match call_service(
+            // Cloned out because the call borrows `worker`; see
+            // `Task::StartAgent`.
+            let follow_up = worker.tasks.clone();
+            // On failure nothing was removed; the dialog shows git's own
+            // refusal and only then offers --force.
+            removal_result(
                 worker,
                 "gui-remove-worktree",
                 "worktree.remove",
@@ -840,17 +762,13 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "force": force,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<RemoveWorktreeResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode removed worktree",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => {
-                    worker.enqueue(Task::RefreshStatuses {
+                Removal {
+                    project_id,
+                    operation: RemovalOp::RemoveWorktree,
+                },
+                "could not remove the worktree",
+                |result: RemoveWorktreeResult, project_id| {
+                    let _ = follow_up.send(Task::RefreshStatuses {
                         project_id: project_id.clone(),
                     });
                     vec![
@@ -867,17 +785,8 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                             worktrees: result.worktrees,
                         },
                     ]
-                }
-                Err(e) => {
-                    // Nothing was removed; the dialog shows git's own refusal and
-                    // only then offers --force.
-                    vec![Message::RemovalFailed {
-                        project_id,
-                        operation: RemovalOp::RemoveWorktree,
-                        report: ErrorReport::new("could not remove the worktree", &e),
-                    }]
-                }
-            }
+                },
+            )
         }
 
         Task::DeleteBranch {
@@ -891,7 +800,10 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                 branch: String,
                 worktrees: Vec<Worktree>,
             }
-            match call_service(
+            // Cloned out because the call borrows `worker`; see
+            // `Task::StartAgent`.
+            let follow_up = worker.tasks.clone();
+            removal_result(
                 worker,
                 "gui-delete-branch",
                 "branch.delete",
@@ -901,17 +813,13 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                     "force": force,
                     "idempotency_key": idempotency_key,
                 }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<DeleteBranchResult>(value).map_err(|error| {
-                    Error::io(
-                        "decode deleted branch",
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })
-            }) {
-                Ok(result) => {
-                    worker.enqueue(Task::RefreshStatuses {
+                Removal {
+                    project_id,
+                    operation: RemovalOp::DeleteBranch,
+                },
+                &format!("could not delete {branch}"),
+                |result: DeleteBranchResult, project_id| {
+                    let _ = follow_up.send(Task::RefreshStatuses {
                         project_id: project_id.clone(),
                     });
                     vec![
@@ -925,13 +833,8 @@ fn handle(worker: &mut WorkerState, task: Task) -> Vec<Message> {
                             worktrees: result.worktrees,
                         },
                     ]
-                }
-                Err(e) => vec![Message::RemovalFailed {
-                    project_id,
-                    operation: RemovalOp::DeleteBranch,
-                    report: ErrorReport::new(&format!("could not delete {branch}"), &e),
-                }],
-            }
+                },
+            )
         }
 
         Task::SetProjectExpanded {

@@ -10,12 +10,12 @@ use grove_core::protocol::{self, Request};
 use grove_core::reconcile::{ProjectRef, Reconciliation};
 use grove_core::state::State;
 
-use super::{ErrorReport, Message, WorkerState};
+use super::{ErrorReport, Message, RemovalOp, WorkerState};
 
 pub(super) const SERVICE_OPERATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
-pub(super) fn call_service(
+fn call_service(
     worker: &WorkerState,
     id: &str,
     method: &str,
@@ -53,6 +53,37 @@ pub(super) fn call_service(
     }
 }
 
+/// The reply of a call whose only interesting outcome is that it succeeded.
+///
+/// `session.attention.clear`, `session.close` and `server.stop` answer with a
+/// body no caller reads. Naming that lets them go through [`service_result`]
+/// like everything else, rather than being a second spelling of the same call
+/// and the same error path that happens to ignore its `Ok`.
+pub(super) type NoReply = serde::de::IgnoredAny;
+
+/// Call the service and decode its reply.
+///
+/// The decode names the *method* rather than the task, which is the half a
+/// reader of the log does not already have.
+fn service_decoded<T>(
+    worker: &WorkerState,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, Error>
+where
+    T: serde::de::DeserializeOwned,
+{
+    call_service(worker, id, method, params).and_then(|value| {
+        serde_json::from_value::<T>(value).map_err(|error| {
+            Error::io(
+                format!("decode {method} response"),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            )
+        })
+    })
+}
+
 /// Call the service, decode its reply, and turn either outcome into messages.
 ///
 /// Twenty-five of the worker's tasks are the same operation with different
@@ -80,18 +111,54 @@ where
     T: serde::de::DeserializeOwned,
     F: FnOnce(T) -> Vec<Message>,
 {
-    match call_service(worker, id, method, params).and_then(|value| {
-        serde_json::from_value::<T>(value).map_err(|error| {
-            Error::io(
-                // Names the method rather than the task, which is the half a
-                // reader of the log does not already have.
-                format!("decode {method} response"),
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-            )
-        })
-    }) {
+    match service_decoded(worker, id, method, params) {
         Ok(value) => ok(value),
         Err(error) => vec![Message::Failed(ErrorReport::new(failure, &error))],
+    }
+}
+
+/// Which of the four separate destructive steps a removal failure belongs to.
+pub(super) struct Removal {
+    pub(super) project_id: String,
+    pub(super) operation: RemovalOp,
+}
+
+/// [`service_result`] for the three removal steps.
+///
+/// They differ from every other task in their *failure* alone: not a
+/// `Message::Failed` banner but a `RemovalFailed` naming the project and the
+/// operation, because the removal dialog reports which of the four separate
+/// steps refused and only then offers the next one — `--force` after git's own
+/// refusal. Folding them into [`service_result`] would have meant losing that,
+/// and leaving them out would have meant three more copies of the call and the
+/// decode.
+///
+/// The project id reaches the success closure rather than being cloned into it
+/// at each call site: exactly one of the two arms consumes it.
+pub(super) fn removal_result<T, F>(
+    worker: &WorkerState,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+    removal: Removal,
+    failure: &str,
+    ok: F,
+) -> Vec<Message>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(T, String) -> Vec<Message>,
+{
+    let Removal {
+        project_id,
+        operation,
+    } = removal;
+    match service_decoded(worker, id, method, params) {
+        Ok(value) => ok(value, project_id),
+        Err(error) => vec![Message::RemovalFailed {
+            project_id,
+            operation,
+            report: ErrorReport::new(failure, &error),
+        }],
     }
 }
 
